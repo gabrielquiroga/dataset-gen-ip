@@ -1,0 +1,65 @@
+# ==========================================
+# ROS 2 & Colcon Build Artifacts
+# ==========================================
+build/
+install/
+log/
+COLCON_IGNORE
+*.colcon_ignore
+
+# ==========================================
+# Datasets, Rosbags & Large Files (CRÍTICO)
+# ==========================================
+dataset_*/
+*.mcap
+*.db3
+*.bag
+rosbag2_*/
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# ==========================================
+# Python Artifacts & Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+*.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# ==========================================
+# C / C++ / Compiladores
+# ==========================================
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.exe
+
+# ==========================================
+# IDEs & System files
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*~
+.DS_Store
+*.log
+*.tmp
+gz_logs/
