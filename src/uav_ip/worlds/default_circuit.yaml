@@ -1,0 +1,28 @@
+# Circuito por defecto - coincide con circuito_aros_01.sdf
+# Generado manualmente como referencia de validacion.
+# El world_generator.py producira archivos con este esquema.
+# Coordenadas en marco Gazebo (ENU): X Y Z Yaw(rad)
+# yaw = 0: la abertura del aro mira al eje +X de Gazebo.
+
+hoops:
+  - name: aro_1
+    x: 5.0
+    y: 0.0
+    z: 1.5
+    yaw: 0.0
+
+  - name: aro_2
+    x: 10.0
+    y: -1.5
+    z: 2.5
+    yaw: 0.0
+
+  - name: aro_3
+    x: 15.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+
+landing:
+  x: 20.0
+  y: 0.0

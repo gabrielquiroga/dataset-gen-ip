@@ -8,9 +8,10 @@ COLCON_IGNORE
 *.colcon_ignore
 
 # ==========================================
-# Datasets, Rosbags & Large Files (CRÍTICO)
+# Datasets, Rosbags & Large Files (CRITICO)
 # ==========================================
 dataset_*/
+datasets/
 *.mcap
 *.db3
 *.bag
@@ -19,6 +20,10 @@ rosbag2_*/
 *.hdf5
 *.npy
 *.npz
+*.pt
+*.pth
+*.onnx
+*.safetensors
 
 # ==========================================
 # Python Artifacts & Environments
@@ -38,6 +43,18 @@ venv/
 .venv/
 env/
 ENV/
+.python-version
+
+# uv lockfile (tracked per-project, not at workspace root)
+# ml_pipeline/uv.lock is tracked intentionally
+/uv.lock
+
+# ==========================================
+# Generated Worlds (SDF generados por world_generator.py)
+# ==========================================
+# Los mundos generados se copian a PX4 y no necesitan versionarse.
+# La plantilla (circuito_aros_01.sdf) y el YAML default SI se versionan.
+generated_worlds/
 
 # ==========================================
 # C / C++ / Compiladores

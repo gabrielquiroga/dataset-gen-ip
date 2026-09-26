@@ -13,15 +13,13 @@ ros2_ws/
 ├── src/
 │   ├── px4_msgs/                  # Definiciones de tópicos (VehicleOdometry, TrajectorySetpoint, etc.)
 │   ├── px4_offboard/              # Scripts de vuelo, control PID/MPC y waypoints
-│   └── uav_imitation_learning/
+│   └── uav_ip/
 │       ├── package.xml
 │       ├── setup.py
 │       ├── resource/
 │       ├── worlds/                 # Archivos .sdf exportados desde Gazebo (Ej. circuito_aros.sdf)
-│       ├── scripts_bash/           # Utilidades para copiar worlds a PX4 y lanzar el bridge
-│       │   ├── 01_setup_env.sh
-│       │   └── 02_run_bridge.sh
-│       └── uav_imitation_learning/ # Módulo Python principal
+│       ├── scripts/                # Utilidades para copiar worlds a PX4 y lanzar el bridge
+│       └── uav_ip/                 # Módulo Python principal
 │           ├── __init__.py
 │           ├── expert_pilot.py     # Nodo ROS 2: Controlador experto (MPC/PID)
 │           ├── env_randomizer.py   # Nodo ROS 2: Mueve obstáculos y reinicia simulaciones
