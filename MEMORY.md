@@ -36,8 +36,8 @@ export PX4_GZ_MODEL_POSE="0,0,0.2,0,0,0"    # Evita colision con plataforma de s
 ```
 
 ## Tareas Activas / Inmediatas
-1. **Paso 1: world_generator.py** - Script que toma circuito_aros_01.sdf como plantilla, aplica variaciones aleatorias a poses de aros, y exporta nuevo .sdf + waypoints.yaml.
-2. **Paso 2: data_collector.py** - Orquestador con bucle doble (tasks x episodios).
+1. **Paso 1: world_generator.py** (COMPLETADO) - Script que toma circuito_aros_01.sdf como plantilla, aplica variaciones aleatorias a poses de aros, exporta nuevo .sdf + waypoints.yaml y lo inyecta a PX4.
+2. **Paso 2: data_collector.py** - Orquestador automático con bucle doble (tasks x episodios). Gestiona todo el stack de simulación y extracción de logs.
 3. **Paso 3: ml_pipeline/extractor.py** - Pipeline de extraccion con uv + rosbags.
 
 ## Deuda Tecnica
