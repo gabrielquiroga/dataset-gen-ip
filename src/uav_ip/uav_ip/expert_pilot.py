@@ -277,18 +277,23 @@ class ExpertPilot(Node):
             )
 
         # -- Arming sequence after 2 s of streaming setpoints --------------
-        if self.setpoint_counter == 100:
-            self._publish_vehicle_command(
-                VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0
-            )
-            self._publish_vehicle_command(
-                VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0
-            )
-            self.nav_state = 1
-            self.get_logger().info("Motores armados. Despegue iniciado.")
-
-        if self.setpoint_counter < 101:
+        if self.nav_state == 0:
             self.setpoint_counter += 1
+            if self.setpoint_counter >= 100:
+                self.nav_state = 1
+                self.get_logger().info("Iniciando secuencia de despegue y re-intentos de armado...")
+
+        if self.nav_state == 1:
+            self.setpoint_counter += 1
+            # Reintentar cada 1 segundo (50 ticks)
+            if self.setpoint_counter % 50 == 0:
+                self._publish_vehicle_command(
+                    VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0
+                )
+                self._publish_vehicle_command(
+                    VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0
+                )
+                self.get_logger().info("Comandando ARM & OFFBOARD (reintento)...")
 
     # =================================================================
     #  PX4 message helpers
