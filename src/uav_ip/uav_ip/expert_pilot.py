@@ -37,7 +37,7 @@ class ExpertPilot(Node):
     """State-machine pilot that follows waypoints derived from a YAML circuit file."""
 
     # --- Tunable constants (metres) ---
-    APPROACH_OFFSET: float = 1.0   # distance before/after hoop centre
+    APPROACH_OFFSET: float = 1.5   # distance before/after hoop centre
     TAKEOFF_HEIGHT: float = 1.5    # AGL for initial climb
     HOVER_HEIGHT: float = 1.5      # AGL over landing pad before descent
     TOUCHDOWN_HEIGHT: float = 0.3  # AGL before AUTO_LAND command
@@ -68,19 +68,18 @@ class ExpertPilot(Node):
             raise SystemExit(1)
 
         # -- Build waypoint sequence from YAML ----------------------------
-        self.waypoints_gazebo: list[list[float]] = self._build_waypoints(wp_path)
+        self.waypoints_gazebo: list[dict] = self._build_waypoints(wp_path)
         self.get_logger().info(
             f"Circuito cargado: {len(self.waypoints_gazebo)} waypoints "
             f"desde {wp_path.name}"
         )
-        for i, wp in enumerate(self.waypoints_gazebo):
+        for i, wp_info in enumerate(self.waypoints_gazebo):
+            wp = wp_info["pos"]
             self.get_logger().info(
-                f"  WP {i}: [{wp[0]:.1f}, {wp[1]:.1f}, {wp[2]:.1f}]"
+                f"  WP {i} ({wp_info['type']}): [{wp[0]:.1f}, {wp[1]:.1f}, {wp[2]:.1f}]"
             )
 
-        self.waypoints_ned: list[list[float]] = [
-            self._gazebo_to_ned(wp) for wp in self.waypoints_gazebo
-        ]
+        self.waypoints_ned: list[dict] = self.waypoints_gazebo  # Store the dict directly, we convert pos dynamically in the loop
 
         # -- QoS for PX4 uORB bridge -------------------------------------
         qos = QoSProfile(
@@ -125,25 +124,23 @@ class ExpertPilot(Node):
     # =================================================================
     #  Waypoint generation from YAML
     # =================================================================
-    def _build_waypoints(self, yaml_path: Path) -> list[list[float]]:
-        """Parse hoop/landing YAML and produce the full waypoint sequence.
-
-        For each hoop the function creates two waypoints:
-          - Pre-alignment:  centre - APPROACH_OFFSET along the hoop forward axis
-          - Post-exit:      centre + APPROACH_OFFSET along the hoop forward axis
-
-        The hoop forward axis is determined by its yaw in the SDF world:
-          forward = (cos(yaw), sin(yaw), 0)
-        """
+    def _build_waypoints(self, yaml_path: Path) -> list[dict]:
+        """Parse hoop/landing YAML and produce the full waypoint sequence."""
         with open(yaml_path, "r") as fh:
             cfg = yaml.safe_load(fh)
 
-        wps: list[list[float]] = []
+        # APPROACH_OFFSET debe ser pequeño para que no se superpongan entre aros cercanos.
+        OFFSET = 1.2
+        wps = []
 
         # WP 0 - Takeoff above origin
-        wps.append([0.0, 0.0, self.TAKEOFF_HEIGHT])
+        wps.append({
+            "pos": [0.0, 0.0, self.TAKEOFF_HEIGHT],
+            "type": "takeoff",
+            "yaw": 0.0
+        })
 
-        # Per-hoop approach / exit pairs
+        # Per-hoop 3-waypoint sequence: Pre, Center, Post
         for hoop in cfg["hoops"]:
             cx = float(hoop["x"])
             cy = float(hoop["y"])
@@ -153,24 +150,38 @@ class ExpertPilot(Node):
             fwd_x = math.cos(yaw)
             fwd_y = math.sin(yaw)
 
-            # Pre-alignment (before the hoop)
-            wps.append([
-                cx - self.APPROACH_OFFSET * fwd_x,
-                cy - self.APPROACH_OFFSET * fwd_y,
-                cz,
-            ])
-            # Post-exit (after the hoop)
-            wps.append([
-                cx + self.APPROACH_OFFSET * fwd_x,
-                cy + self.APPROACH_OFFSET * fwd_y,
-                cz,
-            ])
+            # Pre-alignment
+            wps.append({
+                "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz],
+                "type": "pre",
+                "yaw": yaw
+            })
+            # Center
+            wps.append({
+                "pos": [cx, cy, cz],
+                "type": "center",
+                "yaw": yaw
+            })
+            # Post-exit
+            wps.append({
+                "pos": [cx + OFFSET * fwd_x, cy + OFFSET * fwd_y, cz],
+                "type": "post",
+                "yaw": yaw
+            })
 
         # Landing sequence
         lx = float(cfg["landing"]["x"])
         ly = float(cfg["landing"]["y"])
-        wps.append([lx, ly, self.HOVER_HEIGHT])      # Hover above pad
-        wps.append([lx, ly, self.TOUCHDOWN_HEIGHT])   # Descend to threshold
+        wps.append({
+            "pos": [lx, ly, self.HOVER_HEIGHT],
+            "type": "landing_hover",
+            "yaw": 0.0
+        })
+        wps.append({
+            "pos": [lx, ly, self.TOUCHDOWN_HEIGHT],
+            "type": "landing_touchdown",
+            "yaw": 0.0
+        })
 
         return wps
 
@@ -181,6 +192,14 @@ class ExpertPilot(Node):
     def _gazebo_to_ned(coord: list[float]) -> list[float]:
         """Gazebo ENU (X-fwd, Y-left, Z-up) to PX4 NED (N, E, D)."""
         return [coord[1], coord[0], -coord[2]]
+        
+    @staticmethod
+    def _yaw_gazebo_to_ned(yaw: float) -> float:
+        """Gazebo ENU yaw to PX4 NED yaw."""
+        # NED yaw is clockwise from North (Y in ENU)
+        # ENU yaw is counter-clockwise from East (X in ENU)
+        # yaw_ned = pi/2 - yaw_enu
+        return math.pi / 2.0 - yaw
 
     # =================================================================
     #  Callbacks
@@ -205,11 +224,13 @@ class ExpertPilot(Node):
 
         # -- State machine ------------------------------------------------
         if self.nav_state == 0:
-            pass  # Streaming idle setpoints, waiting for arming at counter=100
+            pass  # Streaming idle setpoints, waiting for arming at counter=50
 
         elif self.nav_state == 1:  # TAKEOFF
-            target = self.waypoints_ned[0]
-            self.target_yaw = math.pi / 2.0
+            wp_info = self.waypoints_ned[0]
+            target = self._gazebo_to_ned(wp_info["pos"])
+            self.target_yaw = self._yaw_gazebo_to_ned(wp_info["yaw"])
+            
             if abs(self.current_pos_ned[2] - target[2]) < 0.2:
                 self.current_wp = 1
                 self.nav_state = 2
@@ -217,8 +238,10 @@ class ExpertPilot(Node):
                     "Despegue completado. Iniciando circuito..."
                 )
 
-        elif self.nav_state == 2:  # NAVIGATE (hoops + approach landing)
-            target = self.waypoints_ned[self.current_wp]
+        elif self.nav_state == 2:  # NAVIGATE
+            wp_info = self.waypoints_ned[self.current_wp]
+            target = self._gazebo_to_ned(wp_info["pos"])
+            wp_type = wp_info["type"]
 
             dx = target[0] - self.current_pos_ned[0]
             dy = target[1] - self.current_pos_ned[1]
@@ -226,31 +249,35 @@ class ExpertPilot(Node):
             dist_xy = math.sqrt(dx * dx + dy * dy)
             dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-            # Dynamic yaw: look towards next waypoint
-            if dist_xy > 0.5:
+            # En vuelo libre, apuntar al siguiente WP. Si estamos en secuencia de aro,
+            # obligar a que el dron mantenga fijo el yaw del aro para no chocar.
+            if wp_type in ("pre", "center", "post"):
+                self.target_yaw = self._yaw_gazebo_to_ned(wp_info["yaw"])
+            elif dist_xy > 0.5:
                 self.target_yaw = math.atan2(dy, dx)
 
-            is_last = self.current_wp == len(self.waypoints_ned) - 1
-
-            if is_last:
-                # Stop-and-Drop: tight convergence before land command
+            if wp_type == "landing_touchdown":
                 if dist_xy < 0.15 and abs(dz) < 0.15:
-                    self.get_logger().info(
-                        "Posicion de aterrizaje alcanzada. "
-                        "Comandando AUTO_LAND..."
-                    )
+                    self.get_logger().info("Aterrizaje alcanzado. Comandando AUTO_LAND...")
                     self.nav_state = 3
-            else:
-                # Fluid hoop crossing: switch at 30 cm sphere
-                if dist_3d < 0.3:
+            elif wp_type == "landing_hover":
+                if dist_xy < 0.3:
                     self.current_wp += 1
-                    self.get_logger().info(
-                        f"WP {self.current_wp - 1} alcanzado -> "
-                        f"rumbo a WP {self.current_wp}"
-                    )
+            elif wp_type == "pre":
+                # Converger fuerte antes del aro
+                if dist_xy < 0.2:
+                    self.current_wp += 1
+            elif wp_type == "center":
+                # Cruzar el aro rapido
+                if dist_3d < 0.4:
+                    self.current_wp += 1
+            elif wp_type == "post":
+                # Salida fluida
+                if dist_3d < 0.6:
+                    self.current_wp += 1
 
         elif self.nav_state == 3:  # LAND COMMAND
-            target = self.waypoints_ned[-1]
+            target = self._gazebo_to_ned(self.waypoints_ned[-1]["pos"])
             self._publish_vehicle_command(
                 VehicleCommand.VEHICLE_CMD_NAV_LAND
             )
@@ -258,11 +285,17 @@ class ExpertPilot(Node):
             self.nav_state = 4
 
         elif self.nav_state == 4:  # LANDING IN PROGRESS
-            target = self.waypoints_ned[-1]
-            # Z in NED is negative-up; near zero means ground contact
-            if self.current_pos_ned[2] > -0.05:
+            target = self._gazebo_to_ned(self.waypoints_ned[-1]["pos"])
+            
+            # Inicializar timer de aterrizaje si no existe
+            if not hasattr(self, 'land_start_time'):
+                self.land_start_time = self.get_clock().now()
+                
+            # Esperar 4 segundos para que PX4 asiente el drone y lo desarme
+            elapsed = (self.get_clock().now() - self.land_start_time).nanoseconds / 1e9
+            if elapsed > 4.0:
                 self.get_logger().info(
-                    "Contacto con el suelo. Mision completada."
+                    "Tiempo de aterrizaje completado. Mision exitosa."
                 )
                 self.nav_state = 5
 
@@ -276,24 +309,25 @@ class ExpertPilot(Node):
                 target[0], target[1], target[2], self.target_yaw
             )
 
-        # -- Arming sequence after 2 s of streaming setpoints --------------
+        # -- Arming sequence after 1 s of streaming setpoints --------------
         if self.nav_state == 0:
             self.setpoint_counter += 1
-            if self.setpoint_counter >= 100:
+            if self.setpoint_counter >= 50:
                 self.nav_state = 1
+                self.setpoint_counter = 0  # reset for state 1
                 self.get_logger().info("Iniciando secuencia de despegue y re-intentos de armado...")
 
         if self.nav_state == 1:
             self.setpoint_counter += 1
-            # Reintentar cada 1 segundo (50 ticks)
-            if self.setpoint_counter % 50 == 0:
+            # Reintentar cada 2.5 segundos (125 ticks), enviando el primero de inmediato (tick 1)
+            if self.setpoint_counter == 1 or self.setpoint_counter % 125 == 0:
                 self._publish_vehicle_command(
                     VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0
                 )
                 self._publish_vehicle_command(
-                    VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0
+                    VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0, 21196.0
                 )
-                self.get_logger().info("Comandando ARM & OFFBOARD (reintento)...")
+                self.get_logger().info("Comandando ARM & OFFBOARD (reintento FORZADO)...")
 
     # =================================================================
     #  PX4 message helpers

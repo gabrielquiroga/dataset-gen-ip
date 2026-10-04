@@ -62,12 +62,12 @@ PX4_STARTUP_TIMEOUT = 50       # Tiempo para que PX4 + Gazebo arranquen
 XRCE_STARTUP_DELAY = 3         # Espera tras lanzar XRCE agent
 BRIDGE_STARTUP_DELAY = 3       # Espera tras lanzar el bridge
 PRE_FLIGHT_SETTLE = 5          # Espera antes de iniciar el vuelo
-EPISODE_TIMEOUT = 180          # Timeout maximo por episodio (3 min)
+EPISODE_TIMEOUT = 360          # Timeout maximo por episodio (6 min)
 POST_EPISODE_COOLDOWN = 5      # Espera tras cerrar procesos
 PROCESS_KILL_TIMEOUT = 10      # Tiempo para que un proceso muera con SIGINT
 
 # Variables de entorno para PX4
-PX4_MODEL_POSE = "0,0,0.8,0,0,0"
+PX4_MODEL_POSE = "0,0,0.3,0,0,0"
 GZ_VERSION = "harmonic"
 PX4_VEHICLE = "gz_x500_depth"
 
@@ -86,11 +86,13 @@ PX4_ROOTFS = PX4_BUILD_DIR / "rootfs"
 # (p.ej. test_flight.sh interrumpido con Ctrl+C) y bloquear recursos
 # como el puerto UDP 8888 del agente XRCE.
 STALE_PROCESS_PATTERNS = [
-    ["pkill", "-x", "px4"],
-    ["pkill", "-f", "MicroXRCEAgent"],
-    ["pkill", "-f", "parameter_bridge"],
-    ["pkill", "-f", "gz sim"],
-    ["pkill", "-f", "ruby.*gz"],
+    ["pkill", "-9", "-f", "gz sim"],
+    ["pkill", "-9", "-f", "ruby.*gz"],
+    ["pkill", "-9", "-f", "bin/px4"],
+    ["pkill", "-9", "-f", "MicroXRCEAgent"],
+    ["pkill", "-9", "-f", "ros_gz_bridge"],
+    ["pkill", "-9", "-f", "expert_pilot"],
+    ["pkill", "-9", "-f", "ros2 bag"],
 ]
 
 
@@ -237,6 +239,7 @@ class DataCollector:
         resume: bool = False,
         episode_timeout: int = EPISODE_TIMEOUT,
         px4_startup_wait: int = PX4_STARTUP_TIMEOUT,
+        no_takeoff_platform: bool = True,
     ):
         self.num_tasks = num_tasks
         self.episodes_per_task = episodes_per_task
@@ -245,6 +248,7 @@ class DataCollector:
         self.resume = resume
         self.episode_timeout = episode_timeout
         self.px4_startup_wait = px4_startup_wait
+        self.no_takeoff_platform = no_takeoff_platform
         self.pm = ProcessManager()
 
         # Contadores globales
@@ -258,15 +262,19 @@ class DataCollector:
         self._interrupted = False
 
     def _signal_handler(self, signum, frame):
-        """Maneja Ctrl+C para limpiar procesos."""
+        """Maneja Ctrl+C para limpiar procesos agresivamente."""
         if self._interrupted:
-            # Segunda vez: forzar salida
+            # Segunda vez: forzar salida inmediatamente sin esperar
             print("\n[FORCE] Segunda interrupcion. Forzando salida...")
-            self.pm.stop_all()
+            self._kill_stale_processes()
             sys.exit(1)
+            
         self._interrupted = True
         print("\n[STOP] Interrupcion recibida. Limpiando procesos...")
-        self.pm.stop_all()
+        # Intentar cerrar el bag limpiamente primero
+        self.pm.stop("bag", signal.SIGINT)
+        # Luego matar todo lo demas sin piedad para no colgar la terminal
+        self._kill_stale_processes()
         self._print_summary()
         sys.exit(0)
 
@@ -364,13 +372,17 @@ class DataCollector:
     def _generate_world(self, task_id: str, seed: int) -> bool:
         """Ejecuta world_generator.py para crear el mundo."""
         print(f"  Generando mundo {task_id} (seed={seed})...")
+        cmd = [
+            sys.executable,
+            str(WORLD_GENERATOR),
+            "--task-id", task_id,
+            "--seed", str(seed),
+        ]
+        if self.no_takeoff_platform:
+            cmd.append("--no-takeoff-platform")
+
         result = subprocess.run(
-            [
-                sys.executable,
-                str(WORLD_GENERATOR),
-                "--task-id", task_id,
-                "--seed", str(seed),
-            ],
+            cmd,
             capture_output=True,
             text=True,
         )
@@ -402,7 +414,8 @@ class DataCollector:
         waypoints_file = GENERATED_WORLDS / task_id / "waypoints.yaml"
 
         print(f"    Logs del episodio: {log_dir}")
-        print(f"      (monitorear con: tail -f {log_dir}/pilot.log)")
+        print(f"      (monitorear piloto: tail -f {log_dir}/pilot.log)")
+        print(f"      (monitorear PX4/SITL: tail -f {log_dir}/px4.log)")
 
         # 0. Matar procesos huerfanos de ejecuciones previas
         self._kill_stale_processes()
@@ -416,6 +429,7 @@ class DataCollector:
             if not self.pm.is_running("xrce"):
                 print("    [ERROR] MicroXRCEAgent murio al iniciar "
                       "(¿puerto 8888 ocupado?). Ver xrce.log")
+                self._print_log_tail(log_dir / "xrce.log", "XRCE Log (ultimas lineas)")
                 return "xrce_crash"
 
             # 2. Lanzar PX4 + Gazebo
@@ -424,6 +438,8 @@ class DataCollector:
             time.sleep(self.px4_startup_wait)
 
             if not self.pm.is_running("px4"):
+                print("    [ERROR] PX4 murio al iniciar. Ver px4.log")
+                self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
                 return "px4_crash"
 
             # 3. Lanzar gz_bridge
@@ -452,6 +468,9 @@ class DataCollector:
 
             if exit_code is None:
                 # Timeout
+                print(f"\n    [TIMEOUT] El episodio excedio los {self.episode_timeout}s.")
+                self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
+                self._print_log_tail(log_dir / "pilot.log", "Pilot Log (ultimas lineas)")
                 return "timeout"
             elif exit_code == 0:
                 # Guardar metadata del episodio
@@ -467,18 +486,25 @@ class DataCollector:
             return f"exception: {e}"
 
         finally:
-            # Cleanup: detener todo en orden inverso
+            # Cleanup: detener todo agresivamente
             print("    Cerrando procesos...")
-            # Bag: SIGINT para cierre limpio del archivo
+            # Bag: SIGINT para cierre limpio del archivo (tiene timeout interno de gracia)
             self.pm.stop("bag", signal.SIGINT)
-            time.sleep(1)
-            self.pm.stop("pilot", signal.SIGINT)
-            self.pm.stop("bridge", signal.SIGINT)
-            self.pm.stop("xrce", signal.SIGINT)
-            # PX4: SIGINT primero, luego cleanup
-            self.pm.stop("px4", signal.SIGINT)
-            # Matar cualquier proceso zombie de gazebo
-            self._cleanup_gazebo()
+            
+            # En lugar de pedir amablemente con stop_all() y causar cuelgues,
+            # aniquilamos los procesos manejados instantaneamente con SIGKILL.
+            for name, proc in list(self.pm.processes.items()):
+                if name == "bag":
+                    continue
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self.pm.processes.clear()
+            
+            # Y finalmente ejecutamos la misma estrategia de pkill -9 de kill_sim.sh
+            # para destruir cualquier hijo rebelde (como el servidor ruby de Gazebo)
+            self._kill_stale_processes()
 
     # ----------------------------------------------------------------
     #  Arranque de procesos individuales
@@ -491,6 +517,19 @@ class DataCollector:
         PX4-Autopilot/src/modules/simulation/gz_bridge/CMakeLists.txt),
         pero con `-d` para no arrancar el shell interactivo pxh.
         """
+        # Escribir comandos extras de inicializacion (ej. forzar chequeos)
+        extras_path = PX4_ROOTFS / "etc" / "extras.txt"
+        extras_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(extras_path, "w") as f:
+            f.write("param set NAV_DLL_ACT 0\n")
+            f.write("param set EKF2_GPS_CHECK 0\n")  # Relajar chequeo de GPS por recomendacion web
+            f.write("param set MPC_TKO_SPEED 3.0\n") # Acelerar el despegue para el dataset
+
+            f.write("param set MPC_XY_CRUISE 3.0\n")  # Velocidad de crucero deseada (m/s)
+            f.write("param set MPC_XY_VEL_MAX 4.0\n")   # Velocidad maxima absoluta (m/s)
+
+            f.write("commander arm -f\n")
+
         env = {
             "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "33"),
             "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
@@ -499,7 +538,7 @@ class DataCollector:
             "GZ_IP": "127.0.0.1",
             "PX4_SIM_MODEL": PX4_VEHICLE,
             "PX4_GZ_WORLD": world_name,
-            "PX4_GZ_MODEL_POSE": PX4_MODEL_POSE,
+            # "PX4_GZ_MODEL_POSE": PX4_MODEL_POSE,
         }
         self.pm.start(
             "px4",
@@ -639,6 +678,20 @@ class DataCollector:
         except Exception:
             return False
 
+    def _print_log_tail(self, log_file: Path, title: str, lines: int = 15) -> None:
+        """Imprime las ultimas lineas de un log para mayor visibilidad."""
+        if log_file.exists():
+            print(f"\n    === {title} ===")
+            try:
+                import collections
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    tail = collections.deque(f, maxlen=lines)
+                for line in tail:
+                    print(f"      {line}", end="")
+                print("    ====================\n")
+            except Exception as e:
+                print(f"      [WARN] No se pudo leer {log_file.name}: {e}")
+
     def _print_summary(self) -> None:
         """Imprime resumen de la recoleccion."""
         total = self.total_success + self.total_failed + self.total_timeout
@@ -704,6 +757,11 @@ def main():
         f"Default: {PX4_STARTUP_TIMEOUT}.",
     )
 
+    parser.add_argument(
+        "--with-takeoff-platform", action="store_false", dest="no_takeoff_platform",
+        help="Incluir la plataforma de salida (por defecto no se incluye).",
+    )
+
     args = parser.parse_args()
 
     # Validar prerequisitos
@@ -717,8 +775,16 @@ def main():
         resume=args.resume,
         episode_timeout=args.episode_timeout,
         px4_startup_wait=args.px4_startup_wait,
+        no_takeoff_platform=args.no_takeoff_platform,
     )
-    collector.run()
+    
+    try:
+        collector.run()
+    except KeyboardInterrupt:
+        print("\n[STOP] Interrupcion global recibida (Ctrl+C). Limpiando todos los procesos...")
+        collector.pm.stop_all()
+        collector._kill_stale_processes()
+        sys.exit(130)
 
 
 def _check_prerequisites() -> None:

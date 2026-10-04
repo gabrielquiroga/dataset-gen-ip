@@ -189,6 +189,7 @@ def modify_sdf(
     world_name: str,
     hoops: list[dict],
     landing: dict,
+    remove_takeoff_platform: bool = False,
 ) -> ET.ElementTree:
     """Parsea el SDF plantilla y modifica las poses de los aros y la plataforma.
 
@@ -197,6 +198,7 @@ def modify_sdf(
         world_name: Nombre para el <world> tag (usado por PX4_GZ_WORLD).
         hoops: Lista de dicts con {name, x, y, z, yaw}.
         landing: Dict con {x, y} de la plataforma de aterrizaje.
+        remove_takeoff_platform: Si es True, elimina el modelo 'plataforma_salida' del SDF.
 
     Returns:
         ElementTree con el SDF modificado.
@@ -209,6 +211,11 @@ def modify_sdf(
     if world_elem is None:
         raise ValueError("No se encontro <world> en el SDF plantilla")
     world_elem.set("name", world_name)
+    
+    if remove_takeoff_platform:
+        takeoff_model = _find_model(world_elem, "plataforma_salida")
+        if takeoff_model is not None:
+            world_elem.remove(takeoff_model)
 
     # Modificar poses de los aros
     for hoop in hoops:
@@ -350,6 +357,12 @@ def main() -> None:
         help="No copiar el SDF a PX4-Autopilot/Tools/simulation/gz/worlds/.",
     )
 
+    parser.add_argument(
+        "--no-takeoff-platform",
+        action="store_true",
+        help="Elimina la plataforma de salida (despegue) del mundo generado.",
+    )
+
     args = parser.parse_args()
 
     # Resolver rutas
@@ -382,7 +395,7 @@ def main() -> None:
     )
 
     # Modificar SDF
-    tree = modify_sdf(args.template, args.task_id, hoops, landing)
+    tree = modify_sdf(args.template, args.task_id, hoops, landing, args.no_takeoff_platform)
 
     # Exportar archivos
     task_dir = args.output_dir / args.task_id
