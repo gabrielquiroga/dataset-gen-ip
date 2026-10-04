@@ -1,0 +1,10 @@
+#!/bin/bash
+echo "Matando procesos de simulacion huerfanos..."
+pkill -f "gz sim"
+pkill -f "ruby.*gz"
+pkill -f "bin/px4"
+pkill -f "MicroXRCEAgent"
+pkill -f "ros_gz_bridge"
+pkill -f "expert_pilot"
+pkill -f "ros2 bag"
+echo "Procesos eliminados."

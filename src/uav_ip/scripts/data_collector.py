@@ -67,9 +67,31 @@ POST_EPISODE_COOLDOWN = 5      # Espera tras cerrar procesos
 PROCESS_KILL_TIMEOUT = 10      # Tiempo para que un proceso muera con SIGINT
 
 # Variables de entorno para PX4
-PX4_MODEL_POSE = "0,0,0.2,0,0,0"
+PX4_MODEL_POSE = "0,0,0.8,0,0,0"
 GZ_VERSION = "harmonic"
 PX4_VEHICLE = "gz_x500_depth"
+
+# Binario de PX4 SITL (generado por `make px4_sitl gz_x500_depth`).
+# Se lanza directamente en modo daemon (-d) en lugar de via `make`:
+#   - `make` usa USES_TERMINAL y arranca el shell interactivo `pxh>`, que lee
+#     stdin. Sin TTY, pxh entra en un bucle que llena el log (~190 MB/vuelo);
+#     con la TTY heredada desde un process group en segundo plano, el kernel
+#     envia SIGTTIN y PX4 queda DETENIDO (sintoma: dron en Gazebo sin armar).
+#   - `-d` desactiva pxh: PX4 corre como servidor puro, ideal para scripts.
+PX4_BUILD_DIR = PX4_DIR / "build" / "px4_sitl_default"
+PX4_BINARY = PX4_BUILD_DIR / "bin" / "px4"
+PX4_ROOTFS = PX4_BUILD_DIR / "rootfs"
+
+# Procesos que pueden quedar huerfanos de ejecuciones anteriores
+# (p.ej. test_flight.sh interrumpido con Ctrl+C) y bloquear recursos
+# como el puerto UDP 8888 del agente XRCE.
+STALE_PROCESS_PATTERNS = [
+    ["pkill", "-x", "px4"],
+    ["pkill", "-f", "MicroXRCEAgent"],
+    ["pkill", "-f", "parameter_bridge"],
+    ["pkill", "-f", "gz sim"],
+    ["pkill", "-f", "ruby.*gz"],
+]
 
 
 # ============================================================================
@@ -102,12 +124,16 @@ class ProcessManager:
             log_file: Si se especifica, stdout/stderr van a este archivo.
         """
         full_env = os.environ.copy()
+        # Logs de nodos Python visibles en tiempo real (tail -f)
+        full_env["PYTHONUNBUFFERED"] = "1"
         if env:
             full_env.update(env)
 
+        log_handle = None
         if log_file:
             log_file.parent.mkdir(parents=True, exist_ok=True)
-            stdout = open(log_file, "w")
+            log_handle = open(log_file, "w")
+            stdout = log_handle
             stderr = subprocess.STDOUT
         else:
             stdout = subprocess.DEVNULL
@@ -118,11 +144,22 @@ class ProcessManager:
             env=full_env,
             cwd=cwd,
             shell=shell,
+            # IMPORTANTE: nunca heredar la terminal como stdin. Un proceso
+            # en otro process group que lee de la TTY recibe SIGTTIN y el
+            # kernel lo detiene (estado 'T'). Esto es lo que hace bash con
+            # `cmd &` en scripts no interactivos (stdin -> /dev/null).
+            stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,
-            # Crear nuevo process group para poder matar todo el arbol
-            preexec_fn=os.setpgrp,
+            # Nueva sesion (=> nuevo process group, sin TTY de control):
+            # permite matar todo el arbol con killpg y evita que el Ctrl+C
+            # de la terminal llegue a los hijos antes que nuestro handler.
+            start_new_session=True,
         )
+
+        # El hijo ya tiene su propia copia del descriptor
+        if log_handle:
+            log_handle.close()
 
         self.processes[name] = proc
         return proc
@@ -306,7 +343,7 @@ class DataCollector:
                 elif result == "timeout":
                     self.total_timeout += 1
                     print(f"  [TIMEOUT] {ep_id} excedio el limite de "
-                          f"{EPISODE_TIMEOUT}s.")
+                          f"{self.episode_timeout}s.")
                 else:
                     self.total_failed += 1
                     print(f"  [FAIL] {ep_id} fallo (exit code: {result}).")
@@ -364,11 +401,22 @@ class DataCollector:
         log_dir.mkdir(exist_ok=True)
         waypoints_file = GENERATED_WORLDS / task_id / "waypoints.yaml"
 
+        print(f"    Logs del episodio: {log_dir}")
+        print(f"      (monitorear con: tail -f {log_dir}/pilot.log)")
+
+        # 0. Matar procesos huerfanos de ejecuciones previas
+        self._kill_stale_processes()
+
         try:
             # 1. Lanzar XRCE-DDS Agent
             print("    Lanzando MicroXRCEAgent...")
             self._start_xrce_agent(log_dir / "xrce.log")
             time.sleep(XRCE_STARTUP_DELAY)
+
+            if not self.pm.is_running("xrce"):
+                print("    [ERROR] MicroXRCEAgent murio al iniciar "
+                      "(¿puerto 8888 ocupado?). Ver xrce.log")
+                return "xrce_crash"
 
             # 2. Lanzar PX4 + Gazebo
             print(f"    Lanzando PX4 (world={task_id})...")
@@ -437,18 +485,27 @@ class DataCollector:
     # ----------------------------------------------------------------
 
     def _start_px4(self, world_name: str, log_file: Path) -> None:
-        """Lanza PX4 SITL con Gazebo."""
+        """Lanza PX4 SITL con Gazebo en modo daemon.
+
+        Replica lo que hace `make px4_sitl gz_x500_depth` (ver
+        PX4-Autopilot/src/modules/simulation/gz_bridge/CMakeLists.txt),
+        pero con `-d` para no arrancar el shell interactivo pxh.
+        """
         env = {
+            "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "33"),
+            "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
+            "GZ_PARTITION": "sim",
             "GZ_VERSION": GZ_VERSION,
+            "GZ_IP": "127.0.0.1",
+            "PX4_SIM_MODEL": PX4_VEHICLE,
             "PX4_GZ_WORLD": world_name,
             "PX4_GZ_MODEL_POSE": PX4_MODEL_POSE,
         }
         self.pm.start(
             "px4",
-            f"make px4_sitl {PX4_VEHICLE}",
+            [str(PX4_BINARY), "-d"],
             env=env,
-            cwd=PX4_DIR,
-            shell=True,
+            cwd=PX4_ROOTFS,
             log_file=log_file,
         )
 
@@ -520,6 +577,24 @@ class DataCollector:
             )
         except Exception:
             pass
+
+    def _kill_stale_processes(self) -> None:
+        """Mata procesos huerfanos del stack (PX4, XRCE, bridge, Gazebo).
+
+        Un MicroXRCEAgent huerfano ocupa el puerto 8888 y hace fallar al
+        nuevo agente con 'bind error errno 98'.
+        """
+        killed_any = False
+        for cmd in STALE_PROCESS_PATTERNS:
+            try:
+                res = subprocess.run(cmd, capture_output=True, timeout=5)
+                killed_any |= res.returncode == 0
+            except Exception:
+                pass
+        if killed_any:
+            print("    [WARN] Se encontraron procesos huerfanos y se "
+                  "terminaron. Esperando liberacion de recursos...")
+            time.sleep(3)
 
     def _save_episode_metadata(
         self,
@@ -666,7 +741,7 @@ def _check_prerequisites() -> None:
 
     # Verificar colcon build
     install_dir = ROS2_WS / "install" / "uav_ip"
-    if not install_dir.is_dir():
+    if "uav_ip" not in os.environ.get("AMENT_PREFIX_PATH", ""):
         errors.append(
             "Paquete uav_ip no instalado. Ejecuta:\n"
             "  cd ~/ros2_ws && colcon build --packages-select uav_ip && "
@@ -676,6 +751,11 @@ def _check_prerequisites() -> None:
     # Verificar PX4
     if not PX4_DIR.is_dir():
         errors.append(f"PX4-Autopilot no encontrado en {PX4_DIR}")
+    elif not PX4_BINARY.is_file():
+        errors.append(
+            f"Binario PX4 no encontrado en {PX4_BINARY}. Compilalo una vez:\n"
+            f"  cd ~/PX4-Autopilot && make px4_sitl {PX4_VEHICLE}"
+        )
 
     # Verificar world_generator.py
     if not WORLD_GENERATOR.is_file():
