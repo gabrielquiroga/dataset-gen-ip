@@ -1,0 +1,62 @@
+# Troubleshooting y Problemas Frecuentes (UAV Instant Policy)
+
+Este documento sirve como registro de los problemas técnicos mas críticos encontrados durante la integración de PX4 SITL, Gazebo Harmonic y ROS 2, junto con sus soluciones definitivas.
+
+---
+
+## 1. Dron no logra armarse y reporta `High Gyro Bias` o `GPS Vert Speed Drift too high`
+
+**Síntoma:** Al lanzar PX4, en la terminal comienzan a aparecer alertas continuas sobre el giroscopio y el GPS, seguidas por `Arming denied: Resolve system health failures first`. El nodo `expert_pilot` se queda infinitamente enviando comandos `ARM & OFFBOARD (reintento)`.
+
+**Causa:** Colisión y explosión del motor de físicas al iniciar (`Spawn Penetration`). La plataforma de salida en Gazebo (`plataforma_salida`) tiene una altura hasta `Z=0.1`. Si la variable `PX4_GZ_MODEL_POSE` define una altura de spawn inferior a las patas del dron (por ejemplo, `Z=0.2`), el dron "nace" penetrando la estructura estática. El motor ODE intenta expulsarlo de inmediato aplicando fuerzas colosales, lo que hace que el dron salga volando hacia arriba girando sin control (invisble en la UI ya que es muy veloz). Esto satura los sensores simulados.
+
+**Solución:**
+Asegurar que el dron inicie con altura de sobra para caer suavemente sobre la plataforma por gravedad. El script orquestador usa obligatoriamente:
+```bash
+export PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"
+```
+
+---
+
+## 2. Dron aparece pero los sensores no publican (`Preflight Fail: ekf2 missing data`)
+
+**Síntoma:** El simulador Gazebo se abre y ves el dron perfectamente colocado. Sin embargo, la terminal de PX4 arroja advertencias de `barometer 0 missing`, `ekf2 missing data` o `Found 0 compass`.
+
+**Causa:** `gz sim` Zombie. Al usar `Ctrl+C` para matar un lanzamiento previo de PX4 (`make px4_sitl`), el servidor en segundo plano de Gazebo no se cierra. Cuando vuelves a iniciar PX4, el script detecta que Gazebo ya corre e inyecta un *nuevo* dron en ese mundo "huérfano" cuyos nodos de transporte (`gz-transport`) están pausados o corruptos. PX4 no recibe datos de los sensores.
+
+**Solución manual:**
+Antes de realizar lanzamientos manuales, usar el script de limpieza provisto para matar procesos zombies:
+```bash
+~/ros2_ws/src/uav_ip/scripts/kill_sim.sh
+```
+*(El script `data_collector.py` ya ejecuta estas rutinas de limpieza automáticamente en cada episodio).*
+
+---
+
+## 3. PX4 arranca perfectamente pero no responde al piloto experto
+
+**Síntoma:** La terminal de PX4 no muestra errores (llega a `home set`) pero el dron jamás inicia vuelo, a pesar de que la terminal de `expert_pilot` indica "Comandando ARM".
+
+**Causa:** Desincronización del Dominio ROS 2 (`ROS_DOMAIN_ID`). PX4 en sí mismo no es un nodo de ROS; depende del puente `MicroXRCEAgent`. Si el script `load_ros` no se ejecuta en la terminal antes de levantar el Agente, el Agente escuchará en el Dominio 0. Sin embargo, el `expert_pilot` publica sus comandos en el Dominio 33. Al no verse, PX4 no crea *suscriptores* (DataReaders) y las peticiones de armado caen al vacío.
+
+**Solución:**
+Asegurar la inyección explícita de las variables de red antes de ejecutar el puente:
+```bash
+export ROS_DOMAIN_ID=33
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+MicroXRCEAgent udp4 -p 8888
+```
+*(El `ProcessManager` de `data_collector.py` ha sido diseñado para inyectar estas variables por la fuerza en todos sus subprocesos).*
+
+---
+
+## 4. Simulador (Gazebo) y ROS están muy desfasados de tiempo en WSL2
+
+**Síntoma:** Pérdida de paquetes, errores de QoS o TF timeouts.
+**Causa:** Conflicto de interfaces de red de Windows hacia WSL2 que confunde a Gazebo Transport y FastDDS.
+**Solución:**
+Aislar la simulación al loopback:
+```bash
+export GZ_IP=127.0.0.1
+export GZ_PARTITION=sim
+```

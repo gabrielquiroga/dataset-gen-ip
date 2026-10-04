@@ -19,7 +19,9 @@
 - **Dataset:** 2 tareas x 15 episodios por tarea (prioriza variacion intra-tarea, alineado al in-context learning del paper).
 
 ## Gotchas Criticos (NO OLVIDAR)
-- **PX4_GZ_MODEL_POSE:** La plataforma de despegue en el SDF esta a Z=0.1m (pose Z=0.05 + mitad del box 0.05). El dron por defecto spawna en Z=0, quedando DENTRO de la plataforma y no puede despegar. SOLUCION: exportar `PX4_GZ_MODEL_POSE="0,0,0.2,0,0,0"` antes de lanzar PX4. El orquestador DEBE setear esta variable.
+- **PX4_GZ_MODEL_POSE y Explosión de Físicas:** La plataforma de despegue en el SDF es una caja que se extiende hasta Z=0.1m. Si el dron (`x500_depth`) spawnea en `Z=0.2`, su tren de aterrizaje penetra la caja, lo que causa una explosión en el motor de físicas al resolver la colisión. Esto genera errores de `High Gyro Bias` y `GPS Vert Speed Drift too high` en PX4, denegando el armado (Arming denied). **SOLUCIÓN:** Usar `PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"` para asegurar que el dron nazca en el aire y caiga suavemente.
+- **Zombies de Gazebo (`gz sim`):** Al matar el proceso de PX4 (`make px4_sitl` o el ejecutable `px4`), el servidor de Gazebo en segundo plano **no muere**. Si se lanza PX4 nuevamente, se inyectará en el mundo zombie corrupto, causando fallas masivas de lectura de sensores (`ekf2 missing data`, `barometer 0 missing`, etc). **SOLUCIÓN:** Siempre matar los huérfanos con `pkill -f "gz sim" ; pkill -f "ruby.*gz" ; pkill -f "bin/px4"` antes de un nuevo lanzamiento. El orquestador ya incluye esta limpieza automática.
+- **Comunicación y Particiones:** Para que el stack completo se comunique sin conflictos y en la misma red, se debe exportar explícitamente `ROS_DOMAIN_ID=33`, `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` y `GZ_PARTITION=sim`. Si el `MicroXRCEAgent` se levanta sin el Domain ID correcto, el piloto experto jamás logrará comunicarse con PX4.
 
 ## Topicos PX4 Verificados (del rosbag existente)
 - `/fmu/in/trajectory_setpoint` (TrajectorySetpoint)
@@ -31,7 +33,11 @@
 ```bash
 export GZ_VERSION=harmonic
 export PX4_GZ_WORLD=tf_circuito_aros        # o el nombre del mundo generado
-export PX4_GZ_MODEL_POSE="0,0,0.2,0,0,0"    # Evita colision con plataforma de salida
+export PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"    # Altura de Z=0.8 obligatoria para evitar High Gyro Bias
+export GZ_PARTITION=sim
+export GZ_IP=127.0.0.1
+export ROS_DOMAIN_ID=33
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 # Luego: make px4_sitl gz_x500_depth
 ```
 
