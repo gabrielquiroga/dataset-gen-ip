@@ -97,6 +97,7 @@ PX4_WORLDS_DIR = Path.home() / "PX4-Autopilot" / "Tools" / "simulation" / "gz" /
 # ============================================================================
 
 def generate_random_circuit(
+    landmarks_info: list,
     seed: Optional[int] = None,
     max_attempts: int = 100,
 ) -> tuple[list[dict], dict]:
@@ -118,7 +119,7 @@ def generate_random_circuit(
         prev_y = 0.0   # el dron despega en Y=0
         feasible = True
 
-        for i in range(NUM_GATES):
+        for i in range(len(landmarks_info)):
             # Posicion X: avance progresivo
             if i == 0:
                 x = rng.uniform(FIRST_GATE_X_MIN, FIRST_GATE_X_MAX)
@@ -148,7 +149,8 @@ def generate_random_circuit(
                 break
 
             hoops.append({
-                "name": GATE_MODEL_NAMES[i],
+                "id": landmarks_info[i]["id"],
+                "type": landmarks_info[i]["type"],
                 "x": round(x, 2),
                 "y": round(y, 2),
                 "z": round(z, 2),
@@ -218,12 +220,42 @@ def modify_sdf(
             world_elem.remove(takeoff_model)
 
     # Modificar poses de los aros
-    for hoop in hoops:
-        model = _find_model(world_elem, hoop["name"])
+    for i, hoop in enumerate(hoops):
+        old_name = f"aro_{i+1}"
+        model = _find_model(world_elem, old_name)
         if model is None:
             raise ValueError(
-                f"Modelo '{hoop['name']}' no encontrado en la plantilla SDF"
+                f"Modelo '{old_name}' no encontrado en la plantilla SDF"
             )
+            
+        model.set("name", hoop["id"])
+        
+        if hoop.get("type") == "pole":
+            link = model.find("link")
+            if link is not None:
+                for child in list(link):
+                    if child.tag in ["visual", "collision"]:
+                        link.remove(child)
+                        
+                visual = ET.SubElement(link, "visual", name="pole_v")
+                v_pose = ET.SubElement(visual, "pose")
+                v_pose.text = "0 0 1.5 0 0 0"
+                v_geom = ET.SubElement(visual, "geometry")
+                v_cyl = ET.SubElement(v_geom, "cylinder")
+                ET.SubElement(v_cyl, "radius").text = "0.1"
+                ET.SubElement(v_cyl, "length").text = "3.0"
+                v_mat = ET.SubElement(visual, "material")
+                ET.SubElement(v_mat, "ambient").text = "1 0.5 0 1"
+                ET.SubElement(v_mat, "diffuse").text = "1 0.5 0 1"
+                
+                collision = ET.SubElement(link, "collision", name="pole_c")
+                c_pose = ET.SubElement(collision, "pose")
+                c_pose.text = "0 0 1.5 0 0 0"
+                c_geom = ET.SubElement(collision, "geometry")
+                c_cyl = ET.SubElement(c_geom, "cylinder")
+                ET.SubElement(c_cyl, "radius").text = "0.1"
+                ET.SubElement(c_cyl, "length").text = "3.0"
+
         pose_str = f"{hoop['x']} {hoop['y']} {hoop['z']} 0 0 {hoop['yaw']}"
         _set_model_pose(model, pose_str)
 
@@ -264,13 +296,15 @@ def _set_model_pose(model: ET.Element, pose_str: str) -> None:
 # ============================================================================
 
 def export_waypoints_yaml(
-    hoops: list[dict],
+    landmarks: list[dict],
+    primitives: list[dict],
     landing: dict,
     output_path: Path,
 ) -> None:
     """Exporta el archivo waypoints.yaml compatible con expert_pilot.py."""
     data = {
-        "hoops": hoops,
+        "landmarks": landmarks,
+        "primitives": primitives,
         "landing": landing,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,14 +413,29 @@ def main() -> None:
         print(f"ERROR: Plantilla SDF no encontrada: {args.template}")
         sys.exit(1)
 
+    task_dir = args.output_dir / args.task_id
+    config_path = task_dir / "task_config.yaml"
+    
+    cfg = None
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+            
+    if cfg is None or "landmarks" not in cfg:
+        print("ERROR: task_config.yaml con landmarks no encontrado. Ejecuta task_generator.py primero.")
+        sys.exit(1)
+        
+    landmarks_info = cfg["landmarks"]
+    primitives = cfg["primitives"]
+
     # Generar circuito aleatorio
     print(f"Generando circuito para '{args.task_id}' (seed={args.seed})...")
-    hoops, landing = generate_random_circuit(seed=args.seed)
+    hoops, landing = generate_random_circuit(landmarks_info, seed=args.seed)
 
-    print("  Aros generados:")
+    print("  Landmarks generados:")
     for h in hoops:
         print(
-            f"    {h['name']}: X={h['x']:6.2f}  Y={h['y']:6.2f}  "
+            f"    {h['id']} ({h['type']}): X={h['x']:6.2f}  Y={h['y']:6.2f}  "
             f"Z={h['z']:6.2f}  Yaw={h['yaw']:+.3f} rad "
             f"({math.degrees(h['yaw']):+.1f}°)"
         )
@@ -398,12 +447,11 @@ def main() -> None:
     tree = modify_sdf(args.template, args.task_id, hoops, landing, args.no_takeoff_platform)
 
     # Exportar archivos
-    task_dir = args.output_dir / args.task_id
     sdf_path = task_dir / f"{args.task_id}.sdf"
     yaml_path = task_dir / "waypoints.yaml"
 
     export_sdf(tree, sdf_path)
-    export_waypoints_yaml(hoops, landing, yaml_path)
+    export_waypoints_yaml(hoops, primitives, landing, yaml_path)
 
     print(f"\n  SDF  -> {sdf_path}")
     print(f"  YAML -> {yaml_path}")

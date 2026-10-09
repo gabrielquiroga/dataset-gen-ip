@@ -29,7 +29,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'expert_pilot = uav_ip.expert_pilot:main',
+            'waypoint_controller = uav_ip.waypoint_controller:main',
+            'tracking_controller = uav_ip.tracking_controller:main',
         ],
     },
 )

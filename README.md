@@ -38,7 +38,61 @@ ros2_ws/
   - `rclpy`, `px4_msgs`, `sensor_msgs` (Dependencias ROS)
   - `rosbags`, `open3d`, `numpy`, `torch` (Dependencias de ML)
 
-## 🚀 Flujo de Ejecución (Pipeline)
+## 🚀 Flujo de Ejecución Actualizado (Arquitectura Modular V2)
+
+Para comprobar el pipeline end-to-end (desde la generación procedural hasta el grafo de PyTorch), sigue este procedimiento abriendo múltiples terminales. *(Se asume que has ejecutado `load_ros` o hecho `source /opt/ros/jazzy/setup.bash` en cada una).*
+
+**Paso 1: Generación Procedural de la Tarea**
+```bash
+# Entrar al workspace y compilar la nueva arquitectura
+cd ~/ros2_ws && colcon build --packages-select uav_ip && source install/setup.bash
+
+# 1. Generar la "receta" semántica de la tarea
+python3 src/uav_ip/scripts/task_generator.py --task-id test_001
+
+# 2. Generar la disposición 3D en Gazebo parcheando los modelos
+python3 src/uav_ip/scripts/world_generator.py --task-id test_001 --output-dir src/uav_ip/generated_worlds
+```
+
+**Paso 2: Levantar PX4 y Simulador**
+```bash
+# (Terminal 1) Lanzar PX4 SITL con el mundo generado
+cd ~/PX4-Autopilot
+export PX4_GZ_WORLD=test_001
+make px4_sitl gz_x500_depth
+```
+
+**Paso 3: Middleware y Puente de Nube de Puntos**
+```bash
+# (Terminal 2) Agente XRCE-DDS para enlazar PX4 con ROS 2
+MicroXRCEAgent udp4 -p 8888
+
+# (Terminal 3) Puente indispensable para habilitar la cámara de profundidad
+ros2 run ros_gz_bridge parameter_bridge "/depth_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked"
+```
+
+**Paso 4: Grabación y Vuelo**
+```bash
+# (Terminal 4) Iniciar el Dataset Tracker (rosbag)
+cd ~/ros2_ws && source install/setup.bash
+# Nota: ros2 bag no sobrescribe carpetas. Borrar la previa con `rm -rf rosbag_test_001` si repites el experimento.
+ros2 bag record -o rosbag_test_001 --topics /fmu/out/vehicle_odometry /depth_camera/points /fmu/in/trajectory_setpoint
+
+# (Terminal 5) Lanzar el Controlador Experto Modular
+cd ~/ros2_ws && source install/setup.bash
+ros2 run uav_ip waypoint_controller --ros-args -p waypoints_file:=/home/gabrielq/ros2_ws/src/uav_ip/generated_worlds/test_001/waypoints.yaml
+```
+
+**Paso 5: Extracción de Características (Instant Policy)**
+```bash
+# (Terminal 6) Una vez finalizado el vuelo, cerrar (Ctrl+C) el comando de rosbag y procesarlo:
+cd ~/ros2_ws && source install/setup.bash
+python3 src/uav_ip/scripts/bag_to_heterodata.py --bag-path rosbag_test_001 --output data.pt
+```
+
+---
+
+## 🛑 Obsoleto - Histórico (Flujo de Ejecución V1)
 
 1. **Preparar el entorno:** En cada terminal, asegúrate de cargar ROS 2 y fijar el dominio de red.
    ```bash

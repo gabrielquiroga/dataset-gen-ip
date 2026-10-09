@@ -42,9 +42,11 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 ```
 
 ## Tareas Activas / Inmediatas
-1. **Paso 1: world_generator.py** (COMPLETADO) - Script que toma circuito_aros_01.sdf como plantilla, aplica variaciones aleatorias a poses de aros, exporta nuevo .sdf + waypoints.yaml y lo inyecta a PX4.
-2. **Paso 2: data_collector.py** (EN PROGRESO) - Orquestador automático con bucle doble (tasks x episodios). Gestiona todo el stack de simulación y extracción de logs.
-3. **Paso 3: ml_pipeline/extractor.py** - Pipeline de extraccion con uv + rosbags.
+1. **Fase de Planeación:** (COMPLETADO) - Creación del `docs/PLAN_DETALLADO_IMPLEMENTACION.md` que traza la hoja de ruta hacia un motor de pseudo-tareas con hitos incrementales para el Hito 0 (Pipeline core) y Hito A (Controladores dinámicos).
+2. **Paso 1: task_generator.py & world_generator.py** (PENDIENTE) - Refactorizar para generar secuencias concretas de primitivas a partir del catálogo (distintas formas/postes) en vez de solo 3 aros estáticos.
+3. **Paso 2: waypoint_controller.py & tracking_controller.py** (PENDIENTE) - Expandir el control para interpretar las secuencias dinámicas (Feed-forward para traverse/overfly y Feedback para orbit).
+4. **Paso 3: data_collector.py** (EN PROGRESO) - Orquestador automático con bucle doble (tasks x episodios).
+5. **Paso 4: ml_pipeline/extractor.py** - Pipeline de extraccion con uv + rosbags (`bag_to_heterodata.py` base completado).
 
 ## Deuda Tecnica
 - **Segmentacion:** Heuristica espacial para borrar suelo de la nube de puntos.

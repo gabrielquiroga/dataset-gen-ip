@@ -43,6 +43,7 @@ from typing import Optional
 ROS2_WS = Path.home() / "ros2_ws"
 UAV_IP_PKG = ROS2_WS / "src" / "uav_ip"
 WORLD_GENERATOR = UAV_IP_PKG / "scripts" / "world_generator.py"
+TASK_GENERATOR = UAV_IP_PKG / "scripts" / "task_generator.py"
 GENERATED_WORLDS = UAV_IP_PKG / "generated_worlds"
 PX4_DIR = Path.home() / "PX4-Autopilot"
 
@@ -91,7 +92,8 @@ STALE_PROCESS_PATTERNS = [
     ["pkill", "-9", "-f", "bin/px4"],
     ["pkill", "-9", "-f", "MicroXRCEAgent"],
     ["pkill", "-9", "-f", "ros_gz_bridge"],
-    ["pkill", "-9", "-f", "expert_pilot"],
+    ["pkill", "-9", "-f", "waypoint_controller"],
+    ["pkill", "-9", "-f", "tracking_controller"],
     ["pkill", "-9", "-f", "ros2 bag"],
 ]
 
@@ -370,28 +372,40 @@ class DataCollector:
     # ----------------------------------------------------------------
 
     def _generate_world(self, task_id: str, seed: int) -> bool:
-        """Ejecuta world_generator.py para crear el mundo."""
+        """Ejecuta task_generator.py y world_generator.py para crear el mundo."""
+        print(f"  Generando configuracion de tarea {task_id} (seed={seed})...")
+        cmd_task = [
+            sys.executable,
+            str(TASK_GENERATOR),
+            "--task-id", task_id,
+            "--seed", str(seed),
+        ]
+        result_task = subprocess.run(cmd_task, capture_output=True, text=True)
+        if result_task.returncode != 0:
+            print(f"  [ERROR] task_generator.py fallo:\n{result_task.stderr}")
+            return False
+            
         print(f"  Generando mundo {task_id} (seed={seed})...")
-        cmd = [
+        cmd_world = [
             sys.executable,
             str(WORLD_GENERATOR),
             "--task-id", task_id,
             "--seed", str(seed),
         ]
         if self.no_takeoff_platform:
-            cmd.append("--no-takeoff-platform")
+            cmd_world.append("--no-takeoff-platform")
 
-        result = subprocess.run(
-            cmd,
+        result_world = subprocess.run(
+            cmd_world,
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
-            print(f"  [ERROR] world_generator.py fallo:\n{result.stderr}")
+        if result_world.returncode != 0:
+            print(f"  [ERROR] world_generator.py fallo:\n{result_world.stderr}")
             return False
 
         # Mostrar resumen
-        for line in result.stdout.strip().split("\n"):
+        for line in result_world.stdout.strip().split("\n"):
             if line.strip():
                 print(f"    {line.strip()}")
         return True
@@ -458,7 +472,7 @@ class DataCollector:
 
             # 6. Lanzar piloto experto
             print("    Lanzando piloto experto...")
-            self._start_expert_pilot(
+            self._start_pilot(
                 waypoints_file, log_dir / "pilot.log"
             )
 
@@ -583,14 +597,14 @@ class DataCollector:
             log_file=log_file,
         )
 
-    def _start_expert_pilot(
+    def _start_pilot(
         self, waypoints_file: Path, log_file: Path
     ) -> None:
         """Lanza el nodo del piloto experto."""
         self.pm.start(
             "pilot",
             [
-                "ros2", "run", "uav_ip", "expert_pilot",
+                "ros2", "run", "uav_ip", "waypoint_controller",
                 "--ros-args",
                 "-p", f"waypoints_file:={waypoints_file}",
             ],
