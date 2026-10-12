@@ -144,27 +144,32 @@ python3 src/uav_ip/scripts/bag_to_heterodata.py \
   --scale 0.1 \
   --fps-points 2048
 ```
+*(Nota: Por defecto, `bag_to_heterodata.py` recorta automáticamente los tiempos estáticos en tierra antes del despegue y tras el aterrizaje. Puedes desactivarlo con `--no-trim-idle` o cambiar el umbral con `--trim-start liftoff`).*
+
 El archivo `test_001.pt` resultante contendrá el grafo con:
 - `data['scene'].pos`: nubes de 2048 puntos de los landmarks visibles a $\le 10\text{ m}$ en marco FLU egocéntrico escaladas a $s = 0.1$.
 - `data['agent'].x`: trayectoria real ejecutada ($s = 0.1$).
 - `data['agent'].y`: acciones / setpoints futuros ($s = 0.1$).
 
-### Paso 6: Visualizar e Inspeccionar los Datos en 3D
+### Paso 6: Visualizar e Inspeccionar los Datos en 3D (Instantáneo o Animación)
 Para auditar visualmente tanto la nube LiDAR egocéntrica como la trayectoria del dron:
 
 ```bash
 cd ~/ros2_ws
 
-# 1. Visualizar la nube LiDAR de un instante específico (ej. paso t=10) del archivo .pt o .npz:
+# 1. Reproducir el vuelo completo como ANIMACION tipo video (GUI o GIF):
+python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --animate --output vuelo_animado.gif
+
+# 2. Visualizar un fotograma estático específico (ej. paso t=10):
 python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --step 10 --output vista_lidar.png
 
-# 2. O verificar directamente el LiDAR sintético sobre los waypoints sin necesidad de volar:
+# 3. O verificar directamente el LiDAR sintético sobre los waypoints sin necesidad de volar:
 python3 src/uav_ip/scripts/visualize_dataset.py \
   --waypoints src/uav_ip/generated_worlds/test_001/waypoints.yaml \
   --drone-pose 0.0 0.0 1.5 0.0 \
   --output test_lidar.png
 ```
-*(Si ejecutas en WSL2 con WSLg o servidor gráfico, se abrirá una ventana 3D interactiva de Matplotlib. Si estás en entorno headless, se guardará automáticamente la imagen `.png` en alta resolución).*
+*(Si ejecutas en WSL2 con WSLg o servidor gráfico, `--animate` reproducirá el vuelo en una ventana interactiva continua; si estás en entorno headless o especificas `.gif`, guardará la animación completa en video GIF).*
 
 ---
 

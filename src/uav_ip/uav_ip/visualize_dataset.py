@@ -31,6 +31,7 @@ if not has_display:
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 # Agregar directorio local al sys.path para importar synthetic_lidar
 script_dir = Path(__file__).resolve().parent
@@ -216,6 +217,123 @@ def plot_trajectory_global(
         plt.show()
 
 
+def animate_pointcloud_and_trajectory(
+    agent_x: np.ndarray,
+    agent_y: np.ndarray,
+    scene_pos: np.ndarray,
+    scale: float = 0.1,
+    title: str = "Vuelo Animado Instant Policy (HeteroData)",
+    output_anim: Path = None,
+    fps: int = 15,
+    interactive: bool = True
+):
+    """
+    Genera una animacion sincronizada de la trayectoria global y las nubes LiDAR 360° egocentricas.
+    Subplots sincronizados en cada frame t:
+    1. Perspectiva 3D: Trayectoria global + posicion actual del dron.
+    2. Plano Superior 2D (XY): Vista del sensor desde el dron (adelante/lados).
+    3. Plano Lateral 2D (XZ): Vista de altura y sobrevuelo (overfly/slalom).
+    """
+    T = len(scene_pos)
+    fig = plt.figure(figsize=(16, 6))
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    # 1. Subplot 3D Perspectiva: Trayectoria Global
+    ax3d = fig.add_subplot(131, projection="3d")
+    ax3d.plot(agent_x[:, 0], agent_x[:, 1], agent_x[:, 2], color="gray", linestyle="--", alpha=0.5, label="Ruta completa")
+    line_history, = ax3d.plot([], [], [], "b-", linewidth=2, label="Recorrido actual")
+    drone_marker = ax3d.scatter([agent_x[0, 0]], [agent_x[0, 1]], [agent_x[0, 2]], color="red", s=100, marker="^", label="Dron")
+
+    ax3d.set_xlabel("X ENU [m·s]")
+    ax3d.set_ylabel("Y ENU [m·s]")
+    ax3d.set_zlabel("Z ENU [m·s]")
+    ax3d.set_title("Trayectoria 3D Global")
+
+    x_min, x_max = float(np.min(agent_x[:, 0])) - 0.2, float(np.max(agent_x[:, 0])) + 0.2
+    y_min, y_max = float(np.min(agent_x[:, 1])) - 0.2, float(np.max(agent_x[:, 1])) + 0.2
+    z_min, z_max = min(0.0, float(np.min(agent_x[:, 2])) - 0.1), float(np.max(agent_x[:, 2])) + 0.2
+    ax3d.set_xlim(x_min, x_max)
+    ax3d.set_ylim(y_min, y_max)
+    ax3d.set_zlim(z_min, z_max)
+    ax3d.legend(loc="upper left", fontsize=8)
+
+    # 2. Subplot 2D: Vista Superior Egocentrica (Plano XY)
+    ax_xy = fig.add_subplot(132)
+    cloud_0 = scene_pos[0]
+    dists_0 = np.linalg.norm(cloud_0, axis=1)
+    scat_xy = ax_xy.scatter(cloud_0[:, 0], cloud_0[:, 1], c=dists_0, cmap="viridis", s=8, alpha=0.7)
+    ax_xy.scatter([0], [0], color="red", s=100, marker="^", label="Dron (0,0)")
+    ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
+    axis_len = 0.3
+    ax_xy.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="+X Adelante")
+    ax_xy.quiver(0, 0, 0, axis_len, color="g", scale=1, scale_units="xy", angles="xy", label="+Y Izquierda")
+    ax_xy.set_xlim(-1.1, 1.1)
+    ax_xy.set_ylim(-1.1, 1.1)
+    ax_xy.set_xlabel("X FLU [m·s] (Adelante ->)")
+    ax_xy.set_ylabel("Y FLU [m·s] (<- Izq / Der ->)")
+    ax_xy.set_title("LiDAR 360° Egocéntrico (Plano XY)")
+    ax_xy.grid(True, linestyle=":", alpha=0.6)
+    ax_xy.axis("equal")
+    ax_xy.legend(loc="upper left", fontsize=8)
+
+    # 3. Subplot 2D: Vista Lateral Egocentrica (Plano XZ)
+    ax_xz = fig.add_subplot(133)
+    scat_xz = ax_xz.scatter(cloud_0[:, 0], cloud_0[:, 2], c=dists_0, cmap="viridis", s=8, alpha=0.7)
+    ax_xz.scatter([0], [0], color="red", s=100, marker="^", label="Dron (0,0)")
+    ax_xz.axhline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xz.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="+X Adelante")
+    ax_xz.quiver(0, 0, 0, axis_len, color="b", scale=1, scale_units="xy", angles="xy", label="+Z Arriba")
+    ax_xz.set_xlim(-1.1, 1.1)
+    ax_xz.set_ylim(-0.8, 0.8)
+    ax_xz.set_xlabel("X FLU [m·s] (Adelante ->)")
+    ax_xz.set_ylabel("Z FLU [m·s] (Arriba ->)")
+    ax_xz.set_title("LiDAR 360° Egocéntrico (Plano XZ)")
+    ax_xz.grid(True, linestyle=":", alpha=0.6)
+    ax_xz.axis("equal")
+    ax_xz.legend(loc="upper left", fontsize=8)
+
+    plt.tight_layout()
+
+    def update(frame):
+        line_history.set_data(agent_x[:frame+1, 0], agent_x[:frame+1, 1])
+        line_history.set_3d_properties(agent_x[:frame+1, 2])
+        drone_marker._offsets3d = ([agent_x[frame, 0]], [agent_x[frame, 1]], [agent_x[frame, 2]])
+
+        cloud = scene_pos[frame]
+        dists = np.linalg.norm(cloud, axis=1)
+
+        scat_xy.set_offsets(cloud[:, :2])
+        scat_xy.set_array(dists)
+
+        scat_xz.set_offsets(np.column_stack([cloud[:, 0], cloud[:, 2]]))
+        scat_xz.set_array(dists)
+
+        alt_m = agent_x[frame, 2] / scale
+        x_m = agent_x[frame, 0] / scale
+        fig.suptitle(f"{title} | Paso {frame}/{T-1} | X: {x_m:.1f} m | Altitud: {alt_m:.2f} m", fontsize=14, fontweight="bold")
+        return line_history, drone_marker, scat_xy, scat_xz
+
+    anim = FuncAnimation(fig, update, frames=T, interval=1000 // max(1, fps), blit=False)
+
+    if output_anim:
+        output_anim = Path(output_anim)
+        output_anim.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Renderizando animacion a {output_anim.resolve()} (FPS={fps}, frames={T})...")
+        anim.save(output_anim, writer=PillowWriter(fps=fps))
+        print(f"[OK] Animacion guardada exitosamente en: {output_anim.resolve()}")
+
+    if interactive and has_display:
+        print("[INFO] Mostrando reproduccion animada interactiva...")
+        plt.show()
+    elif not has_display and not output_anim:
+        default_out = Path("animacion_vuelo.gif")
+        print(f"[INFO] Entorno sin pantalla detectado. Guardando GIF animado en: {default_out.resolve()}...")
+        anim.save(default_out, writer=PillowWriter(fps=fps))
+        print(f"[OK] Animacion guardada en: {default_out.resolve()}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualizador 3D para HeteroData y LiDAR Sintetico 360°"
@@ -247,6 +365,17 @@ def main():
         help="Indice del paso temporal a visualizar en archivos .pt / .npz (default: 0)"
     )
     parser.add_argument(
+        "--animate", "-a",
+        action="store_true",
+        help="Reproducir o guardar una animacion continua tipo video del vuelo completo y del LiDAR"
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=15,
+        help="Cuadros por segundo para la animacion (default: 15)"
+    )
+    parser.add_argument(
         "--r-max",
         type=float,
         default=10.0,
@@ -262,12 +391,12 @@ def main():
         "--output", "-o",
         type=Path,
         default=None,
-        help="Ruta donde guardar la imagen resultante (.png)"
+        help="Ruta donde guardar la imagen resultante (.png) o animacion (.gif)"
     )
     parser.add_argument(
         "--no-gui",
         action="store_true",
-        help="No abrir ventana interactiva, solo generar y guardar la imagen"
+        help="No abrir ventana interactiva, solo generar y guardar la imagen o animacion"
     )
 
     args = parser.parse_args()
@@ -295,17 +424,32 @@ def main():
         print(f"Distancia maxima del LiDAR:     {np.max(np.linalg.norm(cloud, axis=1)):.3f} (en espacio s={args.scale})")
         print("------------------------------------------")
 
-        title = f"HeteroData: {args.file.name} (Paso t={step}/{T-1})"
-        plot_pointcloud_and_trajectory(
-            cloud=cloud,
-            agent_x=agent_x,
-            agent_y=agent_y,
-            current_step=step,
-            scale=args.scale,
-            title=title,
-            output_image=args.output,
-            interactive=not args.no_gui
-        )
+        is_anim = args.animate or (args.output is not None and args.output.suffix.lower() in [".gif", ".mp4"])
+
+        if is_anim:
+            title = f"Vuelo Animado: {args.file.name}"
+            animate_pointcloud_and_trajectory(
+                agent_x=agent_x,
+                agent_y=agent_y,
+                scene_pos=scene_pos,
+                scale=args.scale,
+                title=title,
+                output_anim=args.output,
+                fps=args.fps,
+                interactive=not args.no_gui
+            )
+        else:
+            title = f"HeteroData: {args.file.name} (Paso t={step}/{T-1})"
+            plot_pointcloud_and_trajectory(
+                cloud=cloud,
+                agent_x=agent_x,
+                agent_y=agent_y,
+                current_step=step,
+                scale=args.scale,
+                title=title,
+                output_image=args.output,
+                interactive=not args.no_gui
+            )
 
     # 2. Modo B: Inspeccionar LiDAR sintetico directamente desde waypoints.yaml
     elif args.waypoints:

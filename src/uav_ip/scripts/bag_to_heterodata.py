@@ -242,6 +242,76 @@ def parse_bag_telemetry(bag_path: Path) -> Dict[str, List[Dict[str, Any]]]:
     return data
 
 
+def find_flight_trim_indices(
+    odom_list: List[Dict[str, Any]],
+    using_local_pos: bool = False,
+    trim_start: str = "takeoff_exit",
+    min_takeoff_alt: float = 1.0,
+    liftoff_alt: float = 0.4,
+    touchdown_alt: float = 0.38
+) -> tuple[int, int]:
+    """
+    Detecta los indices de inicio y fin de la ventana util de vuelo:
+    - start_idx: Cuando el dron completa el despegue e inicia el avance hacia el circuito
+                 (o cuando despega si trim_start='liftoff').
+    - end_idx: Cuando el dron aterriza (touchdown) en la plataforma final.
+    """
+    N = len(odom_list)
+    if N == 0:
+        return 0, 0
+
+    z_enu = np.zeros(N, dtype=np.float64)
+    dist_xy = np.zeros(N, dtype=np.float64)
+
+    for i, item in enumerate(odom_list):
+        if not using_local_pos:
+            pos = item["position"]  # NED
+            z = -float(pos[2])      # ENU
+            x = float(pos[1])
+            y = float(pos[0])
+        else:
+            z = float(item["z"])
+            x = float(item["y"])
+            y = float(item["x"])
+        z_enu[i] = z
+        dist_xy[i] = math.sqrt(x * x + y * y)
+
+    # 1. Inicio de vuelo util
+    if trim_start == "none":
+        start_idx = 0
+    elif trim_start == "liftoff":
+        idx_candidates = np.where(z_enu >= liftoff_alt)[0]
+        start_idx = int(idx_candidates[0]) if len(idx_candidates) > 0 else 0
+    else:  # "takeoff_exit" (default)
+        at_alt = np.where(z_enu >= min_takeoff_alt)[0]
+        if len(at_alt) > 0:
+            first_alt = int(at_alt[0])
+            moving = np.where(dist_xy[first_alt:] >= 0.25)[0]
+            if len(moving) > 0:
+                start_idx = int(first_alt + moving[0])
+            else:
+                start_idx = first_alt
+        else:
+            start_idx = 0
+
+    # 2. Fin de vuelo util (touchdown)
+    if trim_start == "none":
+        end_idx = N - 1
+    else:
+        max_dist_idx = int(np.argmax(dist_xy))
+        after_circuit = np.where((np.arange(N) >= max_dist_idx) & (z_enu <= touchdown_alt))[0]
+        if len(after_circuit) > 0:
+            end_idx = min(N - 1, int(after_circuit[0] + 10))
+        else:
+            end_idx = N - 1
+
+    if end_idx <= start_idx:
+        end_idx = N - 1
+        start_idx = 0
+
+    return start_idx, end_idx
+
+
 def build_heterodata_from_synthetic_lidar(
     parsed_data: Dict[str, Any],
     waypoints_file: Path,
@@ -249,7 +319,10 @@ def build_heterodata_from_synthetic_lidar(
     scale_factor: float = 0.1,
     r_max: float = 10.0,
     fps_points: int = 2048,
-    subsample_step: int = 5
+    subsample_step: int = 5,
+    trim_idle: bool = True,
+    trim_start: str = "takeoff_exit",
+    min_takeoff_alt: float = 1.0
 ) -> bool:
     """
     Construye el HeteroData usando SyntheticLidarGenerator para sintetizar las
@@ -289,6 +362,19 @@ def build_heterodata_from_synthetic_lidar(
     if not odom_list:
         print("ERROR: No se encontraron mensajes de odometria ni posicion en el rosbag.")
         return False
+
+    # Recorte de momentos estaticos en tierra (espera de armado pre-despegue y post-aterrizaje)
+    if trim_idle:
+        start_idx, end_idx = find_flight_trim_indices(
+            odom_list,
+            using_local_pos=using_local_pos,
+            trim_start=trim_start,
+            min_takeoff_alt=min_takeoff_alt
+        )
+        total_raw = len(odom_list)
+        odom_list = odom_list[start_idx:end_idx + 1]
+        print(f"  Recorte de vuelo util aplicado: [{start_idx}:{end_idx}] "
+              f"({len(odom_list)} de {total_raw} muestras conservadas).")
 
     # Submuestreo temporal uniforme para no saturar con 250Hz nativos de PX4
     sampled_indices = list(range(0, len(odom_list), max(1, subsample_step)))
@@ -436,6 +522,17 @@ def main():
         default=5,
         help="Paso de submuestreo temporal de telemetria (default: 5)"
     )
+    parser.add_argument(
+        "--no-trim-idle",
+        action="store_true",
+        help="Desactiva el recorte automatico de momentos estaticos en tierra (pre-despegue y post-aterrizaje)"
+    )
+    parser.add_argument(
+        "--trim-start",
+        choices=["takeoff_exit", "liftoff", "none"],
+        default="takeoff_exit",
+        help="Criterio de inicio de recorte: 'takeoff_exit' (al salir de despegue hacia circuito) o 'liftoff' (al despegar del suelo)"
+    )
 
     args = parser.parse_args()
 
@@ -462,7 +559,9 @@ def main():
         scale_factor=args.scale,
         r_max=args.r_max,
         fps_points=args.fps_points,
-        subsample_step=args.subsample_step
+        subsample_step=args.subsample_step,
+        trim_idle=not args.no_trim_idle,
+        trim_start=args.trim_start
     )
 
 
