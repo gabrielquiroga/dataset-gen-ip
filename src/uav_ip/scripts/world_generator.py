@@ -138,13 +138,16 @@ def generate_random_circuit(
                 y = max(MIN_GATE_Y, min(MAX_GATE_Y, y))
 
             # Posicion Z: altura
-            z = rng.uniform(MIN_GATE_Z, MAX_GATE_Z)
+            if landmarks_info[i].get("type") == "pole":
+                z = 1.5   # Centro geometrico de un poste de 3.0m apoyado en el suelo
+            else:
+                z = rng.uniform(MIN_GATE_Z, MAX_GATE_Z)
 
             # Yaw: rotacion de la abertura
             yaw = rng.uniform(-MAX_GATE_YAW, MAX_GATE_YAW)
 
-            # Validar que la barra inferior no toque el suelo
-            if z - GATE_HALF_HEIGHT < 0.1:
+            # Validar que la barra inferior no toque el suelo (solo para gates)
+            if landmarks_info[i].get("type") != "pole" and z - GATE_HALF_HEIGHT < 0.1:
                 feasible = False
                 break
 
@@ -256,7 +259,10 @@ def modify_sdf(
                 ET.SubElement(c_cyl, "radius").text = "0.1"
                 ET.SubElement(c_cyl, "length").text = "3.0"
 
-        pose_str = f"{hoop['x']} {hoop['y']} {hoop['z']} 0 0 {hoop['yaw']}"
+        if hoop.get("type") == "pole":
+            pose_str = f"{hoop['x']} {hoop['y']} 0.0 0 0 {hoop['yaw']}"
+        else:
+            pose_str = f"{hoop['x']} {hoop['y']} {hoop['z']} 0 0 {hoop['yaw']}"
         _set_model_pose(model, pose_str)
 
     # Modificar pose de la plataforma de aterrizaje
@@ -302,9 +308,14 @@ def export_waypoints_yaml(
     output_path: Path,
 ) -> None:
     """Exporta el archivo waypoints.yaml compatible con expert_pilot.py."""
+    landmarks_map = {lm["id"]: lm for lm in landmarks}
+    sorted_primitives = sorted(
+        primitives,
+        key=lambda p: float(landmarks_map.get(p.get("target"), {}).get("x", 0.0))
+    )
     data = {
         "landmarks": landmarks,
-        "primitives": primitives,
+        "primitives": sorted_primitives,
         "landing": landing,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,7 +475,7 @@ def main() -> None:
             print(
                 f"\nLanzar con: PX4_GZ_WORLD={args.task_id} "
                 f"PX4_GZ_MODEL_POSE=\"0,0,0.2,0,0,0\" "
-                f"make px4_sitl gz_x500_depth"
+                f"make px4_sitl gz_x500"
             )
         except FileNotFoundError as e:
             print(f"\n  WARN: {e}")

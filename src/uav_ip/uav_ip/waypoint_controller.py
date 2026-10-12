@@ -49,9 +49,21 @@ class WaypointController(BasePilot):
             "yaw": 0.0
         })
         
-        landmarks_map = {lm["id"]: lm for lm in cfg.get("landmarks", [])}
+        landmarks_list = cfg.get("landmarks") or []
+        if not landmarks_list and "hoops" in cfg:
+            landmarks_list = []
+            for h in cfg["hoops"]:
+                h_copy = dict(h)
+                h_copy["id"] = h_copy.get("name", "hoop")
+                h_copy["type"] = "gate"
+                landmarks_list.append(h_copy)
+
+        landmarks_map = {lm["id"]: lm for lm in landmarks_list}
         
         primitives = cfg.get("primitives", [])
+        if not primitives and landmarks_list:
+            sorted_lms = sorted(landmarks_list, key=lambda l: float(l.get("x", 0.0)))
+            primitives = [{"type": "traverse", "target": lm["id"]} for lm in sorted_lms]
         
         def get_prim_x(prim):
             tid = prim.get("target")
@@ -148,7 +160,7 @@ class WaypointController(BasePilot):
                 if dist_xy < 0.3:
                     self.current_wp += 1
             elif wp_type == "pre":
-                if dist_xy < 0.2:
+                if dist_xy < 0.25 and abs(dz) < 0.35:
                     self.current_wp += 1
             elif wp_type == "center":
                 if dist_3d < 0.4:

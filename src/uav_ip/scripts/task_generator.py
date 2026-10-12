@@ -19,7 +19,10 @@ def main():
     random.seed(args.seed)
 
     num_gates = 3
-    logics = ["A1_DIRECT", "A2_REVERSE", "A3_ALTERNATING"]
+    # En el pasillo unidireccional (+X), la logica factible y compatible con la hipotesis
+    # de Markov y camara frontal (PLAN_ESTRATEGIA.md 6.4) es A1_DIRECT.
+    # Variantes topologicas complejas (A2, A3) requeriran un circuito 2D cerrado o spawn opuesto.
+    logics = ["A1_DIRECT"]
     logic = random.choice(logics)
     
     profiles = ["B1_LINEAR", "B2_BSPLINE"]
@@ -31,11 +34,9 @@ def main():
         landmark_type = random.choice(["gate", "pole"])
         landmarks.append({"id": landmark_id, "type": landmark_type})
         
+    # En el pasillo unidireccional (+X), el avance fisico debe ser progresivo
+    # para evitar vuelo ciego hacia atras y colisiones intermedias sin evitar obstaculos (PLAN_ESTRATEGIA.md 6.4).
     ordered_landmarks = list(landmarks)
-    if logic == "A2_REVERSE":
-        ordered_landmarks = ordered_landmarks[::-1]
-    elif logic == "A3_ALTERNATING" and num_gates >= 3:
-        ordered_landmarks = [ordered_landmarks[0], ordered_landmarks[2], ordered_landmarks[1]]
         
     primitives = []
     for lm in ordered_landmarks:

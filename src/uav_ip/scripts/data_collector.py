@@ -50,12 +50,14 @@ PX4_DIR = Path.home() / "PX4-Autopilot"
 # Directorio de salida del dataset
 DATASET_DIR = ROS2_WS / "datasets"
 
-# Topicos a grabar
+# Topicos a grabar (telemetria ligera PX4 < 5 MB/demo, sin PointCloud2 pesada)
 RECORD_TOPICS = [
     "/fmu/out/vehicle_odometry",
-    "/fmu/out/vehicle_local_position_v1",
     "/fmu/in/trajectory_setpoint",
-    "/depth_camera/points",
+    "/fmu/out/vehicle_land_detected",
+    "/fmu/out/vehicle_status_v4",
+    "/fmu/out/vehicle_local_position_v1",
+    "/fmu/in/vehicle_command",
 ]
 
 # Timeouts (segundos)
@@ -70,9 +72,9 @@ PROCESS_KILL_TIMEOUT = 10      # Tiempo para que un proceso muera con SIGINT
 # Variables de entorno para PX4
 PX4_MODEL_POSE = "0,0,0.3,0,0,0"
 GZ_VERSION = "harmonic"
-PX4_VEHICLE = "gz_x500_depth"
+PX4_VEHICLE = "gz_x500"        # Vehiculo estandar gz_x500 (acelera RTF; observacion privilegiada)
 
-# Binario de PX4 SITL (generado por `make px4_sitl gz_x500_depth`).
+# Binario de PX4 SITL (generado por `make px4_sitl gz_x500`).
 # Se lanza directamente en modo daemon (-d) en lugar de via `make`:
 #   - `make` usa USES_TERMINAL y arranca el shell interactivo `pxh>`, que lee
 #     stdin. Sin TTY, pxh entra en un bucle que llena el log (~190 MB/vuelo);
@@ -427,6 +429,12 @@ class DataCollector:
         log_dir.mkdir(exist_ok=True)
         waypoints_file = GENERATED_WORLDS / task_id / "waypoints.yaml"
 
+        # Asegurar copia de waypoints.yaml en la carpeta del episodio para postproceso
+        ep_wp_dst = ep_dir / "waypoints.yaml"
+        if waypoints_file.exists() and not ep_wp_dst.exists():
+            import shutil
+            shutil.copy2(waypoints_file, ep_wp_dst)
+
         print(f"    Logs del episodio: {log_dir}")
         print(f"      (monitorear piloto: tail -f {log_dir}/pilot.log)")
         print(f"      (monitorear PX4/SITL: tail -f {log_dir}/px4.log)")
@@ -447,7 +455,7 @@ class DataCollector:
                 return "xrce_crash"
 
             # 2. Lanzar PX4 + Gazebo
-            print(f"    Lanzando PX4 (world={task_id})...")
+            print(f"    Lanzando PX4 (world={task_id}, model={PX4_VEHICLE})...")
             self._start_px4(task_id, log_dir / "px4.log")
             time.sleep(self.px4_startup_wait)
 
@@ -456,10 +464,13 @@ class DataCollector:
                 self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
                 return "px4_crash"
 
-            # 3. Lanzar gz_bridge
-            print("    Lanzando ros_gz_bridge...")
-            self._start_gz_bridge(log_dir / "bridge.log")
-            time.sleep(BRIDGE_STARTUP_DELAY)
+            # 3. Lanzar gz_bridge (solo requerido si se utiliza modelo con camara de profundidad)
+            if PX4_VEHICLE == "gz_x500_depth":
+                print("    Lanzando ros_gz_bridge (camara de profundidad)...")
+                self._start_gz_bridge(log_dir / "bridge.log")
+                time.sleep(BRIDGE_STARTUP_DELAY)
+            else:
+                print("    [INFO] Vehiculo gz_x500: Observacion privilegiada activa (sin camara de profundidad).")
 
             # 4. Espera de estabilizacion
             print(f"    Esperando {PRE_FLIGHT_SETTLE}s de estabilizacion...")
@@ -662,6 +673,10 @@ class DataCollector:
             "episode_id": ep_id,
             "status": status,
             "timestamp": datetime.datetime.now().isoformat(),
+            "vehicle_model": PX4_VEHICLE,
+            "embodiment": "uav_lidar_360_privileged",
+            "scale_factor": 0.1,
+            "lidar_r_max": 10.0,
             "topics_recorded": RECORD_TOPICS,
             "episode_timeout_s": self.episode_timeout,
         }
