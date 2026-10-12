@@ -1,16 +1,16 @@
 # UAV Instant Policy: Data Collection & Synthetic LiDAR Pipeline
 
 ## 📖 Descripción del Proyecto
+
 Este proyecto implementa un *pipeline* automatizado de recolección de datos en simulación para entrenar un modelo de Aprendizaje por Imitación en Contexto (*In-Context Imitation Learning* - ICIL), basado en la arquitectura **Instant Policy** (Vosylius y Johns, ICLR 2025).
 
 El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot** para simular un VANT (Vehículo Aéreo No Tripulado) que navega procedimentalmente a través de circuitos dinámicos de landmarks (aros cuadrados, toroides, postes cilíndricos y plataformas de aterrizaje).
 
-### 🎯 Embodiment y Observación Privilegiada (LiDAR 360°)
-- **Embodiment:** El dron se modela conceptualmente con un sensor **LiDAR 3D omnidireccional 360°** (análogo en el mundo real a un *Livox Mid-360*), implementado mediante **observación privilegiada** en modo `range` ($R_{\text{max}} = 10.0\text{ m}$).
-- **Preservación de la Hipótesis de Markov:** La visión 360° elimina la ceguera retrospectiva (*backward blindness*) al cruzar aros o superar obstáculos, reteniendo simultáneamente referencias espaciales al frente y detrás sin requerir modelos recurrentes en Fase 1.
-- **Simulación Ligera (`gz_x500`):** Se utiliza el modelo estándar `gz_x500` de PX4 en lugar de `gz_x500_depth`, acelerando drásticamente el *Real-Time Factor* (RTF) al eliminar el renderizado de cámaras de profundidad en Gazebo.
-- **Eficiencia de Almacenamiento:** Los rosbags registran exclusivamente telemetría ligera de PX4 (**$< 5\text{ MB}$ por demo**, frente a los 5–6 GB del enfoque obsoleto con cámara).
-- **Escala Métrica ($s = 0.1$):** Se aplica $s = 0.1$ a coordenadas y deltas para evitar el aliasing espacial en la codificación posicional sinusoidal de Instant Policy.
+<p align="center">
+   <img src='docs\assets\vuelo_lidar_sintetico.gif' width="850" alt="Animación de vuelo y LiDAR sintético" />
+   <br>
+   <em>Figura 1: Visualización sincronizada del vuelo en 3D (izquierda), proyección egocéntrica del LiDAR en plano XY (centro) y perfil vertical en plano XZ (derecha) mostrando la maniobra de sobrepaso.</em>
+</p>
 
 ---
 
@@ -83,6 +83,12 @@ python3 src/uav_ip/scripts/task_generator.py --task-id test_001 --seed 42
 # 2. Generar el mundo en Gazebo y exportar waypoints.yaml
 python3 src/uav_ip/scripts/world_generator.py --task-id test_001 --seed 42 --output-dir src/uav_ip/generated_worlds
 ```
+
+<p align="center">
+   <img src='docs\assets\gazebo_world_init.png' width="60%">
+   <br>
+   <em>Figura 2: Mundo procedural generado con landmarks (aros cuadrados, toroides y postes cilíndricos).</em>
+</p>
 
 ### Paso 2: Lanzar el Simulador PX4 SITL (Terminal 1)
 ```bash
@@ -171,6 +177,13 @@ python3 src/uav_ip/scripts/visualize_dataset.py \
 ```
 *(Si ejecutas en WSL2 con WSLg o servidor gráfico, `--animate` reproducirá el vuelo en una ventana interactiva continua; si estás en entorno headless o especificas `.gif`, guardará la animación completa en video GIF).*
 
+<p align="center">
+   <img src='docs\assets\gazebo_world_1.png' width=30% alt="Mundo en Gazebo" />
+   <img src='docs\assets\lidar_sintetico_1(t_110).png' width=68% alt="LiDAR 360° en t=110" />
+   <br>
+   <em>Figura 3: Correspondencia entre el entorno físico simulado en Gazebo (izquierda) y la observación LiDAR sintética procesada para la red neuronal (derecha).</em>
+
+</p>
 ---
 
 ## 🤖 Procedimiento 2: Generación Automatizada del Dataset Completo
@@ -231,6 +244,14 @@ for ep_dir in datasets/task_*/episode_*/; do
   fi
 done
 ```
+
+---
+### 🎯 Embodiment y Observación Privilegiada (LiDAR 360°)
+- **Embodiment:** El dron se modela conceptualmente con un sensor **LiDAR 3D omnidireccional 360°** (análogo en el mundo real a un *Livox Mid-360*), implementado mediante **observación privilegiada** en modo `range` ($R_{\text{max}} = 10.0\text{ m}$).
+- **Preservación de la Hipótesis de Markov:** La visión 360° elimina la ceguera retrospectiva (*backward blindness*) al cruzar aros o superar obstáculos, reteniendo simultáneamente referencias espaciales al frente y detrás sin requerir modelos recurrentes en Fase 1.
+- **Simulación Ligera (`gz_x500`):** Se utiliza el modelo estándar `gz_x500` de PX4 en lugar de `gz_x500_depth`, acelerando drásticamente el *Real-Time Factor* (RTF) al eliminar el renderizado de cámaras de profundidad en Gazebo.
+- **Eficiencia de Almacenamiento:** Los rosbags registran exclusivamente telemetría ligera de PX4 (**$< 5\text{ MB}$ por demo**, frente a los 5–6 GB del enfoque obsoleto con cámara).
+- **Escala Métrica ($s = 0.1$):** Se aplica $s = 0.1$ a coordenadas y deltas para evitar el aliasing espacial en la codificación posicional sinusoidal de Instant Policy.
 
 ---
 
