@@ -1,54 +1,39 @@
-# Memoria de Estado del Proyecto
+# Memoria de Estado del Proyecto: UAV Instant Policy
 
-*Este archivo rastrea el progreso del proyecto, las decisiones arquitectonicas tomadas y las tareas pendientes. Debe ser actualizado por el agente conforme se avance.*
+*Índice ejecutivo de estado técnico y punteros de referencia · Actualizado a Octubre de 2026*
 
-## Logros Completados
-- **Setup Base:** Instalacion exitosa de Ubuntu 24.04 (WSL2), ROS 2 Jazzy, Gazebo Harmonic y PX4 SITL.
-- **Comunicacion:** Enlace DDS establecido mediante Micro XRCE-DDS Agent.
-- **Piloto Experto (v1):** Script Python creado (`expert_pilot.py`) que publica `TrajectorySetpoint` sincronizado con el timestamp de PX4, cruzando exitosamente aros fijos.
-- **Integracion de Sensores:** `ros_gz_bridge` configurado correctamente para extraer `PointCloudPacked` hacia `sensor_msgs/PointCloud2`.
-- **Validacion de Datos:** Grabacion exitosa de rosbags (`.mcap` de 6+ GiB) conteniendo Odometria, Acciones y Nubes de Puntos, validados visualmente con Foxglove Studio.
-- **Piloto Experto (v2 - Parametrico):** Refactorizacion completa de `expert_pilot.py` para leer waypoints dinamicamente desde un archivo YAML (parametro ROS 2 `waypoints_file`). Genera automaticamente waypoints pre-alineacion y post-salida para cada aro usando trigonometria (cos/sin del yaw del aro). Incluye salida limpia con `SystemExit(0)` para deteccion por el orquestador. Validado con backward-compatibility test: 9/9 waypoints coinciden con el circuito original. Probado en simulacion: vuelo exitoso identico al v1.
-- **Infraestructura de Paquete:** `setup.py` actualizado con entry_point `expert_pilot` y data_files para instalar mundos SDF y YAML. Build exitoso con `colcon build`.
+---
 
-## Decisiones Arquitectonicas
-- **Separacion ROS 2 / ML:** El dominio ROS 2 vive en `uav_ip` (colcon). El dominio ML vivira en `ml_pipeline/` (uv + venv aislado).
-- **Inyeccion Segura de Mundos:** Copiar SDF a `~/PX4-Autopilot/Tools/simulation/gz/worlds/` y usar `PX4_GZ_WORLD`. Cero modificaciones al codigo fuente de PX4.
-- **Esquema YAML de Circuito:** Los hoops se definen como {name, x, y, z, yaw} en frame Gazebo ENU. El piloto auto-genera waypoints de approach/exit a APPROACH_OFFSET metros del centro.
-- **Senal de Mision Completa:** El piloto lanza `SystemExit(0)` al aterrizar. El orquestador detecta exit code 0.
-- **Dataset:** 2 tareas x 15 episodios por tarea (prioriza variacion intra-tarea, alineado al in-context learning del paper).
+## 📌 Documentos de Referencia Canónicos (Punto Único de Verdad)
 
-## Gotchas Criticos (NO OLVIDAR)
-- **PX4_GZ_MODEL_POSE y Explosión de Físicas:** La plataforma de despegue en el SDF es una caja que se extiende hasta Z=0.1m. Si el dron (`x500_depth`) spawnea en `Z=0.2`, su tren de aterrizaje penetra la caja, lo que causa una explosión en el motor de físicas al resolver la colisión. Esto genera errores de `High Gyro Bias` y `GPS Vert Speed Drift too high` en PX4, denegando el armado (Arming denied). **SOLUCIÓN:** Usar `PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"` para asegurar que el dron nazca en el aire y caiga suavemente.
-- **Zombies de Gazebo (`gz sim`):** Al matar el proceso de PX4 (`make px4_sitl` o el ejecutable `px4`), el servidor de Gazebo en segundo plano **no muere**. Si se lanza PX4 nuevamente, se inyectará en el mundo zombie corrupto, causando fallas masivas de lectura de sensores (`ekf2 missing data`, `barometer 0 missing`, etc). **SOLUCIÓN:** Siempre matar los huérfanos con `pkill -f "gz sim" ; pkill -f "ruby.*gz" ; pkill -f "bin/px4"` antes de un nuevo lanzamiento. El orquestador ya incluye esta limpieza automática.
-- **Comunicación y Particiones:** Para que el stack completo se comunique sin conflictos y en la misma red, se debe exportar explícitamente `ROS_DOMAIN_ID=33`, `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` y `GZ_PARTITION=sim`. Si el `MicroXRCEAgent` se levanta sin el Domain ID correcto, el piloto experto jamás logrará comunicarse con PX4.
+Para evitar desincronizaciones, la información del proyecto se encuentra formalmente centralizada en:
+1. **[Estrategia Teórica y Taxonomía](file:///home/gabrielq/ros2_ws/docs/ESTRATEGIA_TEORICA.md):** Fundamentación matemática, preservación de Markov, escala $s=0.1$, LiDAR 360°, taxonomía de primitivas y análisis combinatorio de tareas.
+2. **[Hoja de Ruta y Plan de Implementación](file:///home/gabrielq/ros2_ws/docs/PLAN_IMPLEMENTACION.md):** Arquitectura por módulos, hitos de desarrollo (Hito 0 al Hito 4) y backlog de tareas operativas inmediatas.
+3. **[Registro de Decisiones de Diseño (ADR)](file:///home/gabrielq/ros2_ws/docs/DECISIONES_DISENO.md):** Registro permanente del "por qué" de cada decisión técnica, incluyendo la memoria histórica de enfoques descartados (cámara de 6 GB, pilotos monolíticos, etc.).
+4. **[Guía de Troubleshooting](file:///home/gabrielq/ros2_ws/docs/TROUBLESHOOTING.md):** Resolución rápida de incidencias en WSL2, PX4 SITL, MicroXRCEAgent y Gazebo.
 
-## Topicos PX4 Verificados (del rosbag existente)
-- `/fmu/in/trajectory_setpoint` (TrajectorySetpoint)
-- `/fmu/out/vehicle_odometry` (VehicleOdometry) - SIN sufijo _v1
-- `/fmu/out/vehicle_local_position_v1` (VehicleLocalPosition) - CON sufijo _v1
-- `/depth_camera/points` (PointCloud2)
+---
 
-## Variables de Entorno para Lanzamiento PX4
-```bash
-export GZ_VERSION=harmonic
-export PX4_GZ_WORLD=tf_circuito_aros        # o el nombre del mundo generado
-export PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"    # Altura de Z=0.8 obligatoria para evitar High Gyro Bias
-export GZ_PARTITION=sim
-export GZ_IP=127.0.0.1
-export ROS_DOMAIN_ID=33
-export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-# Luego: make px4_sitl gz_x500_depth
-```
+## 🚀 Estado Actual del Stack (Hito 0 Completado)
 
-## Tareas Activas / Inmediatas
-1. **Fase de Planeación:** (COMPLETADO) - Creación del `docs/PLAN_DETALLADO_IMPLEMENTACION.md` que traza la hoja de ruta hacia un motor de pseudo-tareas con hitos incrementales para el Hito 0 (Pipeline core) y Hito A (Controladores dinámicos).
-2. **Paso 1: task_generator.py & world_generator.py** (PENDIENTE) - Refactorizar para generar secuencias concretas de primitivas a partir del catálogo (distintas formas/postes) en vez de solo 3 aros estáticos.
-3. **Paso 2: waypoint_controller.py & tracking_controller.py** (PENDIENTE) - Expandir el control para interpretar las secuencias dinámicas (Feed-forward para traverse/overfly y Feedback para orbit).
-4. **Paso 3: data_collector.py** (EN PROGRESO) - Orquestador automático con bucle doble (tasks x episodios).
-5. **Paso 4: ml_pipeline/extractor.py** - Pipeline de extraccion con uv + rosbags (`bag_to_heterodata.py` base completado).
+* **Stack Base:** Ubuntu 24.04 (WSL2), ROS 2 Jazzy, Gazebo Harmonic y PX4 SITL (`v1.14/v1.15`).
+* **Vehículo de Simulación:** Modelo estándar **`gz_x500`** (sin cámara física de profundidad), garantizando un RTF $\ge 1.0\times$.
+* **Observación y Sensores:** LiDAR 3D omnidireccional 360° privilegiado en modo `range` ($R_{\text{max}} = 10.0\text{ m}$) implementado mediante `synthetic_lidar.py` (2048 puntos, FPS, marco egocéntrico FLU, escala métrica $s = 0.1$).
+* **Controladores:** Arquitectura desacoplada bajo patrón Strategy:
+  * `base_pilot.py`: Ciclo de vida de ROS 2, armado seguro en 50 Hz, QoS.
+  * `waypoint_controller.py`: Control feed-forward interpretando `waypoints.yaml` (`traverse`, `slalom`, `overfly`, `orbit` con yaw centrípeto hacia el landmark).
+  * `tracking_controller.py`: Prototipo de seguimiento dinámico en feedback.
+* **Orquestación y Recolección:** `data_collector.py` ejecuta campañas automáticas de múltiples tareas y episodios:
+  * Semántica fija a nivel tarea (`task_config.yaml`).
+  * Aleatorización de poses 3D continua a nivel episodio con semillas deterministas (`waypoints.yaml`).
+  * Telemetría ligera en rosbags MCAP ($< 5\text{ MB}$ por vuelo).
+* **Postproceso:** `bag_to_heterodata.py` convierte los rosbags en grafos PyG `HeteroData` `.pt`. `visualize_dataset.py` permite validación visual 3D estática y generación de animaciones GIF.
 
-## Deuda Tecnica
-- **Segmentacion:** Heuristica espacial para borrar suelo de la nube de puntos.
-- **Marco Egocentrico:** Transformar odometria global a desplazamientos relativos en base_link.
-- **Keyframing:** Heuristica de distancia acumulada + cambio angular para extraer ~10-15 keyframes por episodio.
+---
+
+## 🛠️ Próximas Tareas Inmediatas (Hitos 1 y 2)
+
+1. **Generación Robusta de Tareas sin Reemplazo (`task_generator.py`):** Muestrear el espacio de las 64 firmas semánticas únicas sin colisiones aleatorias.
+2. **Script de Auditoría y Partición (`audit_dataset.py`):** Validar la unicidad de firmas en `datasets/` y emitir `train_tasks.json`, `val_tasks.json` y `held_out_tasks.json`.
+3. **Entorno Virtual para Machine Learning (`~/venv_ip`):** Aislar PyTorch, PyTorch Geometric y `rosbags` para cumplir con PEP 668 sin interferir con ROS 2 Jazzy.
+4. **Procesamiento por Lotes Multiproceso (`bag_to_heterodata.py`):** Agregar `--dataset-dir` y paralelismo con `multiprocessing.Pool` para convertir cientos de episodios en segundos.

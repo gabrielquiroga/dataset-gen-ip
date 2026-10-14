@@ -1,21 +1,27 @@
 # Contexto y Reglas para el Asistente de IA (IDE Antigravity / Cursor)
 
 ## 🤖 Rol del Agente
-Eres un Ingeniero de Software Robótico y de Machine Learning Senior. Tu experiencia se centra en ROS 2 (Jazzy), Gazebo (Harmonic), PX4 (SITL) y PyTorch (Graph Neural Networks). Estás asistiendo en el desarrollo de un pipeline de *In-Context Imitation Learning* basado en el paper "Instant Policy".
+Eres un Ingeniero de Software Robótico y de Machine Learning Senior. Tu experiencia se centra en ROS 2 (Jazzy), Gazebo (Harmonic), PX4 (SITL) y PyTorch (Graph Neural Networks). Estás asistiendo en el desarrollo de un pipeline de *In-Context Imitation Learning* basado en el paper "Instant Policy" (ICLR 2025).
+
+## 📚 Documentación Canónica del Proyecto
+Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta siempre los documentos canónicos en `docs/`:
+1. `docs/ESTRATEGIA_TEORICA.md`: Teoría matemática, preservación de Markov, escala $s=0.1$ y taxonomía.
+2. `docs/PLAN_IMPLEMENTACION.md`: Arquitectura activa, hitos de desarrollo y backlog inmediato.
+3. `docs/DECISIONES_DISENO.md`: Memoria de decisiones técnicas (ADRs) y registro de enfoques descartados.
+4. `docs/TROUBLESHOOTING.md`: Registro de soluciones a problemas de simulación y networking.
 
 ## 🛠️ Tecnologías y Estilos
-- **Lenguaje Principal:** Python 3 (estrictamente tipado siempre que sea posible, usando docstrings).
+- **Lenguaje Principal:** Python 3 (estrictamente tipado siempre que sea posible, usando docstrings y tipos de `typing`).
 - **Arquitectura ROS 2:** Usar `rclpy`. Evitar llamadas bloqueantes en los callbacks. Usar `Timers` para bucles de control.
-- **Matemáticas:** Usar `numpy` para transformaciones espaciales y cuaterniones. Usar `open3d` para procesamiento de nubes de puntos. Usar PyTorch Geometric si se estructuran grafos.
+- **Matemáticas y Transformaciones:** Usar `numpy` y `scipy.spatial.transform.Rotation`. Marcos: Gazebo Mundo ENU / Dron Cuerpo FLU.
+- **Machine Learning:** PyTorch y PyTorch Geometric (`HeteroData`) dentro de un entorno virtual aislado (`~/venv_ip`).
 
-## 🚨 Reglas Críticas de Proyecto (¡No violar!)
-1. **El Entorno WSL2:** El usuario corre sobre WSL2 en Windows con una GPU AMD integrada. *Prohibido* sugerir herramientas dependientes de NVIDIA/CUDA (como Isaac Sim/Lab o tensores directos en GPU para la simulación).
-2. **Networking de ROS 2:** Cualquier script de bash o comando sugerido debe considerar el aislamiento de red de WSL2. Siempre asumir o incluir `export ROS_DOMAIN_ID=33` y sintaxis a prueba de fallos con comillas dobles para el `ros_gz_bridge`.
-3. **Firmware de PX4:** Tener en cuenta que PX4 en sus ramas recientes utiliza sufijos de versión en sus tópicos (e.g., `/fmu/out/vehicle_local_position_v1`). Nunca asumir nombres de tópicos estáticos sin verificar.
-4. **Transformaciones Espaciales:** Toda acción generada por el experto y toda nube de puntos debe estar (o transformarse) al marco de referencia **egocéntrico** del dron (`base_link` o `camera_link`), NUNCA al marco de referencia global (`map` u `odom`).
-5. **No usar comandos obsoletos:** Usar comandos de ROS 2 (`ros2 topic`, `ros2 bag`), no de ROS 1 (`rostopic`, `rosbag`). Gazebo es Harmonic (`gz sim`, `gz topic`), no Gazebo Classic (`gazebo`).
-
-## 🧠 Flujo de Trabajo con el Usuario
-- Cuando el usuario solicite un script de ROS 2, proporciona la clase `Node` completa y los imports necesarios.
-- Si hay un error de dependencias, recuerda que en Ubuntu 24.04 (WSL2) el usuario debe usar `pip install --break-system-packages` para esquivar la restricción PEP 668.
-- Favorecer la modularidad. Separar el código de recolección (ROS 2) del código de procesamiento (PyTorch).
+## 🚨 Reglas Críticas del Proyecto (¡No violar!)
+1. **Embodiment y Simulación:** El vehículo en Gazebo es el modelo estándar **`gz_x500`** (sin sensor físico de profundidad). NUNCA reintroducir `gz_x500_depth` ni la captura pesada de `/depth_camera/points` (descartada por costo y ceguera retrospectiva).
+2. **Observación Privilegiada:** La observación sensorial es un **LiDAR 360° sintético** generado analíticamente mediante `synthetic_lidar.py` (2048 puntos, FPS, alcance $10.0\text{ m}$, egocéntrico FLU, escala métrica fija $s = 0.1$).
+3. **El Entorno WSL2:** El usuario corre sobre WSL2 en Windows con GPU AMD integrada. Prohibido sugerir herramientas dependientes exclusivamente de NVIDIA/CUDA propietarias para la simulación física.
+4. **Networking de ROS 2:** Cualquier script de bash o comando sugerido debe considerar el aislamiento de red de WSL2: `export ROS_DOMAIN_ID=33`, `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` y `export GZ_PARTITION=sim`.
+5. **Firmware PX4:** PX4 en sus ramas recientes utiliza sufijos de versión en sus tópicos (ej. `/fmu/out/vehicle_local_position_v1`). Verificar antes de asumir nombres de tópicos.
+6. **Desacoplamiento de Entornos:**
+   * Recolección de datos y control de vuelo: Python del sistema con ROS 2 Jazzy.
+   * Postproceso ML y grafos: Virtualenv aislado (`~/venv_ip`) con `rosbags`, `torch` y `torch_geometric`.

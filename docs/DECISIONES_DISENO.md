@@ -114,7 +114,54 @@ $$f_k(\Delta p) = \sin(2^k \pi \Delta p)$$
 
 ---
 
-## 7. Resumen de Parámetros Críticos
+## 7. Desacoplamiento de Entornos y Gestión de Dependencias (ROS 2 SITL vs. ML Pipeline)
+
+### 7.1 Contexto y Conflicto de Dependencias
+El sistema operativo base es **Ubuntu 24.04 LTS (Noble)** bajo WSL2, ejecutando **ROS 2 Jazzy Jalisco**.
+1. **PEP 668 (Externally Managed Environment):** Ubuntu 24.04 bloquea de forma predeterminada cualquier comando `pip install` a nivel de sistema para prevenir la sobreescritura de paquetes `.deb` críticos del sistema operativo y de ROS 2.
+2. **Incompatibilidad de Ecosistemas:** El stack de simulación (PX4 + Gazebo + ROS 2) depende de versiones específicas de Python del sistema (`/usr/bin/python3`), mientras que el pipeline de Machine Learning (PyTorch, PyG, CUDA, cuDNN, Torch-Scatter, Torch-Sparse) posee árboles de dependencias pesados y dinámicos que entran en conflicto con las librerías compartidas de ROS.
+3. **Independencia de Rosbags:** La librería `rosbags` (de Ternaris) es una implementación escrita en Python puro para la lectura y deserialización directa de archivos `.mcap` y `.db3`. No depende de la API nativa de ROS 2 ni requiere hacer `source install/setup.bash`.
+
+### 7.2 Decisión Adoptada: Desacoplamiento Estricto
+Se adopta una separación bicameral estricta de entornos:
+1. **Entorno Simulación y Vuelo (Host / ROS 2):**
+   * Corre en el intérprete del sistema con ROS 2 Jazzy sourced (`source /opt/ros/jazzy/setup.bash`).
+   * Responsabilidades: Ejecución de PX4 SITL, Gazebo Harmonic, nodos de control (`base_pilot.py`, `waypoint_controller.py`), generadores procedimentales (`task_generator.py`, `world_generator.py`) y orquestación (`data_collector.py`).
+   * Registro: Graba los rosbags `.mcap` con telemetría ligera.
+2. **Entorno Machine Learning y Entrenamiento (Virtualenv Aislado):**
+   * Corre en un entorno virtual aislado (`~/venv_ip` o entorno Conda).
+   * Dependencias: `torch`, `torch_geometric`, `rosbags`, `scipy`, `numpy`, `matplotlib`.
+   * Responsabilidades: Procesamiento de rosbags a grafos HeteroData (`bag_to_heterodata.py`), extracción de keyframes, aumentos de datos, entrenamiento del modelo de difusión sobre grafos e inferencia offline.
+   * Ventaja: Aislamiento total de dependencias sin riesgo de corromper la instalación de ROS 2 Jazzy.
+
+---
+
+## 8. Muestreo de Tareas sin Reemplazo y Partición Held-Out Estricta
+
+### 8.1 El Problema de la Colisión Combinatoria
+En Instant Policy, la red aprende a inferir la regla semántica de una tarea a partir de $N-1$ demostraciones de contexto para predecir las acciones de una demostración objetivo. Para evaluar la capacidad real de aprendizaje *in-context*, el protocolo exige evaluar en **tareas Held-Out** (secuencias de tareas nunca vistas durante el entrenamiento).
+
+En la configuración de pasillo 1D con 3 landmarks:
+* Cada landmark puede ser `gate` (1 acción: `traverse`) o `pole` (3 acciones: `overfly`, `slalom`, `orbit`).
+* El espacio combinatorio total de firmas semánticas es exactamente de **64 tareas únicas**:
+  $$\text{Firma Semántica} = [(\text{lm}_1, \text{prim}_1), (\text{lm}_2, \text{prim}_2), (\text{lm}_3, \text{prim}_3)]$$
+* Si las tareas se generan mediante un muestreo aleatorio independiente con reemplazo (como hacía la primera versión de `task_generator.py`), la **Paradoja del Cumpleaños** provoca que:
+  * Con 15 tareas generadas, la probabilidad de al menos un duplicado supere el $80\%$.
+  * Con 20 tareas, la probabilidad de duplicados supere el $96\%$.
+* Si existen tareas idénticas etiquetadas con distinto ID (`task_0001` y `task_0018`), se corre el riesgo severo de filtrar datos de entrenamiento en el conjunto de test/held-out (*data leakage*).
+
+### 8.2 Decisión Adoptada: Muestreo sin Reemplazo y Partición Semántica
+1. **Generación Exhaustiva o Muestreo sin Reemplazo:**
+   * El generador de tareas debe muestrear del conjunto discreto de las 64 firmas válidas **sin repetición**, garantizando que cada `task_XXXX` represente una estructura semántica estrictamente única.
+2. **Doble Nivel de Diversidad:**
+   * **Diversidad Inter-Tarea:** Viene dada por la firma semántica única (`task_config.yaml`).
+   * **Diversidad Intra-Tarea:** Viene dada por la variación continua de las poses 3D $(x, y, z, \text{yaw})$ de los objetos en cada episodio (`waypoints.yaml`).
+3. **Auditoría Automatizada (`audit_dataset.py`):**
+   * Se establece la necesidad de un script que verifique la ausencia de firmas duplicadas en el dataset y genere los archivos formales de partición: `train_tasks.json`, `val_tasks.json` y `held_out_tasks.json`.
+
+---
+
+## 9. Resumen de Parámetros Críticos
 
 | Parámetro | Valor | Fundamentación |
 | :--- | :--- | :--- |
@@ -125,3 +172,49 @@ $$f_k(\Delta p) = \sin(2^k \pi \Delta p)$$
 | **Factor de Escala ($s$)** | $0.1$ | Previene aliasing en codificación posicional sinusoidal |
 | **Marcos** | ENU (Mundo) / FLU (Cuerpo) | Unificación analítica estricta con odometría PX4 NED/FRD |
 | **Lógica Pasillo 1D** | `A1_DIRECT` | Trayectorias monótonas libres de colisión por construcción |
+| **Entorno de Simulación** | ROS 2 Jazzy (Sistema) | Control de vuelo, PX4 SITL, Gazebo Harmonic |
+| **Entorno de ML** | Python venv (`~/venv_ip`) | PyTorch, PyG, rosbags puro, sin interferir con PEP 668 |
+
+---
+
+## 10. Registro Histórico de Enfoques Descartados y Evolución Técnica
+
+*Esta sección documenta formalmente las arquitecturas, experimentos y decisiones implementadas en versiones anteriores que fueron evaluadas, contrastadas y descartadas, sirviendo como memoria técnica para el trabajo final / tesis.*
+
+### 10.1 Descarte del Sensor Físico de Profundidad (`gz_x500_depth` + `PointCloud2`)
+* **Qué se implementó (Septiembre 2026):**
+  * Modelo de vehículo `gz_x500_depth` equipado con una cámara de profundidad OAK-D simulada en Gazebo Harmonic.
+  * Puente `ros_gz_bridge` configurado para transformar `/depth_camera/points` (`gz.msgs.PointCloudPacked`) en tópicos de ROS 2 (`sensor_msgs/PointCloud2`).
+  * Grabación directa de los mensajes de nube densa en rosbags `.mcap`.
+* **Hallazgos Empíricos y Métricas:**
+  * Cada nube contenía $307.200$ puntos 3D sin comprimir por fotograma.
+  * A 20 Hz, un vuelo de 45 segundos generaba entre **5 y 6 GB por demostración**.
+  * El renderizado GPU de profundidad en Gazebo colapsaba el *Real-Time Factor* (RTF) a $0.2\times - 0.4\times$, haciendo que un vuelo de 40 s tardara más de 3 minutos en simularse.
+  * Para $1.000$ demostraciones, el dataset hubiera requerido $\approx 6\text{ TB}$ de almacenamiento.
+* **Problemas Teóricos Irreparables:**
+  * **Violación de Markov por Ceguera Retrospectiva:** La cámara frontal de $80^\circ$ pierde inmediatamente la referencia visual del aro en cuanto el dron lo cruza, vaciando la observación $O_t$ hasta avistar el siguiente objeto.
+  * **Contaminación del Suelo:** La nube cruda incluía el suelo, las paredes y el propio chasis del dron. Segmentar analíticamente el suelo con planos RANSAC resultaba inestable ante inclinaciones de *pitch/roll* del dron.
+* **Resolución Definitiva:** Descartado en su totalidad el 11 de octubre de 2026. Reemplazado por el modelo estándar `gz_x500` con **observación privilegiada LiDAR 360° sintética** vía `synthetic_lidar.py` (rosbags $< 5\text{ MB}$, RTF $\ge 1.0$, segmentación analítica perfecta, 2048 puntos FPS).
+
+### 10.2 Descarte del Piloto Monolítico (`expert_pilot.py`)
+* **Qué se implementó (Septiembre 2026):**
+  * Un script único monolítico `expert_pilot.py` que mezclaba el ciclo de vida de ROS 2, la máquina de estados de armado, el parsing de tópicos, el cálculo trigonométrico de waypoints y el control PID.
+* **Motivo del Descarte:**
+  * Rigidez arquitectónica: No permitía desacoplar maniobras feed-forward (cruce directo de aros) de controladores de tracking en feedback continuo (órbita de postes).
+* **Resolución Definitiva:** Refactorizado en el patrón *Strategy* mediante `base_pilot.py` (ciclo de vida, QoS y seguridad de armado), `waypoint_controller.py` (trayectorias feed-forward) y `tracking_controller.py` (seguimiento continuo).
+
+### 10.3 Descarte de Permutaciones Topológicas No Monótonas en Pasillo 1D
+* **Qué se evaluó (Principios de Octubre 2026):**
+  * Permitir que el generador de tareas ordenara libremente los landmarks en un pasillo lineal $+X$ (ej. visitar aro 1, luego aro 3, y regresar al aro 2).
+* **Motivo del Descarte:**
+  * Instant Policy asume demostraciones factibles y libres de colisión por construcción (no aprende a evitar colisiones de forma reactiva, sino a imitar desvíos demostrados).
+  * En un pasillo lineal estrecho, retroceder hacia un aro previo implica volar a través de obstáculos existentes sin un planificador local de evitación, provocando colisiones sistemáticas.
+* **Resolución Definitiva:** Restringir la lógica del pasillo 1D a `A1_DIRECT` (avance monótono). Maniobras con retornos libres se difieren a circuitos cerrados 2D/3D con áreas abiertas.
+
+### 10.4 Descarte de la Generación de Mundo Único por Tarea
+* **Qué se implementó inicialmente:**
+  * `data_collector.py` ejecutaba `_generate_world` una única vez antes del bucle de episodios de cada tarea.
+* **Fallo Identificado:**
+  * Todos los episodios de una misma tarea compartían exactamente las mismas coordenadas físicas $(x, y, z, \text{yaw})$.
+  * Esto violaba el principio central de In-Context Imitation Learning, donde las demos de contexto y la demo objetivo deben compartir la misma regla semántica pero exhibir variabilidad espacial continua.
+* **Resolución Definitiva:** Separación estricta entre `_generate_task_config` (semántica fija en `task_config.yaml`) y `_generate_episode_world` (aleatorización espacial en cada episodio con semilla determinista única).

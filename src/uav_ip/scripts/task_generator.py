@@ -20,7 +20,7 @@ def main():
 
     num_gates = 3
     # En el pasillo unidireccional (+X), la logica factible y compatible con la hipotesis
-    # de Markov y camara frontal (PLAN_ESTRATEGIA.md 6.4) es A1_DIRECT.
+    # de Markov (ESTRATEGIA_TEORICA.md Sec. 4) es A1_DIRECT.
     # Variantes topologicas complejas (A2, A3) requeriran un circuito 2D cerrado o spawn opuesto.
     logics = ["A1_DIRECT"]
     logic = random.choice(logics)
@@ -35,7 +35,7 @@ def main():
         landmarks.append({"id": landmark_id, "type": landmark_type})
         
     # En el pasillo unidireccional (+X), el avance fisico debe ser progresivo
-    # para evitar vuelo ciego hacia atras y colisiones intermedias sin evitar obstaculos (PLAN_ESTRATEGIA.md 6.4).
+    # para evitar vuelo ciego hacia atras y colisiones intermedias sin evitar obstaculos (ESTRATEGIA_TEORICA.md Sec. 4).
     ordered_landmarks = list(landmarks)
         
     primitives = []

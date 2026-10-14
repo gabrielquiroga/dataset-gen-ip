@@ -41,11 +41,11 @@ ros2_ws/
 │           ├── tracking_controller.py # Piloto experto feedback (orbit)
 │           └── synthetic_lidar.py     # Módulo empotrado de generación LiDAR
 ├── datasets/                      # Salida del dataset estructurado por tarea y episodio
-├── docs/                          # Documentación técnica y fundamentos
-│   ├── DECISIONES_DISENO.md       # Memoria persistente de decisiones y fundamentación matemática
-│   ├── PLAN_ESTRATEGIA.md         # Estrategia general adaptada de Instant Policy
-│   ├── DATASET_REQUIREMENTS.md    # Requisitos arquitectónicos del dataset
-│   └── TROUBLESHOOTING.md         # Resolución de incidencias comunes
+├── docs/                          # Documentación técnica canónica
+│   ├── ESTRATEGIA_TEORICA.md      # Marco teórico, preservación de Markov, escala s=0.1 y taxonomía
+│   ├── PLAN_IMPLEMENTACION.md     # Hoja de ruta, hitos de desarrollo (0-4) y backlog operativo
+│   ├── DECISIONES_DISENO.md       # Registro de decisiones de arquitectura (ADRs) y enfoques descartados
+│   └── TROUBLESHOOTING.md         # Resolución de incidencias comunes (WSL2, PX4, Gazebo)
 ├── build/
 ├── install/
 └── log/
