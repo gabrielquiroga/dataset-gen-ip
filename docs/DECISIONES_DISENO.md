@@ -30,11 +30,11 @@ La primera versión del pipeline intentó grabar directamente el tópico de ROS 
 - Cada nube de profundidad de $640 \times 480$ contiene $307.200$ puntos 3D sin comprimir (`sensor_msgs/PointCloud2`).
 - A una tasa moderada de 15 a 30 Hz, una única trayectoria de 40–50 segundos producía entre $600$ y $1.000$ mensajes, generando entre **5 y 6 GB por demostración**.
 - Para un dataset de entrenamiento estándar (ej. $100\text{ tareas} \times 15\text{ demos} = 1.500\text{ vuelos}$), el espacio en disco hubiera requerido entre **7.5 y 9 Terabytes**.
-- En términos computacionales, el renderizado de la cámara de profundidad en Gazebo Harmonic colapsaba el *Real-Time Factor* (RTF) a valores de $0.2\times$ a $0.4\times$, tornando prohibitiva la recolección masiva.
+- En términos computacionales, el renderizado de la cámara de profundidad en Gazebo Harmonic colapsaba el *Real-Time Factor* (RTF) a valores de $\times0.1$ a $\times0.2$, tornando prohibitiva la recolección masiva.
 
 ### 2.2 Decisión: Observación Privilegiada Sintética
 - El dataset almacena exclusivamente **telemetría ligera** de PX4 (`vehicle_odometry`, `trajectory_setpoint`, `vehicle_local_position_v1`, `vehicle_status_v4`, `vehicle_command`, `vehicle_land_detected`) y los metadatos de poses de los landmarks (`waypoints.yaml`). Cada vuelo pesa **$< 5\text{ MB}$** (reducción $> 1.000\times$).
-- La simulación SITL se ejecuta con el modelo estándar **`gz_x500`** (sin sensor de profundidad), disparando el RTF a $1.0\times$ (o superior en modo *fast-forward*).
+- La simulación SITL se ejecuta con el modelo estándar **`gz_x500`** (sin sensor de profundidad), disparando el RTF a $\times1.0$ (o superior en modo *fast-forward*).
 - Las nubes de puntos de 2048 puntos se generan **sintéticamente bajo demanda** (al vuelo o en el script `bag_to_heterodata.py`) mediante el generador modular `synthetic_lidar.py`.
 - **Segmentación perfecta garantizada:** La observación privilegiada elimina por construcción el suelo, paredes, el propio chasis del dron y distractores, entregando exactamente los objetos de interés tal como exige Instant Policy (Apéndice E).
 
@@ -58,7 +58,7 @@ Se implementó en `synthetic_lidar.py` y `bag_to_heterodata.py` la transformaci�
    $$R_{\text{ENU}}^{\text{FLU}} = M_{\text{world}} \cdot R_{\text{NED}}^{\text{FRD}} \cdot M_{\text{body}}$$
    donde:
    $$M_{\text{world}} = \begin{bmatrix} 0 & 1 & 0 \\ 1 & 0 & 0 \\ 0 & 0 & -1 \end{bmatrix}, \quad M_{\text{body}} = \begin{bmatrix} 1 & 0 & 0 \\ 0 & -1 & 0 \\ 0 & 0 & -1 \end{bmatrix}$$
-3. Con estas matrices ortonormales, la proyección de cualquier punto del mundo $P_w$ al marco egocéntrico del dron FLU se expresa de forma vectorized como:
+3. Con estas matrices ortonormales, la proyección de cualquier punto del mundo $P_w$ al marco egocéntrico del dron FLU se expresa de forma vectorizada como:
    $$P_{\text{dron}} = (P_w - p_d) \cdot R_{\text{ENU}}^{\text{FLU}}$$
 
 ---
@@ -189,7 +189,7 @@ En la configuración de pasillo 1D con 3 landmarks:
 * **Hallazgos Empíricos y Métricas:**
   * Cada nube contenía $307.200$ puntos 3D sin comprimir por fotograma.
   * A 20 Hz, un vuelo de 45 segundos generaba entre **5 y 6 GB por demostración**.
-  * El renderizado GPU de profundidad en Gazebo colapsaba el *Real-Time Factor* (RTF) a $0.2\times - 0.4\times$, haciendo que un vuelo de 40 s tardara más de 3 minutos en simularse.
+  * El renderizado GPU de profundidad en Gazebo colapsaba el *Real-Time Factor* (RTF) a $\times0.1 - \times0.2$, haciendo que un vuelo de 20 s tardara más de 3 minutos en simularse.
   * Para $1.000$ demostraciones, el dataset hubiera requerido $\approx 6\text{ TB}$ de almacenamiento.
 * **Problemas Teóricos Irreparables:**
   * **Violación de Markov por Ceguera Retrospectiva:** La cámara frontal de $80^\circ$ pierde inmediatamente la referencia visual del aro en cuanto el dron lo cruza, vaciando la observación $O_t$ hasta avistar el siguiente objeto.

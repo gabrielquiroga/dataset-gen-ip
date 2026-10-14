@@ -7,10 +7,10 @@
 ## 📌 Documentos de Referencia Canónicos (Punto Único de Verdad)
 
 Para evitar desincronizaciones, la información del proyecto se encuentra formalmente centralizada en:
-1. **[Estrategia Teórica y Taxonomía](file:///home/gabrielq/ros2_ws/docs/ESTRATEGIA_TEORICA.md):** Fundamentación matemática, preservación de Markov, escala $s=0.1$, LiDAR 360°, taxonomía de primitivas y análisis combinatorio de tareas.
-2. **[Hoja de Ruta y Plan de Implementación](file:///home/gabrielq/ros2_ws/docs/PLAN_IMPLEMENTACION.md):** Arquitectura por módulos, hitos de desarrollo (Hito 0 al Hito 4) y backlog de tareas operativas inmediatas.
-3. **[Registro de Decisiones de Diseño (ADR)](file:///home/gabrielq/ros2_ws/docs/DECISIONES_DISENO.md):** Registro permanente del "por qué" de cada decisión técnica, incluyendo la memoria histórica de enfoques descartados (cámara de 6 GB, pilotos monolíticos, etc.).
-4. **[Guía de Troubleshooting](file:///home/gabrielq/ros2_ws/docs/TROUBLESHOOTING.md):** Resolución rápida de incidencias en WSL2, PX4 SITL, MicroXRCEAgent y Gazebo.
+1. **[Estrategia Teórica y Taxonomía](/docs/ESTRATEGIA_TEORICA.md):** Fundamentación matemática, preservación de Markov, escala $s=0.1$, LiDAR 360°, taxonomía de primitivas y análisis combinatorio de tareas.
+2. **[Hoja de Ruta y Plan de Implementación](/docs/PLAN_IMPLEMENTACION.md):** Arquitectura por módulos, hitos de desarrollo (Hito 0 al Hito 4) y backlog de tareas operativas inmediatas.
+3. **[Registro de Decisiones de Diseño (ADR)](/docs/DECISIONES_DISENO.md):** Registro permanente del "por qué" de cada decisión técnica, incluyendo la memoria histórica de enfoques descartados (cámara de 6 GB, pilotos monolíticos, etc.).
+4. **[Guía de Troubleshooting](/docs/TROUBLESHOOTING.md):** Resolución rápida de incidencias en WSL2, PX4 SITL, MicroXRCEAgent y Gazebo.
 
 ---
 

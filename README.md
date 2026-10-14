@@ -135,7 +135,7 @@ export ROS_DOMAIN_ID=33
 
 # Ejecutar el controlador hacia los waypoints
 ros2 run uav_ip waypoint_controller --ros-args \
-  -p waypoints_file:=/home/gabrielq/ros2_ws/src/uav_ip/generated_worlds/test_001/waypoints.yaml
+  -p waypoints_file:=~/ros2_ws/src/uav_ip/generated_worlds/test_001/waypoints.yaml
 ```
 
 Cuando el dron aterrice en la plataforma verde, el piloto experto finalizará automáticamente con exit code 0. Detén el grabador en la Terminal 3 con `Ctrl+C`.
@@ -174,6 +174,13 @@ python3 src/uav_ip/scripts/visualize_dataset.py \
   --waypoints src/uav_ip/generated_worlds/test_001/waypoints.yaml \
   --drone-pose 0.0 0.0 1.5 0.0 \
   --output test_lidar.png
+
+# También puede verificarse eligiendo el step de la trayectoria
+python3 src/uav_ip/scripts/visualize_dataset.py \
+  --file test_001.pt \
+  --step 110 \
+  --output vista_lidar_t110.png
+
 ```
 *(Si ejecutas en WSL2 con WSLg o servidor gráfico, `--animate` reproducirá el vuelo en una ventana interactiva continua; si estás en entorno headless o especificas `.gif`, guardará la animación completa en video GIF).*
 
@@ -258,7 +265,7 @@ done
 ## 📚 Documentación y Decisiones Arquitectónicas
 
 Para profundizar en los fundamentos teóricos y evitar reabrir discusiones de diseño resueltas, consulta:
-- [DECISIONES_DISENO.md](file:///home/gabrielq/ros2_ws/docs/DECISIONES_DISENO.md): Detalle técnico sobre el dilema de la cámara vs. LiDAR 360°, la observación privilegiada, la unificación analítica de marcos NED/ENU, la monotonicidad en pasillos 1D, el armado offboard seguro y la escala $s = 0.1$.
-- [PLAN_ESTRATEGIA.md](file:///home/gabrielq/ros2_ws/docs/PLAN_ESTRATEGIA.md): Plan maestro de pseudo-tareas, taxonomía, formulación de grafos y fases de escalado Hito 0 a Hito C.
-- [DATASET_REQUIREMENTS.md](file:///home/gabrielq/ros2_ws/docs/DATASET_REQUIREMENTS.md): Requisitos matemáticos y estructurales indispensables para la convergencia de Instant Policy.
-- [TROUBLESHOOTING.md](file:///home/gabrielq/ros2_ws/docs/TROUBLESHOOTING.md): Guía de solución para errores de EKF2, penetración de spawn en Gazebo y puertos XRCE-DDS.
+- [DECISIONES_DISENO.md](/docs/DECISIONES_DISENO.md): Detalle técnico sobre el dilema de la cámara vs. LiDAR 360°, la observación privilegiada, la unificación analítica de marcos NED/ENU, la monotonicidad en pasillos 1D, el armado offboard seguro y la escala $s = 0.1$.
+- [PLAN_ESTRATEGIA.md](/docs/PLAN_ESTRATEGIA.md): Plan maestro de pseudo-tareas, taxonomía, formulación de grafos y fases de escalado Hito 0 a Hito C.
+- [DATASET_REQUIREMENTS.md](/docs/DATASET_REQUIREMENTS.md): Requisitos matemáticos y estructurales indispensables para la convergencia de Instant Policy.
+- [TROUBLESHOOTING.md](/docs/TROUBLESHOOTING.md): Guía de solución para errores de EKF2, penetración de spawn en Gazebo y puertos XRCE-DDS.
