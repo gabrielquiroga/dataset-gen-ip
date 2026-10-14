@@ -305,7 +305,7 @@ class DataCollector:
 
             task_id = f"task_{task_idx:04d}"
             task_dir = self.dataset_dir / task_id
-            seed = self.base_seed + task_idx
+            task_seed = self.base_seed + task_idx
 
             # Verificar si ya esta completa (resume)
             if self.resume and self._is_task_complete(task_dir):
@@ -314,30 +314,33 @@ class DataCollector:
 
             print(f"\n{'='*60}")
             print(f"  TAREA {task_idx + 1}/{self.num_tasks}: {task_id} "
-                  f"(seed={seed})")
+                  f"(task_seed={task_seed})")
             print(f"{'='*60}")
 
-            # Generar mundo
-            if not self._generate_world(task_id, seed):
-                print(f"[ERROR] Fallo generando mundo para {task_id}. "
+            task_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Generar configuracion semantica de la tarea (fija para todos sus episodios)
+            if not self._generate_task_config(task_id, task_seed):
+                print(f"[ERROR] Fallo generando configuracion semantica para {task_id}. "
                       "Saltando tarea.")
                 continue
 
-            # Copiar waypoints al directorio de la tarea
-            task_dir.mkdir(parents=True, exist_ok=True)
-            wp_src = GENERATED_WORLDS / task_id / "waypoints.yaml"
-            wp_dst = task_dir / "waypoints.yaml"
-            if wp_src.exists():
+            # Copiar definicion semantica (task_config.yaml) a la carpeta de la tarea
+            cfg_src = GENERATED_WORLDS / task_id / "task_config.yaml"
+            cfg_dst = task_dir / "task_config.yaml"
+            if cfg_src.exists():
                 import shutil
-                shutil.copy2(wp_src, wp_dst)
+                shutil.copy2(cfg_src, cfg_dst)
 
-            # Ejecutar episodios
+            # 2. Ejecutar episodios (cada uno con su propia randomizacion espacial)
             for ep_idx in range(self.episodes_per_task):
                 if self._interrupted:
                     break
 
                 ep_id = f"episode_{ep_idx:02d}"
                 ep_dir = task_dir / ep_id
+                # Semilla deterministica y unica por episodio para variar las poses 3D
+                ep_seed = (self.base_seed + task_idx) * 1000 + ep_idx + 1
 
                 # Resume: saltar episodios completos
                 if self.resume and self._is_episode_complete(ep_dir):
@@ -345,9 +348,18 @@ class DataCollector:
                     continue
 
                 print(f"\n  --- {task_id} / {ep_id} "
-                      f"({ep_idx + 1}/{self.episodes_per_task}) ---")
+                      f"({ep_idx + 1}/{self.episodes_per_task}) (ep_seed={ep_seed}) ---")
 
-                result = self._run_episode(task_id, ep_id, ep_dir)
+                # Generar mundo fisico y waypoints aleatorios para este episodio
+                if not self._generate_episode_world(task_id, ep_seed):
+                    print(f"  [ERROR] Fallo generando mundo para {task_id}/{ep_id}. Saltando.")
+                    self.total_failed += 1
+                    continue
+
+                result = self._run_episode(
+                    task_id, ep_id, ep_dir,
+                    task_seed=task_seed, ep_seed=ep_seed
+                )
 
                 if result == "success":
                     self.total_success += 1
@@ -370,29 +382,32 @@ class DataCollector:
         self._print_summary()
 
     # ----------------------------------------------------------------
-    #  Generacion de mundo
+    #  Generacion de tarea y mundo por episodio
     # ----------------------------------------------------------------
 
-    def _generate_world(self, task_id: str, seed: int) -> bool:
-        """Ejecuta task_generator.py y world_generator.py para crear el mundo."""
-        print(f"  Generando configuracion de tarea {task_id} (seed={seed})...")
+    def _generate_task_config(self, task_id: str, task_seed: int) -> bool:
+        """Ejecuta task_generator.py para definir la semantica fija de la tarea."""
+        print(f"  Generando configuracion semantica de tarea {task_id} (task_seed={task_seed})...")
         cmd_task = [
             sys.executable,
             str(TASK_GENERATOR),
             "--task-id", task_id,
-            "--seed", str(seed),
+            "--seed", str(task_seed),
         ]
         result_task = subprocess.run(cmd_task, capture_output=True, text=True)
         if result_task.returncode != 0:
             print(f"  [ERROR] task_generator.py fallo:\n{result_task.stderr}")
             return False
-            
-        print(f"  Generando mundo {task_id} (seed={seed})...")
+        return True
+
+    def _generate_episode_world(self, task_id: str, ep_seed: int) -> bool:
+        """Ejecuta world_generator.py para generar poses fisicas aleatorias en este episodio."""
+        print(f"    Generando mundo fisico para episodio (ep_seed={ep_seed})...")
         cmd_world = [
             sys.executable,
             str(WORLD_GENERATOR),
             "--task-id", task_id,
-            "--seed", str(seed),
+            "--seed", str(ep_seed),
         ]
         if self.no_takeoff_platform:
             cmd_world.append("--no-takeoff-platform")
@@ -403,13 +418,14 @@ class DataCollector:
             text=True,
         )
         if result_world.returncode != 0:
-            print(f"  [ERROR] world_generator.py fallo:\n{result_world.stderr}")
+            print(f"    [ERROR] world_generator.py fallo:\n{result_world.stderr}")
             return False
 
-        # Mostrar resumen
+        # Mostrar resumen de landmarks generados
         for line in result_world.stdout.strip().split("\n"):
-            if line.strip():
-                print(f"    {line.strip()}")
+            line_str = line.strip()
+            if line_str and ("landmark_" in line_str or "Plataforma:" in line_str):
+                print(f"      {line_str}")
         return True
 
     # ----------------------------------------------------------------
@@ -417,7 +433,12 @@ class DataCollector:
     # ----------------------------------------------------------------
 
     def _run_episode(
-        self, task_id: str, ep_id: str, ep_dir: Path
+        self,
+        task_id: str,
+        ep_id: str,
+        ep_dir: Path,
+        task_seed: Optional[int] = None,
+        ep_seed: Optional[int] = None,
     ) -> str:
         """Ejecuta un episodio completo.
 
@@ -429,9 +450,9 @@ class DataCollector:
         log_dir.mkdir(exist_ok=True)
         waypoints_file = GENERATED_WORLDS / task_id / "waypoints.yaml"
 
-        # Asegurar copia de waypoints.yaml en la carpeta del episodio para postproceso
+        # Copiar waypoints.yaml exclusivos de este episodio para auditoria y postproceso
         ep_wp_dst = ep_dir / "waypoints.yaml"
-        if waypoints_file.exists() and not ep_wp_dst.exists():
+        if waypoints_file.exists():
             import shutil
             shutil.copy2(waypoints_file, ep_wp_dst)
 
@@ -484,7 +505,7 @@ class DataCollector:
             # 6. Lanzar piloto experto
             print("    Lanzando piloto experto...")
             self._start_pilot(
-                waypoints_file, log_dir / "pilot.log"
+                ep_wp_dst, log_dir / "pilot.log"
             )
 
             # 7. Esperar a que el piloto termine (o timeout)
@@ -494,16 +515,25 @@ class DataCollector:
             if exit_code is None:
                 # Timeout
                 print(f"\n    [TIMEOUT] El episodio excedio los {self.episode_timeout}s.")
+                self._save_episode_metadata(
+                    ep_dir, task_id, ep_id, "timeout",
+                    task_seed=task_seed, ep_seed=ep_seed
+                )
                 self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
                 self._print_log_tail(log_dir / "pilot.log", "Pilot Log (ultimas lineas)")
                 return "timeout"
             elif exit_code == 0:
-                # Guardar metadata del episodio
+                # Guardar metadata del episodio exitoso
                 self._save_episode_metadata(
-                    ep_dir, task_id, ep_id, "success"
+                    ep_dir, task_id, ep_id, "success",
+                    task_seed=task_seed, ep_seed=ep_seed
                 )
                 return "success"
             else:
+                self._save_episode_metadata(
+                    ep_dir, task_id, ep_id, f"pilot_exit_{exit_code}",
+                    task_seed=task_seed, ep_seed=ep_seed
+                )
                 return str(exit_code)
 
         except Exception as e:
@@ -666,11 +696,15 @@ class DataCollector:
         task_id: str,
         ep_id: str,
         status: str,
+        task_seed: Optional[int] = None,
+        ep_seed: Optional[int] = None,
     ) -> None:
         """Guarda metadata del episodio en JSON."""
         meta = {
             "task_id": task_id,
             "episode_id": ep_id,
+            "task_seed": task_seed,
+            "episode_seed": ep_seed,
             "status": status,
             "timestamp": datetime.datetime.now().isoformat(),
             "vehicle_model": PX4_VEHICLE,

@@ -104,13 +104,19 @@ class WaypointController(BasePilot):
                 wps.append({"pos": [cx + right_x * LAT_OFFSET, cy + right_y * LAT_OFFSET, cz], "type": "center", "yaw": yaw})
                 wps.append({"pos": [cx + OFFSET * fwd_x + right_x * LAT_OFFSET, cy + OFFSET * fwd_y + right_y * LAT_OFFSET, cz], "type": "post", "yaw": yaw})
             elif p_type == "orbit":
-                LAT_OFFSET = 1.5
+                R = 1.5
                 right_x = math.sin(yaw)
                 right_y = -math.cos(yaw)
-                wps.append({"pos": [cx - LAT_OFFSET * fwd_x, cy - LAT_OFFSET * fwd_y, cz], "type": "pre", "yaw": yaw})
-                wps.append({"pos": [cx + right_x * LAT_OFFSET, cy + right_y * LAT_OFFSET, cz], "type": "center", "yaw": yaw})
-                wps.append({"pos": [cx + LAT_OFFSET * fwd_x, cy + LAT_OFFSET * fwd_y, cz], "type": "center", "yaw": yaw})
-                wps.append({"pos": [cx - right_x * LAT_OFFSET, cy - right_y * LAT_OFFSET, cz], "type": "post", "yaw": yaw})
+                # 1. Aproximacion frontal mirando de frente al poste
+                wps.append({"pos": [cx - R * fwd_x, cy - R * fwd_y, cz], "type": "pre", "yaw": yaw})
+                # 2. Flanco derecho con yaw centripeto hacia el poste (+90°)
+                wps.append({"pos": [cx + right_x * R, cy + right_y * R, cz], "type": "center", "yaw": yaw + math.pi / 2})
+                # 3. Tras el poste (+X) con yaw centripeto hacia el poste (+180°)
+                wps.append({"pos": [cx + R * fwd_x, cy + R * fwd_y, cz], "type": "center", "yaw": yaw + math.pi})
+                # 4. Flanco izquierdo con yaw centripeto hacia el poste (-90°)
+                wps.append({"pos": [cx - right_x * R, cy - right_y * R, cz], "type": "center", "yaw": yaw - math.pi / 2})
+                # 5. Salida progresiva hacia +X reanudando orientacion de pasillo
+                wps.append({"pos": [cx + R * fwd_x - right_x * R, cy + R * fwd_y - right_y * R, cz], "type": "post", "yaw": yaw})
 
         lx, ly = float(cfg["landing"]["x"]), float(cfg["landing"]["y"])
         wps.append({"pos": [lx, ly, self.HOVER_HEIGHT], "type": "landing_hover", "yaw": 0.0})
