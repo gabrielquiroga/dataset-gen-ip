@@ -319,8 +319,8 @@ class DataCollector:
 
             task_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Generar configuracion semantica de la tarea (fija para todos sus episodios)
-            if not self._generate_task_config(task_id, task_seed):
+            # 1. Generar configuracion semantica de la tarea (sin reemplazo)
+            if not self._generate_task_config(task_id, task_seed, task_idx=task_idx):
                 print(f"[ERROR] Fallo generando configuracion semantica para {task_id}. "
                       "Saltando tarea.")
                 continue
@@ -385,15 +385,22 @@ class DataCollector:
     #  Generacion de tarea y mundo por episodio
     # ----------------------------------------------------------------
 
-    def _generate_task_config(self, task_id: str, task_seed: int) -> bool:
-        """Ejecuta task_generator.py para definir la semantica fija de la tarea."""
-        print(f"  Generando configuracion semantica de tarea {task_id} (task_seed={task_seed})...")
+    def _generate_task_config(
+        self, task_id: str, task_seed: int, task_idx: Optional[int] = None
+    ) -> bool:
+        """Ejecuta task_generator.py para definir la semantica fija de la tarea sin reemplazo."""
+        idx_str = f", task_index={task_idx}" if task_idx is not None else ""
+        print(f"  Generando configuracion semantica de tarea {task_id} (task_seed={task_seed}{idx_str})...")
         cmd_task = [
             sys.executable,
             str(TASK_GENERATOR),
             "--task-id", task_id,
             "--seed", str(task_seed),
+            "--shuffle-seed", str(self.base_seed),
         ]
+        if task_idx is not None:
+            cmd_task.extend(["--task-index", str(task_idx)])
+
         result_task = subprocess.run(cmd_task, capture_output=True, text=True)
         if result_task.returncode != 0:
             print(f"  [ERROR] task_generator.py fallo:\n{result_task.stderr}")

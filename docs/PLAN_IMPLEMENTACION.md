@@ -44,13 +44,16 @@ El proyecto desacopla estrictamente tres dominios funcionales:
 
 | Módulo / Script | Ubicación | Estado Actual | Rol en el Pipeline |
 | :--- | :--- | :--- | :--- |
-| **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** (A mejorar en Hito 1) | Genera `task_config.yaml` definiendo la secuencia de primitivas y landmarks. |
+| Módulo / Script | Ubicación | Estado Actual | Rol en el Pipeline |
+| :--- | :--- | :--- | :--- |
+| **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Genera `task_config.yaml` con muestreo combinatorio sin reemplazo extensible a $N$ landmarks. |
 | **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Genera el SDF para Gazebo y el `waypoints.yaml` con poses aleatorias factibles. |
 | **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Clase base de ROS 2 para ciclo de vida, arming seguro (50 Hz pre-flight) y QoS. |
 | **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Piloto experto feed-forward (`traverse`, `slalom`, `overfly`, `orbit` con yaw centrípeto). |
 | **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Prototipo funcional** | Control por retroalimentación continua (PID en velocidad) para seguimiento dinámico. |
-| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea y multi-episodio con variación espacial intra-tarea e inyección limpia de procesos. |
+| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea y multi-episodio con variación espacial intra-tarea y generación indexada sin reemplazo. |
 | **`synthetic_lidar.py`** | `src/uav_ip/scripts/` y `uav_ip/` | **Completado** | Sintetizador privilegiado de nubes LiDAR 360° en marco FLU, con FPS y escala $s=0.1$. |
+| **`audit_dataset.py`** | `src/uav_ip/scripts/` | **Completado** | Auditoría universal de duplicados, calidad de vuelo y particionado Train/Val/Held-Out sin fugas. |
 | **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Completado** (Modo individual) | Extractor de telemetría MCAP a grafos PyG `HeteroData` `.pt`. |
 | **`visualize_dataset.py`** | `src/uav_ip/scripts/` y `uav_ip/` | **Completado** | Visualizador 3D estático y animador GIF de trayectorias y nubes LiDAR sintéticas. |
 
@@ -69,28 +72,24 @@ El proyecto desacopla estrictamente tres dominios funcionales:
 
 ---
 
-### Hito 1: Robustez en Generación de Tareas y Partición Held-Out — [SIGUIENTE PASO]
+### Hito 1: Robustez en Generación de Tareas y Partición Held-Out — [COMPLETADO]
 
 *Objetivo: Garantizar la integridad combinatoria del dataset, eliminando duplicados aleatorios y estructurando formalmente la partición para evaluar la generalización in-context.*
 
-#### Tarea 1.1: Generación de Tareas sin Reemplazo (`task_generator.py`)
-- **Problema:** Con 3 landmarks y el catálogo actual existen exactamente 64 firmas semánticas únicas. El muestreo con reemplazo genera $> 90\%$ de duplicados a partir de 20 tareas (Paradoja del Cumpleaños).
-- **Acción:**
-  * Implementar en `task_generator.py` un catálogo exhaustivo de las 64 combinaciones válidas.
-  * Permitir seleccionar tareas por índice determinista (`--task-index 0..63`) o muestreo aleatorio sin reemplazo.
-- **Criterio de Aceptación:** Si se generan 60 tareas consecutivas, las 60 presentan firmas semánticas estrictamente distintas en sus `task_config.yaml`.
+#### Tarea 1.1: Generación de Tareas sin Reemplazo (`task_generator.py`) — [x] COMPLETADO
+- **Implementación:**
+  * Catálogo combinatorio dinámico mediante `itertools.product(action_catalog, repeat=num_landmarks)` extensible a cualquier número de landmarks y futuras primitivas.
+  * Muestreo determinista sin reemplazo vía `--task-index` y permutación barajada con `--shuffle-seed`.
+  * Integración con `data_collector.py` para asignar un índice único por tarea a ejecutar.
+- **Criterio de Aceptación:** Generación de tareas consecutivas sin duplicados semánticos garantizada por construcción.
 
-#### Tarea 1.2: Script de Auditoría y Partición (`audit_dataset.py`)
-- **Acción:**
-  * Crear un script que escanee recursivamente `datasets/task_XXXX/task_config.yaml`.
-  * Extraer la firma semántica de cada tarea:
-    $$\text{Firma} = [(\text{lm}_1, \text{prim}_1), (\text{lm}_2, \text{prim}_2), (\text{lm}_3, \text{prim}_3)]$$
-  * Reportar estadísticas: número de tareas únicas, episodios por tarea, tasas de éxito y colisiones.
-  * Generar los índices JSON de partición para entrenamiento:
-    * `train_tasks.json` ($\sim 70\%$ de las firmas).
-    * `val_tasks.json` ($\sim 15\%$ de las firmas).
-    * `held_out_tasks.json` ($\sim 15\%$ de las firmas nunca vistas).
-- **Criterio de Aceptación:** Cero solapamiento de firmas semánticas entre `train_tasks.json` y `held_out_tasks.json`.
+#### Tarea 1.2: Script de Auditoría y Partición (`audit_dataset.py`) — [x] COMPLETADO
+- **Implementación:**
+  * Escaneo recursivo de `datasets/task_XXXX/task_config.yaml` y extracción de firma canónica agnóstica a la longitud.
+  * Detección automática de duplicados y reporte de estadísticas de vuelo (`episode_meta.json`).
+  * Validación de variabilidad espacial intra-tarea (`waypoints.yaml`).
+  * Generación de splits con cero data leakage (`train_tasks.json`, `val_tasks.json`, `held_out_tasks.json`) y resumen global `dataset_summary.json`.
+- **Criterio de Aceptación:** Auditoría superada con cero solapamiento semántico entre Train y Held-Out.
 
 ---
 

@@ -27,10 +27,12 @@ ros2_ws/
 │       ├── worlds/                # Plantillas SDF de Gazebo (circuito_aros_01.sdf)
 │       ├── generated_worlds/      # Tareas generadas procedimentalmente (.sdf + waypoints.yaml)
 │       ├── scripts/
-│       │   ├── task_generator.py      # Generador de recetas semánticas de tareas
+│       │   ├── task_generator.py      # Generador de recetas semánticas de tareas (sin reemplazo)
 │       │   ├── world_generator.py     # Generador de mundos SDF y waypoints.yaml
 │       │   ├── synthetic_lidar.py     # Generador de nubes LiDAR 360° sintéticas (FPS 2048 pts)
+│       │   ├── audit_dataset.py       # Auditoría semántica, métricas de vuelo y particionado Train/Val/Held-Out
 │       │   ├── bag_to_heterodata.py   # Conversor de rosbag a grafos PyTorch Geometric (.pt)
+│       │   ├── visualize_dataset.py   # Visualizador 3D estático y animador GIF de trayectorias
 │       │   ├── data_collector.py      # Orquestador automático del dataset (doble bucle)
 │       │   ├── test_flight.sh         # Script rápido para vuelo de prueba
 │       │   └── kill_sim.sh            # Limpieza agresiva de procesos huérfanos
@@ -237,8 +239,27 @@ datasets/
     └── ...
 ```
 
-### 2. Conversión por Lotes a Formato PyTorch Geometric
-Una vez recolectadas las tareas, puedes convertir todos los episodios a `.pt` iterando con `bag_to_heterodata.py`:
+### 2. Auditoría del Dataset y Partición Formal (`audit_dataset.py`)
+Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría para verificar la integridad del dataset y generar las particiones oficiales:
+
+```bash
+python3 src/uav_ip/scripts/audit_dataset.py --dataset-dir datasets
+```
+
+Este comando realiza las siguientes validaciones y exportaciones:
+- **Detección de duplicados:** Comprueba las firmas semánticas de todas las tareas y asegura que no existan tareas repetidas.
+- **Auditoría de calidad de vuelo:** Analiza los metadatos de cada episodio (`episode_meta.json`) para reportar tasas de éxito, colisiones y *timeouts*.
+- **Control de variabilidad espacial:** Verifica que los episodios de una misma tarea presenten posiciones físicas aleatorizadas en sus `waypoints.yaml`.
+- **Generación de particiones Train / Val / Held-Out:** Crea en `datasets/splits/`:
+  - `train_tasks.json` ($\sim 70\%$ de las firmas semánticas).
+  - `val_tasks.json` ($\sim 15\%$ de las firmas).
+  - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, garantizando **cero fugas de información** para evaluar generalización *in-context*).
+  - `dataset_summary.json` (resumen estadístico global).
+
+*(Para realizar un chequeo rápido en terminal sin generar archivos JSON, puedes agregar el flag `--no-export`).*
+
+### 3. Conversión por Lotes a Formato PyTorch Geometric
+Una vez validado el dataset, puedes convertir todos los episodios a grafos `.pt` iterando con `bag_to_heterodata.py`:
 ```bash
 # Ejemplo de procesamiento por lotes en bash:
 for ep_dir in datasets/task_*/episode_*/; do
@@ -265,7 +286,7 @@ done
 ## 📚 Documentación y Decisiones Arquitectónicas
 
 Para profundizar en los fundamentos teóricos y evitar reabrir discusiones de diseño resueltas, consulta:
-- [DECISIONES_DISENO.md](/docs/DECISIONES_DISENO.md): Detalle técnico sobre el dilema de la cámara vs. LiDAR 360°, la observación privilegiada, la unificación analítica de marcos NED/ENU, la monotonicidad en pasillos 1D, el armado offboard seguro y la escala $s = 0.1$.
-- [PLAN_ESTRATEGIA.md](/docs/PLAN_ESTRATEGIA.md): Plan maestro de pseudo-tareas, taxonomía, formulación de grafos y fases de escalado Hito 0 a Hito C.
-- [DATASET_REQUIREMENTS.md](/docs/DATASET_REQUIREMENTS.md): Requisitos matemáticos y estructurales indispensables para la convergencia de Instant Policy.
+- [ESTRATEGIA_TEORICA.md](/docs/ESTRATEGIA_TEORICA.md): Marco teórico, preservación de Markov, formulación de grafos y taxonomía de pseudo-tareas.
+- [PLAN_IMPLEMENTACION.md](/docs/PLAN_IMPLEMENTACION.md): Hoja de ruta por hitos (0 a 4), estado de componentes de software y criterios de aceptación.
+- [DECISIONES_DISENO.md](/docs/DECISIONES_DISENO.md): Registro de decisiones arquitectónicas (ADRs), descarte de cámara de profundidad, marcos de referencia NED/ENU y escala métrica $s = 0.1$.
 - [TROUBLESHOOTING.md](/docs/TROUBLESHOOTING.md): Guía de solución para errores de EKF2, penetración de spawn en Gazebo y puertos XRCE-DDS.
