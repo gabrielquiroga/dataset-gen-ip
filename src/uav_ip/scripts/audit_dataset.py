@@ -61,6 +61,7 @@ def audit_dataset(
     tasks_by_signature: Dict[str, List[str]] = {}
     task_metadata: Dict[str, Dict[str, Any]] = {}
     primitive_counts: Dict[str, int] = {}
+    landmark_length_counts: Dict[int, int] = {}
     total_episodes = 0
     total_success = 0
     total_timeout = 0
@@ -81,6 +82,10 @@ def audit_dataset(
         if signature not in tasks_by_signature:
             tasks_by_signature[signature] = []
         tasks_by_signature[signature].append(task_id)
+
+        # Contar cantidad de landmarks
+        n_landmarks = len(cfg.get("landmarks", []))
+        landmark_length_counts[n_landmarks] = landmark_length_counts.get(n_landmarks, 0) + 1
 
         # Contar primitivas
         for prim in cfg.get("primitives", []):
@@ -168,6 +173,10 @@ def audit_dataset(
     for ptype, count in sorted(primitive_counts.items()):
         print(f"  - {ptype:15s}: {count} apariciones")
 
+    print(f"\n📏 DISTRIBUCIÓN DE CANTIDAD DE LANDMARKS:")
+    for n_lm, count in sorted(landmark_length_counts.items()):
+        print(f"  - Tareas con {n_lm} landmarks: {count}")
+
     print(f"\n🔍 VARIABILIDAD ESPACIAL INTRA-TAREA:")
     if tasks_with_identical_waypoints:
         print(f"  ⚠️ ATENCIÓN: {len(tasks_with_identical_waypoints)} tareas tienen waypoints idénticos entre episodios:")
@@ -226,6 +235,7 @@ def audit_dataset(
             "total_success": total_success,
             "success_rate": (total_success / total_episodes) if total_episodes > 0 else 0.0,
             "primitive_counts": primitive_counts,
+            "landmark_length_counts": landmark_length_counts,
             "train_tasks_count": len(train_tasks),
             "val_tasks_count": len(val_tasks),
             "held_out_tasks_count": len(held_out_tasks),

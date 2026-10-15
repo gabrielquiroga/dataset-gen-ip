@@ -103,59 +103,6 @@
       </link>
     </model>
 
-<!-- Aro 1: Recto (Puerta Cuadrada) -->
-    <model name="aro_1">
-      <static>true</static>
-      <!-- Posición central de la puerta -->
-      <pose>5 0 1.5 0 0 0</pose>
-      <link name="link">
-        <!-- Barra Superior -->
-        <visual name="top_v"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="top_c"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <!-- Barra Inferior -->
-        <visual name="bot_v"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="bot_c"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <!-- Pilar Izquierdo -->
-        <visual name="left_v"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="left_c"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-        <!-- Pilar Derecho -->
-        <visual name="right_v"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="right_c"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-      </link>
-    </model>
-
-    <!-- Aro 2: Elevado y a la derecha -->
-    <model name="aro_2">
-      <static>true</static>
-      <pose>10 -1.5 2.5 0 0 0</pose>
-      <link name="link">
-        <visual name="top_v"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="top_c"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <visual name="bot_v"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="bot_c"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <visual name="left_v"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="left_c"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-        <visual name="right_v"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="right_c"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-      </link>
-    </model>
-
-    <!-- Aro 3: Bajo y centrado -->
-    <model name="aro_3">
-      <static>true</static>
-      <pose>15 0 1.0 0 0 0</pose>
-      <link name="link">
-        <visual name="top_v"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="top_c"><pose>0 0 0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <visual name="bot_v"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="bot_c"><pose>0 0 -0.75 0 0 0</pose><geometry><box><size>0.1 1.5 0.1</size></box></geometry></collision>
-        <visual name="left_v"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="left_c"><pose>0 0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-        <visual name="right_v"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry><material><ambient>0.8 0 0 1</ambient><diffuse>0.8 0 0 1</diffuse></material></visual>
-        <collision name="right_c"><pose>0 -0.7 0 0 0 0</pose><geometry><box><size>0.1 0.1 1.4</size></box></geometry></collision>
-      </link>
-    </model>
-
     <!-- Plataforma de Llegada (Verde) -->
     <model name="plataforma_llegada">
       <static>true</static>

@@ -60,6 +60,35 @@ def get_combinatorial_catalog(
     return list(itertools.product(action_catalog, repeat=num_landmarks))
 
 
+def get_balanced_multilength_catalog(
+    action_catalog: List[Tuple[str, str]],
+    min_landmarks: int,
+    max_landmarks: int,
+    shuffle_seed: int = 42,
+) -> List[Tuple[Tuple[str, str], ...]]:
+    """Genera un catálogo combinado balanceado e intercalado para un rango de longitudes [min..max].
+    
+    Baraja deterministamente cada longitud por separado e intercala sus secuencias
+    para que todas las longitudes tengan una representación uniforme y se garantice
+    cero duplicados por construcción.
+    """
+    buckets: Dict[int, List[Tuple[Tuple[str, str], ...]]] = {}
+    rng = random.Random(shuffle_seed)
+    for n in range(min_landmarks, max_landmarks + 1):
+        seqs = list(itertools.product(action_catalog, repeat=n))
+        rng.shuffle(seqs)
+        buckets[n] = seqs
+
+    interleaved = []
+    max_bucket_len = max(len(s) for s in buckets.values())
+    for i in range(max_bucket_len):
+        for n in range(min_landmarks, max_landmarks + 1):
+            if i < len(buckets[n]):
+                interleaved.append(buckets[n][i])
+
+    return interleaved
+
+
 def generate_task_dict(
     task_id: str,
     seed: int,
@@ -99,8 +128,16 @@ def main():
         help="Índice combinatorio [0..M-1] para muestreo estricto sin reemplazo"
     )
     parser.add_argument(
-        "--num-landmarks", "--num-gates", dest="num_landmarks", type=int, default=3,
-        help="Cantidad de landmarks en el circuito (default: 3)"
+        "--num-landmarks", "--num-gates", dest="num_landmarks", type=int, default=None,
+        help="Cantidad exacta fija de landmarks (anula min/max si se especifica)"
+    )
+    parser.add_argument(
+        "--min-landmarks", type=int, default=2,
+        help="Cantidad mínima de landmarks acotados (default: 2)"
+    )
+    parser.add_argument(
+        "--max-landmarks", type=int, default=5,
+        help="Cantidad máxima de landmarks acotados (default: 5)"
     )
     parser.add_argument(
         "--shuffle-seed", type=int, default=42,
@@ -111,18 +148,22 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=pkg_dir / "generated_worlds")
     args = parser.parse_args()
 
-    # Generar espacio combinatorial para num_landmarks
-    catalog = get_combinatorial_catalog(DEFAULT_ACTION_CATALOG, args.num_landmarks)
-    catalog_size = len(catalog)
+    if args.num_landmarks is not None:
+        min_l = max_l = args.num_landmarks
+    else:
+        min_l = args.min_landmarks
+        max_l = args.max_landmarks
 
-    # Permutación pseudoaleatoria determinista para muestreo sin reemplazo
-    rng_perm = random.Random(args.shuffle_seed)
-    shuffled_indices = list(range(catalog_size))
-    rng_perm.shuffle(shuffled_indices)
+    if min_l > max_l:
+        raise ValueError(f"min_landmarks ({min_l}) no puede ser mayor que max_landmarks ({max_l})")
+
+    # Generar espacio combinatorial balanceado e intercalado
+    catalog = get_balanced_multilength_catalog(DEFAULT_ACTION_CATALOG, min_l, max_l, args.shuffle_seed)
+    catalog_size = len(catalog)
 
     if args.task_index is not None:
         # Modo sin reemplazo indexado sobre la permutación
-        chosen_idx = shuffled_indices[args.task_index % catalog_size]
+        chosen_idx = args.task_index % catalog_size
         action_sequence = catalog[chosen_idx]
     else:
         # Fallback pseudoaleatorio si no se pasa índice
@@ -143,6 +184,8 @@ def main():
         profile=profile,
     )
     task_config["catalog_size"] = catalog_size
+    task_config["min_landmarks"] = min_l
+    task_config["max_landmarks"] = max_l
     if args.task_index is not None:
         task_config["task_index"] = args.task_index
 
@@ -155,7 +198,7 @@ def main():
         
     print(f"Task configuration written to {config_path}")
     print(f"  Firma Semántica: {task_config['signature']}")
-    print(f"  Catálogo: {catalog_size} combinaciones disponibles (num_landmarks={args.num_landmarks})")
+    print(f"  Catálogo: {catalog_size} combinaciones disponibles (rango=[{min_l}..{max_l}], actual={len(action_sequence)})")
 
 
 if __name__ == "__main__":

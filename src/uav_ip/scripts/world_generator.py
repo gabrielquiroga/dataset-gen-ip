@@ -81,15 +81,80 @@ LANDING_OFFSET_Y_MAX: float = 1.5   # ligero descentrado lateral
 # que salen del FOV de la camara de profundidad)
 MAX_DELTA_Y_BETWEEN_GATES: float = 3.0
 
-# Numero de aros en el circuito
-NUM_GATES: int = 3
-
-# Nombres de los modelos en el SDF (deben coincidir con la plantilla)
-GATE_MODEL_NAMES = ["aro_1", "aro_2", "aro_3"]
 LANDING_MODEL_NAME = "plataforma_llegada"
 
 # Ruta default de PX4 worlds
 PX4_WORLDS_DIR = Path.home() / "PX4-Autopilot" / "Tools" / "simulation" / "gz" / "worlds"
+
+
+# ============================================================================
+# Constructores Modulares de Modelos SDF
+# ============================================================================
+
+def _create_gate_element(
+    name: str, x: float, y: float, z: float, yaw: float
+) -> ET.Element:
+    """Crea un elemento <model> SDF para un aro o puerta cuadrada con 4 barras."""
+    model = ET.Element("model", name=name)
+    ET.SubElement(model, "static").text = "true"
+    ET.SubElement(model, "pose").text = f"{x} {y} {z} 0 0 {yaw}"
+
+    link = ET.SubElement(model, "link", name="link")
+
+    bars = [
+        # (nombre, pose, size, color)
+        ("top", "0 0 0.75 0 0 0", "0.1 1.5 0.1", "0.8 0 0 1"),
+        ("bot", "0 0 -0.75 0 0 0", "0.1 1.5 0.1", "0.8 0 0 1"),
+        ("left", "0 0.7 0 0 0 0", "0.1 0.1 1.4", "0.8 0 0 1"),
+        ("right", "0 -0.7 0 0 0 0", "0.1 0.1 1.4", "0.8 0 0 1"),
+    ]
+    for b_name, b_pose, b_size, b_color in bars:
+        vis = ET.SubElement(link, "visual", name=f"{b_name}_v")
+        ET.SubElement(vis, "pose").text = b_pose
+        g = ET.SubElement(vis, "geometry")
+        box = ET.SubElement(g, "box")
+        ET.SubElement(box, "size").text = b_size
+        mat = ET.SubElement(vis, "material")
+        ET.SubElement(mat, "ambient").text = b_color
+        ET.SubElement(mat, "diffuse").text = b_color
+
+        col = ET.SubElement(link, "collision", name=f"{b_name}_c")
+        ET.SubElement(col, "pose").text = b_pose
+        gc = ET.SubElement(col, "geometry")
+        box_c = ET.SubElement(gc, "box")
+        ET.SubElement(box_c, "size").text = b_size
+
+    return model
+
+
+def _create_pole_element(
+    name: str, x: float, y: float, yaw: float, radius: float = 0.1, length: float = 3.0
+) -> ET.Element:
+    """Crea un elemento <model> SDF para un poste cilíndrico vertical."""
+    model = ET.Element("model", name=name)
+    ET.SubElement(model, "static").text = "true"
+    ET.SubElement(model, "pose").text = f"{x} {y} 0.0 0 0 {yaw}"
+
+    link = ET.SubElement(model, "link", name="link")
+
+    vis = ET.SubElement(link, "visual", name="pole_v")
+    ET.SubElement(vis, "pose").text = f"0 0 {length / 2.0} 0 0 0"
+    g = ET.SubElement(vis, "geometry")
+    cyl = ET.SubElement(g, "cylinder")
+    ET.SubElement(cyl, "radius").text = str(radius)
+    ET.SubElement(cyl, "length").text = str(length)
+    mat = ET.SubElement(vis, "material")
+    ET.SubElement(mat, "ambient").text = "1 0.5 0 1"
+    ET.SubElement(mat, "diffuse").text = "1 0.5 0 1"
+
+    col = ET.SubElement(link, "collision", name="pole_c")
+    ET.SubElement(col, "pose").text = f"0 0 {length / 2.0} 0 0 0"
+    gc = ET.SubElement(col, "geometry")
+    cyl_c = ET.SubElement(gc, "cylinder")
+    ET.SubElement(cyl_c, "radius").text = str(radius)
+    ET.SubElement(cyl_c, "length").text = str(length)
+
+    return model
 
 
 # ============================================================================
@@ -105,7 +170,7 @@ def generate_random_circuit(
 
     Returns:
         (hoops, landing) donde:
-          hoops = [{"name": str, "x": float, "y": float, "z": float, "yaw": float}, ...]
+          hoops = [{"id": str, "type": str, "x": float, "y": float, "z": float, "yaw": float}, ...]
           landing = {"x": float, "y": float}
 
     Raises:
@@ -196,12 +261,12 @@ def modify_sdf(
     landing: dict,
     remove_takeoff_platform: bool = False,
 ) -> ET.ElementTree:
-    """Parsea el SDF plantilla y modifica las poses de los aros y la plataforma.
+    """Parsea el SDF plantilla, limpia modelos previos e inyecta dinámicamente los landmarks.
 
     Args:
         template_path: Ruta al archivo .sdf plantilla.
         world_name: Nombre para el <world> tag (usado por PX4_GZ_WORLD).
-        hoops: Lista de dicts con {name, x, y, z, yaw}.
+        hoops: Lista de dicts con {id, type, x, y, z, yaw}.
         landing: Dict con {x, y} de la plataforma de aterrizaje.
         remove_takeoff_platform: Si es True, elimina el modelo 'plataforma_salida' del SDF.
 
@@ -222,50 +287,25 @@ def modify_sdf(
         if takeoff_model is not None:
             world_elem.remove(takeoff_model)
 
-    # Modificar poses de los aros
-    for i, hoop in enumerate(hoops):
-        old_name = f"aro_{i+1}"
-        model = _find_model(world_elem, old_name)
-        if model is None:
-            raise ValueError(
-                f"Modelo '{old_name}' no encontrado en la plantilla SDF"
+    # 1. Eliminar cualquier modelo de landmark preexistente en la plantilla (aro_*, landmark_*)
+    for model in list(world_elem.findall("model")):
+        m_name = model.get("name", "")
+        if m_name.startswith(("aro_", "landmark_")):
+            world_elem.remove(model)
+
+    # 2. Inyectar dinámicamente cada uno de los N landmarks
+    for hoop in hoops:
+        if hoop.get("type") == "pole":
+            model_elem = _create_pole_element(
+                hoop["id"], hoop["x"], hoop["y"], hoop["yaw"]
             )
-            
-        model.set("name", hoop["id"])
-        
-        if hoop.get("type") == "pole":
-            link = model.find("link")
-            if link is not None:
-                for child in list(link):
-                    if child.tag in ["visual", "collision"]:
-                        link.remove(child)
-                        
-                visual = ET.SubElement(link, "visual", name="pole_v")
-                v_pose = ET.SubElement(visual, "pose")
-                v_pose.text = "0 0 1.5 0 0 0"
-                v_geom = ET.SubElement(visual, "geometry")
-                v_cyl = ET.SubElement(v_geom, "cylinder")
-                ET.SubElement(v_cyl, "radius").text = "0.1"
-                ET.SubElement(v_cyl, "length").text = "3.0"
-                v_mat = ET.SubElement(visual, "material")
-                ET.SubElement(v_mat, "ambient").text = "1 0.5 0 1"
-                ET.SubElement(v_mat, "diffuse").text = "1 0.5 0 1"
-                
-                collision = ET.SubElement(link, "collision", name="pole_c")
-                c_pose = ET.SubElement(collision, "pose")
-                c_pose.text = "0 0 1.5 0 0 0"
-                c_geom = ET.SubElement(collision, "geometry")
-                c_cyl = ET.SubElement(c_geom, "cylinder")
-                ET.SubElement(c_cyl, "radius").text = "0.1"
-                ET.SubElement(c_cyl, "length").text = "3.0"
-
-        if hoop.get("type") == "pole":
-            pose_str = f"{hoop['x']} {hoop['y']} 0.0 0 0 {hoop['yaw']}"
         else:
-            pose_str = f"{hoop['x']} {hoop['y']} {hoop['z']} 0 0 {hoop['yaw']}"
-        _set_model_pose(model, pose_str)
+            model_elem = _create_gate_element(
+                hoop["id"], hoop["x"], hoop["y"], hoop["z"], hoop["yaw"]
+            )
+        world_elem.append(model_elem)
 
-    # Modificar pose de la plataforma de aterrizaje
+    # 3. Modificar pose de la plataforma de aterrizaje (siempre adelante del último landmark)
     landing_model = _find_model(world_elem, LANDING_MODEL_NAME)
     if landing_model is None:
         raise ValueError(
@@ -273,6 +313,12 @@ def modify_sdf(
         )
     landing_pose_str = f"{landing['x']} {landing['y']} 0.05 0 0 0"
     _set_model_pose(landing_model, landing_pose_str)
+
+    # Formatear indentación XML limpia
+    try:
+        ET.indent(tree, space="  ")
+    except AttributeError:
+        pass
 
     return tree
 

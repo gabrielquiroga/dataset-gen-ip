@@ -218,3 +218,16 @@ En la configuración de pasillo 1D con 3 landmarks:
   * Todos los episodios de una misma tarea compartían exactamente las mismas coordenadas físicas $(x, y, z, \text{yaw})$.
   * Esto violaba el principio central de In-Context Imitation Learning, donde las demos de contexto y la demo objetivo deben compartir la misma regla semántica pero exhibir variabilidad espacial continua.
 * **Resolución Definitiva:** Separación estricta entre `_generate_task_config` (semántica fija en `task_config.yaml`) y `_generate_episode_world` (aleatorización espacial en cada episodio con semilla determinista única).
+
+### 10.5 Descarte de la Plantilla Rígida de 3 Aros y Transición a Inyección Dinámica Modular
+* **Qué se implementó inicialmente:**
+  * El archivo de simulación `circuito_aros_01.sdf` contenía tres modelos fijos: `<model name="aro_1">`, `aro_2` y `aro_3`.
+  * `world_generator.py` buscaba obligatoriamente estos tres nombres para renombrarlos o modificar sus mallas.
+* **Limitaciones Identificadas:**
+  * Imposibilidad de variar la complejidad de las tareas: Tareas de 2 objetos dejaban un "aro fantasma" abandonado en el mundo; tareas de 4 o más objetos provocaban una excepción `ValueError` al no existir `aro_4` en el XML.
+* **Resolución Definitiva (Octubre 2026):**
+  * Desacoplamiento total entre el entorno base de Gazebo (física, iluminación, plano de tierra, plataforma de salida y plataforma de llegada) y los landmarks.
+  * Implementación de constructores modulares de XML en Python (`_create_gate_element` y `_create_pole_element`) que inyectan dinámicamente $N$ elementos en tiempo de ejecución.
+  * Reposicionamiento automático de la plataforma de aterrizaje a $X_N + \Delta X_{\text{land}}$, garantizando que cualquier circuito de longitud acotada $N \in [2, 5]$ sea físicamente factible.
+  * Catálogo combinatorio dinámico balanceado e intercalado en `task_generator.py`, garantizando muestreo sin reemplazo estricto (cero duplicados) a través de todas las longitudes.
+

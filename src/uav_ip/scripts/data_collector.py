@@ -244,6 +244,9 @@ class DataCollector:
         episode_timeout: int = EPISODE_TIMEOUT,
         px4_startup_wait: int = PX4_STARTUP_TIMEOUT,
         no_takeoff_platform: bool = True,
+        num_landmarks: Optional[int] = None,
+        min_landmarks: int = 2,
+        max_landmarks: int = 5,
     ):
         self.num_tasks = num_tasks
         self.episodes_per_task = episodes_per_task
@@ -253,6 +256,9 @@ class DataCollector:
         self.episode_timeout = episode_timeout
         self.px4_startup_wait = px4_startup_wait
         self.no_takeoff_platform = no_takeoff_platform
+        self.num_landmarks = num_landmarks
+        self.min_landmarks = min_landmarks
+        self.max_landmarks = max_landmarks
         self.pm = ProcessManager()
 
         # Contadores globales
@@ -397,7 +403,11 @@ class DataCollector:
             "--task-id", task_id,
             "--seed", str(task_seed),
             "--shuffle-seed", str(self.base_seed),
+            "--min-landmarks", str(self.min_landmarks),
+            "--max-landmarks", str(self.max_landmarks),
         ]
+        if self.num_landmarks is not None:
+            cmd_task.extend(["--num-landmarks", str(self.num_landmarks)])
         if task_idx is not None:
             cmd_task.extend(["--task-index", str(task_idx)])
 
@@ -831,6 +841,18 @@ def main():
         "--with-takeoff-platform", action="store_false", dest="no_takeoff_platform",
         help="Incluir la plataforma de salida (por defecto no se incluye).",
     )
+    parser.add_argument(
+        "--num-landmarks", type=int, default=None,
+        help="Fijar cantidad exacta de landmarks en todas las tareas (anula min/max).",
+    )
+    parser.add_argument(
+        "--min-landmarks", type=int, default=2,
+        help="Cantidad minima de landmarks acotados por tarea (default: 2).",
+    )
+    parser.add_argument(
+        "--max-landmarks", type=int, default=5,
+        help="Cantidad maxima de landmarks acotados por tarea (default: 5).",
+    )
 
     args = parser.parse_args()
 
@@ -846,6 +868,9 @@ def main():
         episode_timeout=args.episode_timeout,
         px4_startup_wait=args.px4_startup_wait,
         no_takeoff_platform=args.no_takeoff_platform,
+        num_landmarks=args.num_landmarks,
+        min_landmarks=args.min_landmarks,
+        max_landmarks=args.max_landmarks,
     )
     
     try:

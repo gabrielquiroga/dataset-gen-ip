@@ -218,6 +218,9 @@ python3 src/uav_ip/scripts/data_collector.py \
 ### Opciones Disponibles de `data_collector.py`
 - `--num-tasks <N>`: Número de pseudo-tareas únicas a generar (mundos con variaciones espaciales aleatorias).
 - `--episodes-per-task <M>`: Demostraciones por cada tarea (para conformar $N-1$ demos de contexto y 1 de query).
+- `--min-landmarks <min>`: Cantidad mínima de landmarks acotados por tarea (default: 2).
+- `--max-landmarks <max>`: Cantidad máxima de landmarks acotados por tarea (default: 5).
+- `--num-landmarks <K>`: Forzar cantidad exacta fija de landmarks en todas las tareas (anula min/max).
 - `--base-seed <S>`: Semilla base para reproducibilidad estricta.
 - `--resume`: Si se interrumpió la recolección, reanuda automáticamente omitiendo tareas y episodios ya completados con éxito.
 - `--episode-timeout <seg>`: Timeout de seguridad por vuelo (default: 360s).
