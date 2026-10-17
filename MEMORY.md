@@ -14,26 +14,25 @@ Para evitar desincronizaciones, la información del proyecto se encuentra formal
 
 ---
 
-## 🚀 Estado Actual del Stack (Hito 0 Completado)
+## 🚀 Estado Actual del Stack (Hitos 0 y 1 Completados)
 
 * **Stack Base:** Ubuntu 24.04 (WSL2), ROS 2 Jazzy, Gazebo Harmonic y PX4 SITL (`v1.14/v1.15`).
 * **Vehículo de Simulación:** Modelo estándar **`gz_x500`** (sin cámara física de profundidad), garantizando un RTF $\ge 1.0\times$.
 * **Observación y Sensores:** LiDAR 3D omnidireccional 360° privilegiado en modo `range` ($R_{\text{max}} = 10.0\text{ m}$) implementado mediante `synthetic_lidar.py` (2048 puntos, FPS, marco egocéntrico FLU, escala métrica $s = 0.1$).
-* **Controladores:** Arquitectura desacoplada bajo patrón Strategy:
-  * `base_pilot.py`: Ciclo de vida de ROS 2, armado seguro en 50 Hz, QoS.
-  * `waypoint_controller.py`: Control feed-forward interpretando `waypoints.yaml` (`traverse`, `slalom`, `overfly`, `orbit` con yaw centrípeto hacia el landmark).
-  * `tracking_controller.py`: Prototipo de seguimiento dinámico en feedback.
-* **Orquestación y Recolección:** `data_collector.py` ejecuta campañas automáticas de múltiples tareas y episodios:
-  * Semántica fija a nivel tarea (`task_config.yaml`).
-  * Aleatorización de poses 3D continua a nivel episodio con semillas deterministas (`waypoints.yaml`).
-  * Telemetría ligera en rosbags MCAP ($< 5\text{ MB}$ por vuelo).
-* **Postproceso:** `bag_to_heterodata.py` convierte los rosbags en grafos PyG `HeteroData` `.pt`. `visualize_dataset.py` permite validación visual 3D estática y generación de animaciones GIF.
+* **Controladores:** Arquitectura desacoplada bajo patrón Strategy (`base_pilot.py`, `waypoint_controller.py`, `tracking_controller.py`).
+* **Generación y Auditoría:** `task_generator.py` muestrea el catálogo combinatorio multi-longitud sin reemplazo; `audit_dataset.py` verifica cero duplicados y exporta particiones `train`, `val` y `held_out` sin fugas.
+* **Orquestación y Postproceso:** `data_collector.py` recolecta rosbags MCAP ligeros ($< 5\text{ MB}$/vuelo); `bag_to_heterodata.py` y `visualize_dataset.py` procesan y animan las trayectorias en 3D.
 
 ---
 
-## 🛠️ Próximas Tareas Inmediatas (Hitos 1 y 2)
+## 🛠️ Próximas Tareas Inmediatas (Hito 1.5 y Hito 2 en `docs/PLAN_IMPLEMENTACION.md`)
 
-1. **Generación Robusta de Tareas sin Reemplazo (`task_generator.py`):** Muestrear el espacio de las 64 firmas semánticas únicas sin colisiones aleatorias.
-2. **Script de Auditoría y Partición (`audit_dataset.py`):** Validar la unicidad de firmas en `datasets/` y emitir `train_tasks.json`, `val_tasks.json` y `held_out_tasks.json`.
-3. **Entorno Virtual para Machine Learning (`~/venv_ip`):** Aislar PyTorch, PyTorch Geometric y `rosbags` para cumplir con PEP 668 sin interferir con ROS 2 Jazzy.
-4. **Procesamiento por Lotes Multiproceso (`bag_to_heterodata.py`):** Agregar `--dataset-dir` y paralelismo con `multiprocessing.Pool` para convertir cientos de episodios en segundos.
+1. **Hito 1.5 — Bloque A (Simulación y Recolección):**
+   * Eliminar el `profile` fantasma de `get_task_signature` e incorporar `slalom` bilateral (`left`/`right`) y `circular_gate` en `task_generator.py` y `world_generator.py`.
+   * Suavizar el paso por waypoints en `waypoint_controller.py`, corregir la mezcla de marcos ENU/NED en `tracking_controller.py` y añadir variación en la pose inicial de vuelo.
+2. **Hito 1.5 — Bloque B (Postproceso LiDAR, Grafos $SE(3)$ y Empaquetado):**
+   * Proyectar las nubes de `synthetic_lidar.py` en el marco estabilizado por gravedad (*Horizontal FLU*), acotar puntos de `landing_pad` y fijar semilla determinista en `fps_numpy`.
+   * Rediseñar `bag_to_heterodata.py` para almacenar poses $SE(3)$ completas, los 6 keypoints del UAV, el horizonte $T=8$ de desplazamientos relativos futuros $T_{EA}$ sobre la trayectoria real (en lugar de setpoints escalonados globales) y el extractor de $L=10$ keyframes.
+   * Reemplazar las copias duplicadas en `src/uav_ip/scripts/` (`synthetic_lidar.py` y `visualize_dataset.py`) por *thin wrappers* que importen desde `uav_ip/`.
+3. **Hito 2 (Infraestructura ML y Aumento de Recuperación):**
+   * Configurar `~/venv_ip`, añadir procesamiento por lotes multiproceso en `bag_to_heterodata.py` e implementar el aumento de datos correctivo del 30% (*Tube Augmentation*).
