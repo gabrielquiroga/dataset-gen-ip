@@ -129,52 +129,48 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 ---
 
-#### Bloque B: Correcciones Matemáticas en Observación LiDAR, Grafos `HeteroData` y Empaquetado
+#### Bloque B: Correcciones Matemáticas en Observación LiDAR, Grafos `HeteroData` y Empaquetado — [COMPLETADO]
 
-##### Tarea 1.5.4: Marco Egocéntrico Estabilizado por Gravedad (*Horizontal FLU*) y Refinamiento de `synthetic_lidar.py` — [ ] PENDIENTE
+##### Tarea 1.5.4: Marco Egocéntrico Estabilizado por Gravedad (*Horizontal FLU*) y Refinamiento de `synthetic_lidar.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. **Acoplamiento Pitch/Roll en cuadricópteros subactuados:** `px4_odometry_to_gazebo_enu` proyecta la nube de puntos usando la matriz 3D completa $R_{\text{ENU}}^{\text{FLU}}$ (que incluye el *roll* $\phi$ y *pitch* $\theta$ instantáneos del chasis). Al acelerar o frenar a $3\text{ m/s}$, el dron cabecea $\pm 20^\circ$, haciendo que un aro situado a $8\text{ m}$ al frente aparente subir o bajar $\pm 2.7\text{ m}$ en $Z_{\text{FLU}}$, distorsionando la geometría respecto al espacio plano de control $(x, y, z, \text{yaw})$.
   2. **Sobredensidad de `landing_pad`:** La plataforma de aterrizaje se muestrea como una caja de $2.0 \times 2.0 \times 0.1\text{ m}$ ($8\text{ m}^2$ de área total, incluyendo cara inferior), robando gran parte de los 2048 puntos FPS cuando el dron ejecuta la última primitiva a $4\text{–}6\text{ m}$ de ella.
   3. **No-determinismo en pre-submuestreo y colapso en $(0,0,0)$:** `fps_numpy` usa `seed=None` por defecto al reducir nubes de $>4096$ puntos y devuelve `np.zeros((2048, 3))` (el centro de masa del dron) si la nube queda vacía ($N=0$).
 - **Acciones de Implementación:**
   * Implementar por defecto la proyección al **marco egocéntrico estabilizado por gravedad (*Horizontal FLU / Gravity-Aligned Frame*)**: extraer el *yaw* $\psi_{\text{ENU}} = \operatorname{atan2}(R_{1,0}, R_{0,0})$ de $R_{\text{ENU}}^{\text{FLU}}$ y rotar la escena exclusivamente con $R_z(\psi_{\text{ENU}})$ (dejando `gravity_aligned: bool = True` como parámetro configurable).
-  * En `generate_canonical_landing_pad`: muestrear únicamente la cara superior (o el disco de radio $0.75\text{ m}$ especificado en `ESTRATEGIA_TEORICA.md`) con una cuota máxima acotada de puntos (ej. $\le 1000$ puntos) para no eclipsar a los landmarks principales.
-  * Pasar una semilla determinista (`seed = episode_seed * 10000 + step_idx`) a `generate_pointcloud` / `fps_numpy`.
-  * En caso de nube vacía ($N=0$), colocar los puntos dummy en la frontera exterior del rango ($R = R_{\text{max}}$) o emitir una máscara de validez `scene_valid_mask`, nunca en $(0,0,0)$.
+  * En `generate_canonical_landing_pad`: muestrear exclusivamente la cara superior y bordes laterales (excluyendo la cara inferior apoyada en el suelo) con una cuota acotada de $1000$ puntos para no eclipsar a los landmarks principales.
+  * Pasar una semilla determinista (`seed = (ep_seed * 10000 + step_idx) % (2**31 - 1)`) a `generate_pointcloud` / `fps_numpy`.
+  * En caso de nube vacía ($N=0$), colocar los puntos dummy en un anillo sobre la frontera exterior del rango ($R = s \cdot R_{\text{max}} = 1.0$), nunca en $(0,0,0)$.
 - **Criterio de Aceptación:** Suite `pytest` en `test_synthetic_lidar.py` ampliada verificando invarianza de la nube ante inclinaciones puras de *pitch/roll* del dron con `gravity_aligned=True`.
 
-##### Tarea 1.5.5: Rediseño Matemático de `bag_to_heterodata.py` acorde a *Instant Policy* ($SE(3)$, Horizonte $T=8$, Keyframes $L=10$ y 6 Keypoints) — [ ] PENDIENTE
+##### Tarea 1.5.5: Rediseño Matemático de `bag_to_heterodata.py` acorde a *Instant Policy* ($SE(3)$, Horizonte $T=8$, Keyframes $L=10$ y 6 Keypoints) y Actualización de `visualize_dataset.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. `bag_to_heterodata.py` asigna como acción objetivo (`data['agent'].y`) la coordenada global en ENU del setpoint discreto publicado por `WaypointController` (una función escalón que apunta a metros de distancia y salta discontinuamente), contradiciendo el Apéndice H de *Instant Policy*.
   2. `data['agent'].x` y `data['agent'].y` están en el marco global ENU mientras que `data['scene'].pos` está en el marco local del dron, y **no se guarda la orientación del dron ($R_{WE}$ / yaw)** ni el estado binario de vuelo $s_t \in \{0, 1\}$, haciendo imposible reconstruir los desplazamientos relativos en $SE(3)$ o los 6 nodos keypoint del dron.
 - **Acciones de Implementación:**
   1. **Re-muestreo y Estado Completo del Agente:**
      * Guardar en `data['agent']`:
-       - `pos_enu`: $(T_{\text{steps}}, 3)$ posición en ENU escalada por $s=0.1$.
-       - `yaw_enu` y `rot_enu`: $(T_{\text{steps}}, 1)$ y $(T_{\text{steps}}, 3, 3)$ orientación estabilizada $R_z(\psi_t)$ (y cuaternión completo `q_ned` para auditoría).
+       - `pos_enu` (y `x`): $(T_{\text{steps}}, 3)$ posición en ENU escalada por $s=0.1$.
+       - `yaw_enu`, `rot_enu` y `pose_se3`: $(T_{\text{steps}}, 1)$, $(T_{\text{steps}}, 3, 3)$ y $(T_{\text{steps}}, 4, 4)$ orientación estabilizada $R_z(\psi_t)$ y matriz homogénea $T_{WE}^t$ (más cuaternión completo `q_ned` para auditoría).
        - `flight_state`: $(T_{\text{steps}}, 1)$ estado binario $s_t \in \{0, 1\}$ ($1$ en vuelo activo, $0$ durante descenso final/touchdown sobre la plataforma).
        - `keypoints_body`: $(6, 3)$ coordenadas canónicas de los 6 nodos keypoint del UAV en el marco local (centro, proa $+X$, popa $-X$, babor $+Y$, estribor $-Y$, cenit $+Z$) para construir los nodos del agente $\{p_g^i\}_{i=1}^6$ requeridos por el algoritmo SVD de *Instant Policy* (Sec. 3.2 y 3.3).
   2. **Horizonte de Acciones Relativas ($T = 8$) sobre la Trayectoria Ejecutada:**
      * Para cada instante $t$, calcular la secuencia de $T=8$ transformaciones futuras relativas en el marco local estabilizado del dron a partir de la trayectoria realmente volada (con paso uniforme):
        $$T_{EA}^{(t, k)} = (T_{WE}^t)^{-1} T_{WE}^{t+k} \in SE(3), \quad k = 1, \dots, T$$
-     * Almacenar tanto las matrices relativas `data['agent'].action_se3` de forma $(T_{\text{steps}}, 8, 4, 4)$ como la descomposición desacoplada $(\Delta p_{t+k}, \Delta \psi_{t+k}, s_{t+k})$ escalada por $s=0.1$.
+     * Almacenar tanto las matrices relativas `data['agent'].action_se3` de forma $(T_{\text{steps}}, 8, 4, 4)$ como la descomposición desacoplada `data['agent'].y` $(\Delta p_{t+k}, \Delta \psi_{t+k}, s_{t+k})$ de forma $(T_{\text{steps}}, 8, 5)$ escalada por $s=0.1$.
      * Guardar el setpoint crudo de PX4 en `data['agent'].setpoint_raw` exclusivamente con fines de diagnóstico del controlador.
-  3. **Extracción Geométrica de Keyframes de Contexto ($L = 10$):**
-     * Implementar la función `extract_trajectory_keyframes(pos_enu, yaw_enu, flight_state, L=10)` que seleccione automáticamente los $L$ índices críticos de una demostración combinando:
-       - Inicio ($t=0$) y fin ($t=T_{\text{steps}}-1$) del vuelo.
-       - Transición del estado binario de vuelo $s_t$ (inicio del aterrizaje).
-       - Máximos locales de curvatura geométrica 3D $\kappa(t)$ y de velocidad angular $|\dot{\psi}(t)|$ (capturando automáticamente los centros de giro en `slalom`, `overfly` y los 4 cuadrantes de `orbit`).
-       - Interpolación uniforme por longitud de arco para completar exactamente $L$ keyframes.
-     * Almacenar `data['agent'].keyframe_indices` de forma $(L,)$ directamente en el archivo `.pt`.
-- **Criterio de Aceptación:** Todo archivo `.pt` generado contiene `scene.pos` $(T_{\text{steps}}, 2048, 3)$, poses $SE(3)$ completas, horizonte de acciones relativas $T=8$ en marco local, estado $s_t$ e índices de $L=10$ keyframes verificados visualmente en `visualize_dataset.py`.
+  3. **Extracción Geométrica de Keyframes de Contexto ($L = 10$) y Soporte en `visualize_dataset.py`:**
+     * Implementar `extract_trajectory_keyframes(pos_enu, yaw_enu, flight_state, num_keyframes=10)` combinando inicio/fin, transición de aterrizaje $s_t$, máximos de curvatura 3D $\kappa(t)$ y $|\dot{\psi}(t)|$, y cobertura por longitud de arco (1D FPS), guardando `data['agent'].keyframe_indices` de forma $(10,)$.
+     * Actualizar `visualize_dataset.py` de forma retrocompatible para renderizar el horizonte local $T=8$ en las vistas egocéntricas y los $L=10$ keyframes sobre la trayectoria 3D global.
+- **Criterio de Aceptación:** Todo archivo `.pt`/`.npz` generado contiene `scene.pos` $(T_{\text{steps}}, 2048, 3)$, poses $SE(3)$ completas, horizonte de acciones relativas $T=8$ en marco local, estado $s_t$ e índices de $L=10$ keyframes verificados visualmente en `visualize_dataset.py`.
 
-##### Tarea 1.5.6: Sincronización Estructural entre `src/uav_ip/uav_ip/` y `src/uav_ip/scripts/` (Patrón *Thin Wrapper*) — [ ] PENDIENTE
+##### Tarea 1.5.6: Sincronización Estructural entre `src/uav_ip/uav_ip/` y `src/uav_ip/scripts/` (Patrón *Thin Wrapper*) — [x] COMPLETADO
 - **Contexto y Justificación:**
   * La carpeta `src/uav_ip/uav_ip/` responde al estándar oficial de paquetes `ament_python` de ROS 2 (instalable vía `colcon build` para importar como `from uav_ip.synthetic_lidar import ...`), mientras que `src/uav_ip/scripts/` permite ejecutar scripts directamente por CLI (`python3 src/uav_ip/scripts/...`) o importarlos desde `bag_to_heterodata.py` dentro del virtualenv de ML (`~/venv_ip`) sin tener ROS 2 cargado.
   * Sin embargo, mantener dos copias completas de 713 líneas (`synthetic_lidar.py`) y 517 líneas (`visualize_dataset.py`) introduce riesgo de divergencia silenciosa al aplicar las mejoras de las Tareas 1.5.4 y 1.5.5.
 - **Estrategia de Resolución (*Single Source of Truth + Thin Shim*):**
   1. Mantener el código fuente completo **únicamente** dentro del módulo de Python `src/uav_ip/uav_ip/synthetic_lidar.py` y `src/uav_ip/uav_ip/visualize_dataset.py`.
-  2. Reemplazar el contenido de `src/uav_ip/scripts/synthetic_lidar.py` y `src/uav_ip/scripts/visualize_dataset.py` por un *thin wrapper* (~15 líneas) que inyecte dinámicamente `src/uav_ip/` en `sys.path`, re-exporte toda la API (`from uav_ip.synthetic_lidar import *`) y ejecute `main()` si `__name__ == "__main__"`.
+  2. Reemplazar el contenido de `src/uav_ip/scripts/synthetic_lidar.py` y `src/uav_ip/scripts/visualize_dataset.py` por un *thin wrapper* (~25 líneas) que inyecte dinámicamente `src/uav_ip/` en `sys.path`, re-exporte toda la API (`from uav_ip.synthetic_lidar import *`) y ejecute `main()` si `__name__ == "__main__"`.
   3. De este modo:
      * `ros2 run uav_ip synthetic_lidar` funciona en ROS 2.
      * `from uav_ip.synthetic_lidar import ...` funciona en ROS 2 y en `pytest`.
