@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
+import math
+from typing import Optional, Sequence
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition
-import math
+
 
 class BasePilot(Node):
     """
-    BasePilot provides the lifecycle of ROS 2, arming, QoS, and publishing/subscribing
-    to PX4 messages for offboard control.
+    BasePilot provides the lifecycle of ROS 2, arming, QoS, coordinate frame
+    conversions (Gazebo ENU <-> PX4 NED), and publishing/subscribing to PX4
+    messages for offboard control.
     """
-    def __init__(self, node_name="base_pilot"):
+    def __init__(self, node_name: str = "base_pilot"):
         super().__init__(node_name)
-        
+
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
@@ -32,35 +35,58 @@ class BasePilot(Node):
         self.setpoint_counter = 0
 
     def _pos_callback(self, msg: VehicleLocalPosition) -> None:
-        self.current_pos_ned = [msg.x, msg.y, msg.z]
+        self.current_pos_ned = [float(msg.x), float(msg.y), float(msg.z)]
         self.px4_timestamp = msg.timestamp
 
     @staticmethod
-    def gazebo_to_ned(coord: list[float]) -> list[float]:
-        return [coord[1], coord[0], -coord[2]]
-        
+    def gazebo_to_ned(coord: Sequence[float]) -> list[float]:
+        """Convierte posición o vector libre desde Gazebo ENU [E, N, U] a PX4 NED [N, E, D]."""
+        return [float(coord[1]), float(coord[0]), -float(coord[2])]
+
+    @staticmethod
+    def ned_to_gazebo(coord: Sequence[float]) -> list[float]:
+        """Convierte posición o vector libre desde PX4 NED [N, E, D] a Gazebo ENU [E, N, U]."""
+        return [float(coord[1]), float(coord[0]), -float(coord[2])]
+
     @staticmethod
     def yaw_gazebo_to_ned(yaw: float) -> float:
-        return math.pi / 2.0 - yaw
+        """Convierte ángulo yaw desde Gazebo ENU (0=Este, CCW) a PX4 NED (0=Norte, CW)."""
+        return math.atan2(math.sin(math.pi / 2.0 - yaw), math.cos(math.pi / 2.0 - yaw))
 
-    def publish_offboard_mode(self) -> None:
+    @staticmethod
+    def yaw_ned_to_gazebo(yaw_ned: float) -> float:
+        """Convierte ángulo yaw desde PX4 NED (0=Norte, CW) a Gazebo ENU (0=Este, CCW)."""
+        return math.atan2(math.sin(math.pi / 2.0 - yaw_ned), math.cos(math.pi / 2.0 - yaw_ned))
+
+    def publish_offboard_mode(self, use_velocity: bool = False) -> None:
         msg = OffboardControlMode()
         msg.position = True
-        msg.velocity = False
+        msg.velocity = bool(use_velocity)
         msg.acceleration = False
         msg.attitude = False
         msg.body_rate = False
         msg.timestamp = self.px4_timestamp
         self.offboard_pub.publish(msg)
 
-    def publish_trajectory_setpoint(self, x: float, y: float, z: float, yaw: float) -> None:
+    def publish_trajectory_setpoint(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float,
+        velocity: Optional[Sequence[float]] = None,
+        yawspeed: float = float("nan"),
+    ) -> None:
         msg = TrajectorySetpoint()
         msg.position = [float(x), float(y), float(z)]
-        msg.velocity = [float("nan")] * 3
+        if velocity is not None:
+            msg.velocity = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
+        else:
+            msg.velocity = [float("nan")] * 3
         msg.acceleration = [float("nan")] * 3
         msg.jerk = [float("nan")] * 3
         msg.yaw = float(yaw)
-        msg.yawspeed = float("nan")
+        msg.yawspeed = float(yawspeed)
         msg.timestamp = self.px4_timestamp
         self.trajectory_pub.publish(msg)
 
