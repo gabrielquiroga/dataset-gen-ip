@@ -3,34 +3,49 @@
 task_generator.py - Generates pseudo-task definitions according to the Instant Policy taxonomy.
 
 Supports:
-  1. Extensible catalog of atomic actions [(landmark_type, primitive_type)].
-  2. Canonical semantic signature generation (get_task_signature).
-  3. Dynamic combinatorial enumeration (itertools.product) for any number of landmarks.
-  4. Deterministic sampling without replacement via --task-index and shuffled permutation.
+  1. Extensible catalog of atomic actions [(landmark_type, primitive_type, params_dict)].
+  2. Bilateral slalom primitives (side='left' and side='right') and optional circular_gate.
+  3. Canonical semantic signature generation (get_task_signature) free of phantom profile splits.
+  4. Dynamic combinatorial enumeration (itertools.product) for any number of landmarks.
+  5. Deterministic sampling without replacement via --task-index and shuffled permutation.
 """
 import argparse
 import itertools
 import random
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Union
 import yaml
 
+ActionItem = Union[Tuple[str, str], Tuple[str, str, Dict[str, Any]]]
+
 # Catálogo extensible de acciones atómicas factibles en pasillo 1D (+X).
-# Cada elemento es una tupla: (tipo_landmark, tipo_primitiva).
-# Ampliable en el futuro con nuevos landmarks o primitivas sin alterar la arquitectura.
-DEFAULT_ACTION_CATALOG: List[Tuple[str, str]] = [
-    ("gate", "traverse"),
-    ("pole", "overfly"),
-    ("pole", "slalom"),
-    ("pole", "orbit"),
+# Cada elemento es una tupla: (tipo_landmark, tipo_primitiva, parametros_extra).
+DEFAULT_ACTION_CATALOG: List[Tuple[str, str, Dict[str, Any]]] = [
+    ("gate", "traverse", {}),
+    ("pole", "overfly", {}),
+    ("pole", "slalom", {"side": "left"}),
+    ("pole", "slalom", {"side": "right"}),
+    ("pole", "orbit", {}),
 ]
+
+CIRCULAR_GATE_ACTION: Tuple[str, str, Dict[str, Any]] = ("circular_gate", "traverse", {})
+
+
+def _unpack_action_item(item: ActionItem) -> Tuple[str, str, Dict[str, Any]]:
+    """Normaliza una tupla de acción de 2 o 3 elementos a (lm_type, prim_type, params)."""
+    if len(item) == 2:
+        return item[0], item[1], {}
+    elif len(item) == 3:
+        return item[0], item[1], dict(item[2] or {})
+    raise ValueError(f"Formato de acción inválido: {item}")
+
 
 def get_task_signature(config: Dict[str, Any]) -> str:
     """Calcula una firma semántica canónica unívoca para cualquier configuración de tarea.
-    
+
     Agnóstica a la cantidad de landmarks, tipos de objetos y parámetros.
     Ejemplo:
-      "landmark_1:gate/traverse;landmark_2:pole/orbit;landmark_3:pole/slalom|logic:A1_DIRECT|profile:B1_LINEAR"
+      "landmark_1:gate/traverse;landmark_2:pole/orbit;landmark_3:pole/slalom(side=left)|logic:A1_DIRECT"
     """
     lm_map = {lm["id"]: lm["type"] for lm in config.get("landmarks", [])}
     tokens = []
@@ -38,41 +53,40 @@ def get_task_signature(config: Dict[str, Any]) -> str:
         lm_id = p.get("target")
         lm_type = lm_map.get(lm_id, "unknown")
         prim_type = p.get("type", "unknown")
-        # Parámetros adicionales ordenados alfabéticamente si existen
+        # Parámetros adicionales ordenados alfabéticamente si existen (ej. side=left)
         params = [f"{k}={v}" for k, v in sorted(p.items()) if k not in ("target", "type")]
         param_str = f"({','.join(params)})" if params else ""
         tokens.append(f"{lm_id}:{lm_type}/{prim_type}{param_str}")
-        
+
     logic = config.get("logic", "A1_DIRECT")
-    profile = config.get("profile", "B1_LINEAR")
-    return ";".join(tokens) + f"|logic:{logic}|profile:{profile}"
+    return ";".join(tokens) + f"|logic:{logic}"
 
 
 def get_combinatorial_catalog(
-    action_catalog: List[Tuple[str, str]], 
+    action_catalog: List[ActionItem],
     num_landmarks: int
-) -> List[Tuple[Tuple[str, str], ...]]:
+) -> List[Tuple[ActionItem, ...]]:
     """Genera exhaustivamente todas las secuencias combinatorias para num_landmarks.
-    
+
     Para K acciones y N landmarks, genera K^N secuencias.
-    Ejemplo: 4 acciones ^ 3 landmarks = 64 combinaciones únicas.
+    Ejemplo: 5 acciones ^ 3 landmarks = 125 combinaciones únicas.
     """
     return list(itertools.product(action_catalog, repeat=num_landmarks))
 
 
 def get_balanced_multilength_catalog(
-    action_catalog: List[Tuple[str, str]],
+    action_catalog: List[ActionItem],
     min_landmarks: int,
     max_landmarks: int,
     shuffle_seed: int = 42,
-) -> List[Tuple[Tuple[str, str], ...]]:
+) -> List[Tuple[ActionItem, ...]]:
     """Genera un catálogo combinado balanceado e intercalado para un rango de longitudes [min..max].
-    
+
     Baraja deterministamente cada longitud por separado e intercala sus secuencias
     para que todas las longitudes tengan una representación uniforme y se garantice
     cero duplicados por construcción.
     """
-    buckets: Dict[int, List[Tuple[Tuple[str, str], ...]]] = {}
+    buckets: Dict[int, List[Tuple[ActionItem, ...]]] = {}
     rng = random.Random(shuffle_seed)
     for n in range(min_landmarks, max_landmarks + 1):
         seqs = list(itertools.product(action_catalog, repeat=n))
@@ -92,18 +106,22 @@ def get_balanced_multilength_catalog(
 def generate_task_dict(
     task_id: str,
     seed: int,
-    action_sequence: Tuple[Tuple[str, str], ...],
+    action_sequence: Tuple[ActionItem, ...],
     logic: str = "A1_DIRECT",
-    profile: str = "B1_LINEAR",
+    profile: str = "B1_CONTINUOUS",
 ) -> Dict[str, Any]:
     """Construye el diccionario canónico de configuración de la tarea."""
     landmarks = []
     primitives = []
-    for i, (lm_type, prim_type) in enumerate(action_sequence):
+    for i, action_item in enumerate(action_sequence):
+        lm_type, prim_type, extra_params = _unpack_action_item(action_item)
         lm_id = f"landmark_{i+1}"
         landmarks.append({"id": lm_id, "type": lm_type})
-        primitives.append({"type": prim_type, "target": lm_id})
-        
+        prim_dict: Dict[str, Any] = {"type": prim_type, "target": lm_id}
+        for k, v in sorted(extra_params.items()):
+            prim_dict[k] = v
+        primitives.append(prim_dict)
+
     config = {
         "task_id": task_id,
         "seed": seed,
@@ -143,6 +161,14 @@ def main():
         "--shuffle-seed", type=int, default=42,
         help="Semilla para barajar la permutación del catálogo deterministamente"
     )
+    parser.add_argument(
+        "--include-circular-gates", action="store_true",
+        help="Incluye 'circular_gate' en el catálogo combinatorio además de puertas cuadradas"
+    )
+    parser.add_argument(
+        "--profile", type=str, default="B1_CONTINUOUS",
+        help="Perfil cinemático de control (default: B1_CONTINUOUS)"
+    )
     script_dir = Path(__file__).resolve().parent
     pkg_dir = script_dir.parent
     parser.add_argument("--output-dir", type=Path, default=pkg_dir / "generated_worlds")
@@ -157,8 +183,12 @@ def main():
     if min_l > max_l:
         raise ValueError(f"min_landmarks ({min_l}) no puede ser mayor que max_landmarks ({max_l})")
 
-    # Generar espacio combinatorial balanceado e intercalado
-    catalog = get_balanced_multilength_catalog(DEFAULT_ACTION_CATALOG, min_l, max_l, args.shuffle_seed)
+    active_catalog = list(DEFAULT_ACTION_CATALOG)
+    if args.include_circular_gates:
+        active_catalog.append(CIRCULAR_GATE_ACTION)
+
+    # Generar espacio combinatorio balanceado e intercalado
+    catalog = get_balanced_multilength_catalog(active_catalog, min_l, max_l, args.shuffle_seed)
     catalog_size = len(catalog)
 
     if args.task_index is not None:
@@ -170,11 +200,9 @@ def main():
         rng_choice = random.Random(args.seed)
         action_sequence = rng_choice.choice(catalog)
 
-    # Lógica y perfil cinemático
     # En pasillo 1D (+X) la lógica válida y factible de avance monótono es A1_DIRECT
     logic = "A1_DIRECT"
-    rng_profile = random.Random(args.seed)
-    profile = rng_profile.choice(["B1_LINEAR", "B2_BSPLINE"])
+    profile = args.profile
 
     task_config = generate_task_dict(
         task_id=args.task_id,
@@ -191,11 +219,11 @@ def main():
 
     task_dir = args.output_dir / args.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
-    
+
     config_path = task_dir / "task_config.yaml"
     with open(config_path, "w") as f:
         yaml.dump(task_config, f, sort_keys=False)
-        
+
     print(f"Task configuration written to {config_path}")
     print(f"  Firma Semántica: {task_config['signature']}")
     print(f"  Catálogo: {catalog_size} combinaciones disponibles (rango=[{min_l}..{max_l}], actual={len(action_sequence)})")

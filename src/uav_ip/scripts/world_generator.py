@@ -3,7 +3,9 @@
 world_generator.py — Generador de Mundos Aleatorios para Instant Policy.
 
 Toma el SDF plantilla (circuito_aros_01.sdf), aplica variaciones aleatorias
-factibles a las poses de los aros y la plataforma de aterrizaje, y exporta:
+factibles a las poses de los landmarks (puertas cuadradas, aros circulares,
+postes cilíndricos), la pose aérea inicial y la plataforma de aterrizaje,
+y exporta:
   1. Un archivo .sdf validado para Gazebo Harmonic.
   2. Un archivo waypoints.yaml con las poses para el piloto experto.
 
@@ -11,25 +13,10 @@ Uso:
     python3 world_generator.py --task-id task_0001
     python3 world_generator.py --task-id task_0001 --seed 42
     python3 world_generator.py --task-id task_0001 --output-dir /tmp/worlds
-
-El script también copia el .sdf generado a PX4 para que pueda ser
-lanzado con PX4_GZ_WORLD=<task_id>.
-
-Reglas de Factibilidad:
-    - Los aros se generan en orden creciente de X (el dron vuela hacia +X).
-    - Separacion minima entre aros consecutivos: MIN_GATE_SEP_X metros.
-    - Altura minima del centro del aro: MIN_GATE_Z (para que la barra inferior
-      no penetre el suelo: centro - 0.75m > 0).
-    - La plataforma de aterrizaje siempre se coloca adelante del ultimo aro.
-    - Maximo desplazamiento lateral (Y) limitado para que la camara de
-      profundidad mantenga visibilidad del siguiente aro.
-    - Yaw del aro limitado a +-MAX_GATE_YAW para no crear angulos imposibles.
 """
 
 import argparse
-import copy
 import math
-import os
 import random
 import shutil
 import sys
@@ -40,25 +27,27 @@ from typing import Optional
 import yaml
 
 # ============================================================================
-# Geometria del aro (puerta cuadrada)
+# Geometria del aro (puerta cuadrada y circular)
 # ============================================================================
-# La puerta se extiende ±0.75m en Z y ±0.7m en Y respecto a su centro.
-# Barras de 0.1m de grosor.
+# La puerta cuadrada se extiende ±0.75m en Z y ±0.7m en Y respecto a su centro.
+# El aro circular tiene radio mayor 0.75m y radio tubular 0.05m.
 GATE_HALF_HEIGHT: float = 0.75
 GATE_HALF_WIDTH: float = 0.70
+CIRCULAR_MAJOR_RADIUS: float = 0.75
+CIRCULAR_TUBE_RADIUS: float = 0.05
 
 # ============================================================================
 # Rangos de randomizacion
 # ============================================================================
-# Primer aro: posicion absoluta desde el origen (spawn del dron)
+# Primer landmark: posicion absoluta desde el origen (spawn del dron)
 FIRST_GATE_X_MIN: float = 4.0
 FIRST_GATE_X_MAX: float = 7.0
 
-# Separacion entre aros consecutivos (en X)
+# Separacion entre landmarks consecutivos (en X)
 MIN_GATE_SEP_X: float = 4.0
 MAX_GATE_SEP_X: float = 7.0
 
-# Rango lateral (Y) del centro de cada aro
+# Rango lateral (Y) del centro de cada landmark
 MIN_GATE_Y: float = -3.0
 MAX_GATE_Y: float = 3.0
 
@@ -67,18 +56,21 @@ MAX_GATE_Y: float = 3.0
 MIN_GATE_Z: float = 1.0   # barra inferior queda a Z = 1.0 - 0.75 = 0.25m
 MAX_GATE_Z: float = 3.0
 
-# Yaw del aro (radianes): rotacion de la abertura respecto al eje +X
-# 0 = abertura mira al +X (el dron vuela recto)
-# +-0.4 rad ≈ +-23 grados: suficiente variacion sin crear angulos imposibles
+# Yaw del landmark (radianes): rotacion respecto al eje +X
 MAX_GATE_YAW: float = 0.4
 
-# Plataforma de aterrizaje: offset en X desde el ultimo aro
+# Plataforma de aterrizaje: offset en X desde el ultimo landmark
 LANDING_OFFSET_X_MIN: float = 4.0
 LANDING_OFFSET_X_MAX: float = 6.0
 LANDING_OFFSET_Y_MAX: float = 1.5   # ligero descentrado lateral
 
-# Maximo cambio lateral entre aros consecutivos (evita trayectorias
-# que salen del FOV de la camara de profundidad)
+# Variacion acotada de la pose inicial en vuelo (tras despegar desde el origen EKF2 (0,0))
+START_Y_MAX: float = 0.8
+START_Z_MIN: float = 1.2
+START_Z_MAX: float = 1.8
+START_YAW_MAX: float = 0.20
+
+# Maximo cambio lateral entre landmarks consecutivos
 MAX_DELTA_Y_BETWEEN_GATES: float = 3.0
 
 LANDING_MODEL_NAME = "plataforma_llegada"
@@ -127,6 +119,58 @@ def _create_gate_element(
     return model
 
 
+def _create_circular_gate_element(
+    name: str,
+    x: float,
+    y: float,
+    z: float,
+    yaw: float,
+    major_radius: float = CIRCULAR_MAJOR_RADIUS,
+    tube_radius: float = CIRCULAR_TUBE_RADIUS,
+    num_segments: int = 16,
+) -> ET.Element:
+    """Crea un elemento <model> SDF para un aro circular / toroide en el plano Y-Z.
+
+    Se construye mediante un anillo poligonal de num_segments cilindros cuyas
+    dimensiones coinciden exactamente con generate_canonical_circular_gate()
+    en synthetic_lidar.py (major_radius=0.75m, tube_radius=0.05m).
+    """
+    model = ET.Element("model", name=name)
+    ET.SubElement(model, "static").text = "true"
+    ET.SubElement(model, "pose").text = f"{x} {y} {z} 0 0 {yaw}"
+
+    link = ET.SubElement(model, "link", name="link")
+    seg_length = 2.0 * major_radius * math.sin(math.pi / num_segments) * 1.05
+    color = "0.85 0.15 0.15 1"
+
+    for k in range(num_segments):
+        phi = (2.0 * math.pi * k) / num_segments
+        yk = major_radius * math.cos(phi)
+        zk = major_radius * math.sin(phi)
+        # Rotar el cilindro (eje local Z) alrededor de X por roll=phi
+        # alinea su eje con la tangente (0, -sin(phi), cos(phi)) del toroide en Y-Z.
+        seg_pose = f"0 {yk:.4f} {zk:.4f} {phi:.4f} 0 0"
+
+        vis = ET.SubElement(link, "visual", name=f"seg_{k}_v")
+        ET.SubElement(vis, "pose").text = seg_pose
+        g = ET.SubElement(vis, "geometry")
+        cyl = ET.SubElement(g, "cylinder")
+        ET.SubElement(cyl, "radius").text = f"{tube_radius:.4f}"
+        ET.SubElement(cyl, "length").text = f"{seg_length:.4f}"
+        mat = ET.SubElement(vis, "material")
+        ET.SubElement(mat, "ambient").text = color
+        ET.SubElement(mat, "diffuse").text = color
+
+        col = ET.SubElement(link, "collision", name=f"seg_{k}_c")
+        ET.SubElement(col, "pose").text = seg_pose
+        gc = ET.SubElement(col, "geometry")
+        cyl_c = ET.SubElement(gc, "cylinder")
+        ET.SubElement(cyl_c, "radius").text = f"{tube_radius:.4f}"
+        ET.SubElement(cyl_c, "length").text = f"{seg_length:.4f}"
+
+    return model
+
+
 def _create_pole_element(
     name: str, x: float, y: float, yaw: float, radius: float = 0.1, length: float = 3.0
 ) -> ET.Element:
@@ -161,17 +205,35 @@ def _create_pole_element(
 # Generacion de poses aleatorias con validacion
 # ============================================================================
 
+def generate_start_pose(seed: Optional[int] = None) -> dict:
+    """Genera una pose inicial en vuelo (post-despegue) suavemente aleatorizada.
+
+    Nota: El spawn físico en tierra permanece en (0, 0) para que el origen NED
+    de PX4 EKF2 coincida exactamente con el origen ENU de Gazebo, mientras que
+    el punto aéreo de inicio del circuito varía entre episodios.
+    """
+    if seed is None:
+        return {"x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
+    rng = random.Random(seed ^ 0x5A5A5A)
+    return {
+        "x": 0.0,
+        "y": round(rng.uniform(-START_Y_MAX, START_Y_MAX), 2),
+        "z": round(rng.uniform(START_Z_MIN, START_Z_MAX), 2),
+        "yaw": round(rng.uniform(-START_YAW_MAX, START_YAW_MAX), 3),
+    }
+
+
 def generate_random_circuit(
     landmarks_info: list,
     seed: Optional[int] = None,
     max_attempts: int = 100,
 ) -> tuple[list[dict], dict]:
-    """Genera poses aleatorias para los aros y la plataforma de aterrizaje.
+    """Genera poses aleatorias para los landmarks y la plataforma de aterrizaje.
 
     Returns:
         (hoops, landing) donde:
           hoops = [{"id": str, "type": str, "x": float, "y": float, "z": float, "yaw": float}, ...]
-          landing = {"x": float, "y": float}
+          landing = {"x": float, "y": float, "z": float}
 
     Raises:
         RuntimeError: si no se logra un circuito factible en max_attempts intentos.
@@ -192,18 +254,19 @@ def generate_random_circuit(
                 sep = rng.uniform(MIN_GATE_SEP_X, MAX_GATE_SEP_X)
                 x = prev_x + sep
 
-            # Posicion Y: lateral, pero limitando el delta con el aro anterior
+            # Posicion Y: lateral, pero limitando el delta con el landmark anterior
             y = rng.uniform(MIN_GATE_Y, MAX_GATE_Y)
             if abs(y - prev_y) > MAX_DELTA_Y_BETWEEN_GATES:
-                # Forzar dentro del rango aceptable
                 y = prev_y + rng.uniform(
                     -MAX_DELTA_Y_BETWEEN_GATES,
                     MAX_DELTA_Y_BETWEEN_GATES,
                 )
                 y = max(MIN_GATE_Y, min(MAX_GATE_Y, y))
 
+            lm_type = str(landmarks_info[i].get("type", "gate"))
+
             # Posicion Z: altura
-            if landmarks_info[i].get("type") == "pole":
+            if lm_type == "pole":
                 z = 1.5   # Centro geometrico de un poste de 3.0m apoyado en el suelo
             else:
                 z = rng.uniform(MIN_GATE_Z, MAX_GATE_Z)
@@ -211,14 +274,19 @@ def generate_random_circuit(
             # Yaw: rotacion de la abertura
             yaw = rng.uniform(-MAX_GATE_YAW, MAX_GATE_YAW)
 
-            # Validar que la barra inferior no toque el suelo (solo para gates)
-            if landmarks_info[i].get("type") != "pole" and z - GATE_HALF_HEIGHT < 0.1:
+            # Validar que el borde inferior no toque el suelo (para gates cuadrados y circulares)
+            half_h = (
+                CIRCULAR_MAJOR_RADIUS + CIRCULAR_TUBE_RADIUS
+                if "circ" in lm_type.lower() or lm_type == "torus"
+                else GATE_HALF_HEIGHT
+            )
+            if lm_type != "pole" and z - half_h < 0.1:
                 feasible = False
                 break
 
             hoops.append({
                 "id": landmarks_info[i]["id"],
-                "type": landmarks_info[i]["type"],
+                "type": lm_type,
                 "x": round(x, 2),
                 "y": round(y, 2),
                 "z": round(z, 2),
@@ -231,7 +299,7 @@ def generate_random_circuit(
         if not feasible:
             continue
 
-        # Plataforma de aterrizaje: adelante del ultimo aro
+        # Plataforma de aterrizaje: adelante del ultimo landmark
         last_hoop = hoops[-1]
         land_x = last_hoop["x"] + rng.uniform(
             LANDING_OFFSET_X_MIN, LANDING_OFFSET_X_MAX
@@ -241,6 +309,7 @@ def generate_random_circuit(
         landing = {
             "x": round(land_x, 2),
             "y": round(land_y, 2),
+            "z": 0.05,
         }
 
         return hoops, landing
@@ -261,27 +330,15 @@ def modify_sdf(
     landing: dict,
     remove_takeoff_platform: bool = False,
 ) -> ET.ElementTree:
-    """Parsea el SDF plantilla, limpia modelos previos e inyecta dinámicamente los landmarks.
-
-    Args:
-        template_path: Ruta al archivo .sdf plantilla.
-        world_name: Nombre para el <world> tag (usado por PX4_GZ_WORLD).
-        hoops: Lista de dicts con {id, type, x, y, z, yaw}.
-        landing: Dict con {x, y} de la plataforma de aterrizaje.
-        remove_takeoff_platform: Si es True, elimina el modelo 'plataforma_salida' del SDF.
-
-    Returns:
-        ElementTree con el SDF modificado.
-    """
+    """Parsea el SDF plantilla, limpia modelos previos e inyecta dinámicamente los landmarks."""
     tree = ET.parse(template_path)
     root = tree.getroot()
 
-    # Encontrar el <world> tag y cambiar su nombre
     world_elem = root.find("world")
     if world_elem is None:
         raise ValueError("No se encontro <world> en el SDF plantilla")
     world_elem.set("name", world_name)
-    
+
     if remove_takeoff_platform:
         takeoff_model = _find_model(world_elem, "plataforma_salida")
         if takeoff_model is not None:
@@ -293,11 +350,16 @@ def modify_sdf(
         if m_name.startswith(("aro_", "landmark_")):
             world_elem.remove(model)
 
-    # 2. Inyectar dinámicamente cada uno de los N landmarks
+    # 2. Inyectar dinámicamente cada uno de los N landmarks según su tipo geométrico
     for hoop in hoops:
-        if hoop.get("type") == "pole":
+        h_type = str(hoop.get("type", "gate")).lower()
+        if h_type == "pole":
             model_elem = _create_pole_element(
                 hoop["id"], hoop["x"], hoop["y"], hoop["yaw"]
+            )
+        elif "circ" in h_type or h_type == "torus":
+            model_elem = _create_circular_gate_element(
+                hoop["id"], hoop["x"], hoop["y"], hoop["z"], hoop["yaw"]
             )
         else:
             model_elem = _create_gate_element(
@@ -311,10 +373,10 @@ def modify_sdf(
         raise ValueError(
             f"Modelo '{LANDING_MODEL_NAME}' no encontrado en la plantilla SDF"
         )
-    landing_pose_str = f"{landing['x']} {landing['y']} 0.05 0 0 0"
+    landing_z = landing.get("z", 0.05)
+    landing_pose_str = f"{landing['x']} {landing['y']} {landing_z} 0 0 0"
     _set_model_pose(landing_model, landing_pose_str)
 
-    # Formatear indentación XML limpia
     try:
         ET.indent(tree, space="  ")
     except AttributeError:
@@ -324,7 +386,7 @@ def modify_sdf(
 
 
 def _find_model(world_elem: ET.Element, model_name: str) -> Optional[ET.Element]:
-    """Busca un <model name='...'>  dentro del <world>."""
+    """Busca un <model name='...'> dentro del <world>."""
     for model in world_elem.iter("model"):
         if model.get("name") == model_name:
             return model
@@ -333,12 +395,10 @@ def _find_model(world_elem: ET.Element, model_name: str) -> Optional[ET.Element]
 
 def _set_model_pose(model: ET.Element, pose_str: str) -> None:
     """Modifica el <pose> directo del modelo (no el de los links internos)."""
-    # El <pose> que queremos es hijo directo de <model>, no de <link>
     for child in model:
         if child.tag == "pose":
             child.text = pose_str
             return
-    # Si no existe un <pose> directo, crearlo
     pose_elem = ET.SubElement(model, "pose")
     pose_elem.text = pose_str
 
@@ -352,21 +412,23 @@ def export_waypoints_yaml(
     primitives: list[dict],
     landing: dict,
     output_path: Path,
+    start_pose: Optional[dict] = None,
 ) -> None:
-    """Exporta el archivo waypoints.yaml compatible con expert_pilot.py."""
+    """Exporta el archivo waypoints.yaml compatible con waypoint_controller.py."""
     landmarks_map = {lm["id"]: lm for lm in landmarks}
     sorted_primitives = sorted(
         primitives,
         key=lambda p: float(landmarks_map.get(p.get("target"), {}).get("x", 0.0))
     )
-    data = {
-        "landmarks": landmarks,
-        "primitives": sorted_primitives,
-        "landing": landing,
-    }
+    data = {}
+    if start_pose is not None:
+        data["start_pose"] = start_pose
+    data["landmarks"] = landmarks
+    data["primitives"] = sorted_primitives
+    data["landing"] = landing
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        # Header comment
         f.write("# Auto-generated by world_generator.py\n")
         f.write("# Coordenadas en marco Gazebo (ENU): X Y Z Yaw(rad)\n\n")
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
@@ -383,14 +445,7 @@ def export_sdf(tree: ET.ElementTree, output_path: Path) -> None:
 
 
 def copy_to_px4(sdf_path: Path, px4_worlds_dir: Path = PX4_WORLDS_DIR) -> Path:
-    """Copia el SDF generado al directorio de mundos de PX4.
-
-    Returns:
-        Ruta destino dentro de PX4.
-
-    Raises:
-        FileNotFoundError: si el directorio de mundos de PX4 no existe.
-    """
+    """Copia el SDF generado al directorio de mundos de PX4."""
     if not px4_worlds_dir.is_dir():
         raise FileNotFoundError(
             f"Directorio de mundos PX4 no encontrado: {px4_worlds_dir}\n"
@@ -420,8 +475,7 @@ def main() -> None:
     parser.add_argument(
         "--task-id",
         required=True,
-        help="Identificador unico de la tarea (ej: task_0001). "
-        "Se usa como nombre del world y de los archivos de salida.",
+        help="Identificador unico de la tarea (ej: task_0001).",
     )
     parser.add_argument(
         "--seed",
@@ -433,8 +487,7 @@ def main() -> None:
         "--output-dir",
         type=Path,
         default=None,
-        help="Directorio de salida. Default: generated_worlds/ junto "
-        "al directorio del script.",
+        help="Directorio de salida. Default: generated_worlds/ junto al script.",
     )
     parser.add_argument(
         "--template",
@@ -447,7 +500,6 @@ def main() -> None:
         action="store_true",
         help="No copiar el SDF a PX4-Autopilot/Tools/simulation/gz/worlds/.",
     )
-
     parser.add_argument(
         "--no-takeoff-platform",
         action="store_true",
@@ -456,7 +508,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Resolver rutas
     script_dir = Path(__file__).resolve().parent
     pkg_dir = script_dir.parent  # src/uav_ip/
 
@@ -472,23 +523,27 @@ def main() -> None:
 
     task_dir = args.output_dir / args.task_id
     config_path = task_dir / "task_config.yaml"
-    
+
     cfg = None
     if config_path.exists():
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f)
-            
+
     if cfg is None or "landmarks" not in cfg:
         print("ERROR: task_config.yaml con landmarks no encontrado. Ejecuta task_generator.py primero.")
         sys.exit(1)
-        
+
     landmarks_info = cfg["landmarks"]
     primitives = cfg["primitives"]
 
-    # Generar circuito aleatorio
     print(f"Generando circuito para '{args.task_id}' (seed={args.seed})...")
     hoops, landing = generate_random_circuit(landmarks_info, seed=args.seed)
+    start_pose = generate_start_pose(seed=args.seed)
 
+    print(
+        f"  Pose inicial aerea: X={start_pose['x']:5.2f}  Y={start_pose['y']:5.2f}  "
+        f"Z={start_pose['z']:5.2f}  Yaw={start_pose['yaw']:+.3f} rad"
+    )
     print("  Landmarks generados:")
     for h in hoops:
         print(
@@ -497,30 +552,28 @@ def main() -> None:
             f"({math.degrees(h['yaw']):+.1f}°)"
         )
     print(
-        f"  Plataforma: X={landing['x']:6.2f}  Y={landing['y']:6.2f}"
+        f"  Plataforma: X={landing['x']:6.2f}  Y={landing['y']:6.2f}  Z={landing['z']:4.2f}"
     )
 
-    # Modificar SDF
     tree = modify_sdf(args.template, args.task_id, hoops, landing, args.no_takeoff_platform)
 
-    # Exportar archivos
     sdf_path = task_dir / f"{args.task_id}.sdf"
     yaml_path = task_dir / "waypoints.yaml"
 
     export_sdf(tree, sdf_path)
-    export_waypoints_yaml(hoops, primitives, landing, yaml_path)
+    export_waypoints_yaml(hoops, primitives, landing, yaml_path, start_pose=start_pose)
 
     print(f"\n  SDF  -> {sdf_path}")
     print(f"  YAML -> {yaml_path}")
 
-    # Copiar a PX4
     if not args.no_copy:
         try:
             px4_dest = copy_to_px4(sdf_path)
             print(f"  PX4  -> {px4_dest}")
+            spawn_z = "0.15" if args.no_takeoff_platform else "0.35"
             print(
                 f"\nLanzar con: PX4_GZ_WORLD={args.task_id} "
-                f"PX4_GZ_MODEL_POSE=\"0,0,0.2,0,0,0\" "
+                f"PX4_GZ_MODEL_POSE=\"0,0,{spawn_z},0,0,0\" "
                 f"make px4_sitl gz_x500"
             )
         except FileNotFoundError as e:
