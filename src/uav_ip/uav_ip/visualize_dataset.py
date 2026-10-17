@@ -39,33 +39,79 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 try:
-    from synthetic_lidar import SyntheticLidarGenerator
+    from uav_ip.synthetic_lidar import SyntheticLidarGenerator
 except ImportError:
-    SyntheticLidarGenerator = None
+    try:
+        from synthetic_lidar import SyntheticLidarGenerator
+    except ImportError:
+        SyntheticLidarGenerator = None
 
 
-def load_dataset_file(file_path: Path):
+def _to_numpy(val):
+    """Convierte un tensor de PyTorch o arreglo a np.ndarray."""
+    if val is None:
+        return None
+    if hasattr(val, "detach"):
+        return val.detach().cpu().numpy()
+    return np.asarray(val)
+
+
+def _extract_local_horizon_flu(agent_y: np.ndarray, action_se3: np.ndarray = None) -> np.ndarray:
     """
-    Carga un archivo .pt (HeteroData) o .npz (NumPy) y extrae:
-    - agent_x: (T, 3) posiciones del dron (escaladas s=0.1)
-    - agent_y: (T, 3) acciones / setpoints futuros (escaladas s=0.1)
+    Extrae el horizonte de traslacion relativo (T, H, 3) en el marco local Horizontal FLU
+    a partir de agent_y (T, H, >=3) o de action_se3 (T, H, 4, 4).
+    Si el archivo es legado (T, 3), retorna None.
+    """
+    if action_se3 is not None and action_se3.ndim == 4 and action_se3.shape[-2:] == (4, 4):
+        return action_se3[:, :, :3, 3].astype(np.float32)
+    if agent_y is not None and agent_y.ndim == 3 and agent_y.shape[-1] >= 3:
+        return agent_y[:, :, :3].astype(np.float32)
+    return None
+
+
+def load_dataset_file(file_path: Path, return_extra: bool = False):
+    """
+    Carga un archivo .pt (HeteroData) o .npz (NumPy) de forma retrocompatible y extrae:
+    - agent_x: (T, 3) posiciones del dron en ENU (escaladas s=0.1)
+    - agent_y: (T, 8, 5) horizonte de acciones relativas SE(3) o (T, 3) en archivos legados
     - scene_pos: (T, 2048, 3) nubes de puntos LiDAR egocentricas (escaladas s=0.1)
+    - extra (opcional si return_extra=True): dict con 'action_horizon_flu', 'keyframe_indices',
+      'flight_state', 'setpoint_raw', 'yaw_enu', 'keypoints_body'.
     """
     ext = file_path.suffix.lower()
+    extra = {
+        "action_horizon_flu": None,
+        "keyframe_indices": None,
+        "flight_state": None,
+        "setpoint_raw": None,
+        "yaw_enu": None,
+        "keypoints_body": None,
+    }
 
     if ext == ".npz":
         data = np.load(file_path)
-        agent_x = data["agent_x"]
-        agent_y = data["agent_y"]
+        agent_x = data["pos_enu"] if "pos_enu" in data else data["agent_x"]
+        agent_y = data["agent_y"] if "agent_y" in data else None
         scene_pos = data["scene_pos"]
-        return agent_x, agent_y, scene_pos
+        action_se3 = data["action_se3"] if "action_se3" in data else None
+        extra["action_horizon_flu"] = _extract_local_horizon_flu(agent_y, action_se3)
+        if "keyframe_indices" in data:
+            extra["keyframe_indices"] = np.asarray(data["keyframe_indices"], dtype=np.int64)
+        if "flight_state" in data:
+            extra["flight_state"] = np.asarray(data["flight_state"], dtype=np.float32)
+        if "setpoint_raw" in data:
+            extra["setpoint_raw"] = np.asarray(data["setpoint_raw"], dtype=np.float32)
+        if "yaw_enu" in data:
+            extra["yaw_enu"] = np.asarray(data["yaw_enu"], dtype=np.float32)
+        if "keypoints_body" in data:
+            extra["keypoints_body"] = np.asarray(data["keypoints_body"], dtype=np.float32)
+        return (agent_x, agent_y, scene_pos, extra) if return_extra else (agent_x, agent_y, scene_pos)
 
     elif ext == ".pt":
         try:
             import torch
-            from torch_geometric.data import HeteroData
+            from torch_geometric.data import HeteroData  # noqa: F401
         except ImportError:
-            # Si torch no esta en el interprete actual, intentar cargar con numpy si fue guardado via pickle
             raise ImportError(
                 "Para visualizar archivos .pt se requiere 'torch' y 'torch_geometric'. "
                 "Instala las librerias con: pip install torch torch_geometric\n"
@@ -74,18 +120,32 @@ def load_dataset_file(file_path: Path):
 
         data = torch.load(file_path, map_location="cpu", weights_only=False)
         if hasattr(data, "__getitem__") and "agent" in data and "scene" in data:
-            # Objeto HeteroData
-            agent_x = data["agent"].x.detach().cpu().numpy()
-            agent_y = data["agent"].y.detach().cpu().numpy()
-            scene_pos = data["scene"].pos.detach().cpu().numpy()
+            ag = data["agent"]
+            agent_x = _to_numpy(getattr(ag, "pos_enu", getattr(ag, "x", None)))
+            agent_y = _to_numpy(getattr(ag, "y", None))
+            scene_pos = _to_numpy(data["scene"].pos)
+            action_se3 = _to_numpy(getattr(ag, "action_se3", None))
+            extra["action_horizon_flu"] = _extract_local_horizon_flu(agent_y, action_se3)
+            extra["keyframe_indices"] = _to_numpy(getattr(ag, "keyframe_indices", None))
+            extra["flight_state"] = _to_numpy(getattr(ag, "flight_state", None))
+            extra["setpoint_raw"] = _to_numpy(getattr(ag, "setpoint_raw", None))
+            extra["yaw_enu"] = _to_numpy(getattr(ag, "yaw_enu", None))
+            extra["keypoints_body"] = _to_numpy(getattr(ag, "keypoints_body", None))
         elif isinstance(data, dict):
-            agent_x = data.get("agent_x", data.get("x")).detach().cpu().numpy()
-            agent_y = data.get("agent_y", data.get("y")).detach().cpu().numpy()
-            scene_pos = data.get("scene_pos", data.get("pos")).detach().cpu().numpy()
+            agent_x = _to_numpy(data.get("pos_enu", data.get("agent_x", data.get("x"))))
+            agent_y = _to_numpy(data.get("agent_y", data.get("y")))
+            scene_pos = _to_numpy(data.get("scene_pos", data.get("pos")))
+            action_se3 = _to_numpy(data.get("action_se3"))
+            extra["action_horizon_flu"] = _extract_local_horizon_flu(agent_y, action_se3)
+            extra["keyframe_indices"] = _to_numpy(data.get("keyframe_indices"))
+            extra["flight_state"] = _to_numpy(data.get("flight_state"))
+            extra["setpoint_raw"] = _to_numpy(data.get("setpoint_raw"))
+            extra["yaw_enu"] = _to_numpy(data.get("yaw_enu"))
+            extra["keypoints_body"] = _to_numpy(data.get("keypoints_body"))
         else:
             raise ValueError(f"Estructura no reconocida en {file_path}")
 
-        return agent_x, agent_y, scene_pos
+        return (agent_x, agent_y, scene_pos, extra) if return_extra else (agent_x, agent_y, scene_pos)
 
     else:
         raise ValueError(f"Extension de archivo no soportada: {ext}. Debe ser .pt o .npz")
@@ -97,31 +157,41 @@ def plot_pointcloud_and_trajectory(
     agent_y: np.ndarray = None,
     current_step: int = 0,
     scale: float = 0.1,
-    title: str = "Visualizacion LiDAR 360° Egocentrico (FLU)",
+    title: str = "Visualizacion LiDAR 360° Egocentrico (Horizontal FLU)",
     output_image: Path = None,
-    interactive: bool = True
+    interactive: bool = True,
+    extra: dict = None
 ):
     """
-    Genera un panel de 3 vistas (3D Perspectiva, Vista Superior XY, Vista Lateral XZ).
+    Genera un panel de 3 vistas (3D Perspectiva, Vista Superior XY, Vista Lateral XZ),
+    incluyendo el horizonte de acciones relativas SE(3) (T=8) si esta disponible.
     """
     fig = plt.figure(figsize=(16, 6))
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
+    horizon_step = None
+    if extra and extra.get("action_horizon_flu") is not None:
+        h_all = extra["action_horizon_flu"]
+        if 0 <= current_step < len(h_all):
+            # Anteceder (0,0,0) para dibujar la polilinea saliendo del centro del dron
+            horizon_step = np.vstack([np.zeros((1, 3), dtype=np.float32), h_all[current_step]])
+
     # 1. Subplot 3D Perspectiva
     ax3d = fig.add_subplot(131, projection="3d")
-    
-    # Graficar nube LiDAR egocentrica
-    # Asignar color segun distancia al dron (origen 0,0,0)
+
     dists = np.linalg.norm(cloud, axis=1)
     scatter = ax3d.scatter(
         cloud[:, 0], cloud[:, 1], cloud[:, 2],
         c=dists, cmap="viridis", s=6, alpha=0.7, label=f"LiDAR ({len(cloud)} pts)"
     )
 
-    # Graficar origen del dron (0,0,0) y ejes locales FLU
     ax3d.scatter([0], [0], [0], color="red", s=80, marker="^", label="Dron (0,0,0)")
-    
-    # Ejes locales (Forward: Rojo, Left: Verde, Up: Azul)
+    if horizon_step is not None:
+        ax3d.plot(
+            horizon_step[:, 0], horizon_step[:, 1], horizon_step[:, 2],
+            "m-o", markersize=4, linewidth=2.0, label=f"Horizonte SE(3) (T={len(horizon_step)-1})"
+        )
+
     axis_len = 0.3  # en espacio escalado (equivale a 3m sin escalar)
     ax3d.quiver(0, 0, 0, axis_len, 0, 0, color="r", arrow_length_ratio=0.15, label="+X (Adelante)")
     ax3d.quiver(0, 0, 0, 0, axis_len, 0, color="g", arrow_length_ratio=0.15, label="+Y (Izquierda)")
@@ -138,6 +208,11 @@ def plot_pointcloud_and_trajectory(
     ax_xy = fig.add_subplot(132)
     ax_xy.scatter(cloud[:, 0], cloud[:, 1], c=dists, cmap="viridis", s=8, alpha=0.6)
     ax_xy.scatter([0], [0], color="red", s=100, marker="^", label="Dron")
+    if horizon_step is not None:
+        ax_xy.plot(
+            horizon_step[:, 0], horizon_step[:, 1],
+            "m-o", markersize=4, linewidth=2.0, label="Horizonte SE(3)"
+        )
     ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="Frente (+X)")
@@ -153,6 +228,11 @@ def plot_pointcloud_and_trajectory(
     ax_xz = fig.add_subplot(133)
     ax_xz.scatter(cloud[:, 0], cloud[:, 2], c=dists, cmap="viridis", s=8, alpha=0.6)
     ax_xz.scatter([0], [0], color="red", s=100, marker="^", label="Dron")
+    if horizon_step is not None:
+        ax_xz.plot(
+            horizon_step[:, 0], horizon_step[:, 2],
+            "m-o", markersize=4, linewidth=2.0, label="Horizonte SE(3)"
+        )
     ax_xz.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="Frente (+X)")
@@ -176,7 +256,6 @@ def plot_pointcloud_and_trajectory(
         print("[INFO] Mostrando ventana interactiva de Matplotlib...")
         plt.show()
     elif not has_display and not output_image:
-        # Si no hay display y no paso --output, guardar por defecto en visualizacion_lidar.png
         default_out = Path("visualizacion_lidar.png")
         plt.savefig(default_out, dpi=180)
         print(f"\n[INFO] Entorno sin pantalla grafica detectado. Grafica guardada automaticamente en: {default_out.resolve()}")
@@ -184,19 +263,38 @@ def plot_pointcloud_and_trajectory(
 
 def plot_trajectory_global(
     agent_x: np.ndarray,
-    agent_y: np.ndarray,
+    agent_y: np.ndarray = None,
     output_image: Path = None,
-    interactive: bool = True
+    interactive: bool = True,
+    extra: dict = None
 ):
     """
-    Grafica la trayectoria global del vuelo (posicion real vs setpoints).
+    Grafica la trayectoria global del vuelo (posicion real, keyframes L=10 y setpoints).
+    Soporta tanto el nuevo formato SE(3) como archivos legados (T, 3).
     """
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    ax.plot(agent_x[:, 0], agent_x[:, 1], agent_x[:, 2], "b-o", markersize=3, label="Trayectoria ejecutada (agent.x)")
-    if agent_y is not None:
+    ax.plot(agent_x[:, 0], agent_x[:, 1], agent_x[:, 2], "b-o", markersize=3, label="Trayectoria ejecutada (pos_enu)")
+
+    # Si existe setpoint_raw en extra o agent_y es legado (T, 3), graficarlo
+    sp_raw = extra.get("setpoint_raw") if extra else None
+    if sp_raw is not None and sp_raw.ndim == 2 and sp_raw.shape[1] == 3:
+        ax.plot(sp_raw[:, 0], sp_raw[:, 1], sp_raw[:, 2], "r--", alpha=0.5, label="Setpoint controlador (raw)")
+    elif agent_y is not None and agent_y.ndim == 2 and agent_y.shape[1] == 3:
         ax.plot(agent_y[:, 0], agent_y[:, 1], agent_y[:, 2], "r--", alpha=0.7, label="Acciones / Setpoints (agent.y)")
+
+    # Resaltar keyframes geometricos (L=10) si estan presentes
+    kf_idx = extra.get("keyframe_indices") if extra else None
+    if kf_idx is not None and len(kf_idx) > 0:
+        valid_kf = [int(i) for i in kf_idx if 0 <= int(i) < len(agent_x)]
+        if valid_kf:
+            kf_pts = agent_x[valid_kf]
+            ax.scatter(
+                kf_pts[:, 0], kf_pts[:, 1], kf_pts[:, 2],
+                color="gold", edgecolors="black", s=140, marker="*", zorder=10,
+                label=f"Keyframes contexto (L={len(valid_kf)})"
+            )
 
     ax.scatter([agent_x[0, 0]], [agent_x[0, 1]], [agent_x[0, 2]], color="green", s=100, label="Inicio")
     ax.scatter([agent_x[-1, 0]], [agent_x[-1, 1]], [agent_x[-1, 2]], color="black", s=100, marker="x", label="Fin")
@@ -225,22 +323,33 @@ def animate_pointcloud_and_trajectory(
     title: str = "Vuelo Animado Instant Policy (HeteroData)",
     output_anim: Path = None,
     fps: int = 15,
-    interactive: bool = True
+    interactive: bool = True,
+    extra: dict = None
 ):
     """
-    Genera una animacion sincronizada de la trayectoria global y las nubes LiDAR 360° egocentricas.
-    Subplots sincronizados en cada frame t:
-    1. Perspectiva 3D: Trayectoria global + posicion actual del dron.
-    2. Plano Superior 2D (XY): Vista del sensor desde el dron (adelante/lados).
-    3. Plano Lateral 2D (XZ): Vista de altura y sobrevuelo (overfly/slalom).
+    Genera una animacion sincronizada de la trayectoria global (con L=10 keyframes)
+    y las nubes LiDAR 360° egocentricas (con el horizonte de acciones relativas T=8).
     """
     T = len(scene_pos)
     fig = plt.figure(figsize=(16, 6))
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
+    horizon_all = extra.get("action_horizon_flu") if extra else None
+    kf_idx = extra.get("keyframe_indices") if extra else None
+    flight_state = extra.get("flight_state") if extra else None
+
     # 1. Subplot 3D Perspectiva: Trayectoria Global
     ax3d = fig.add_subplot(131, projection="3d")
     ax3d.plot(agent_x[:, 0], agent_x[:, 1], agent_x[:, 2], color="gray", linestyle="--", alpha=0.5, label="Ruta completa")
+    if kf_idx is not None and len(kf_idx) > 0:
+        valid_kf = [int(i) for i in kf_idx if 0 <= int(i) < len(agent_x)]
+        if valid_kf:
+            kf_pts = agent_x[valid_kf]
+            ax3d.scatter(
+                kf_pts[:, 0], kf_pts[:, 1], kf_pts[:, 2],
+                color="gold", edgecolors="black", s=90, marker="*", alpha=0.9,
+                label=f"Keyframes (L={len(valid_kf)})"
+            )
     line_history, = ax3d.plot([], [], [], "b-", linewidth=2, label="Recorrido actual")
     drone_marker = ax3d.scatter([agent_x[0, 0]], [agent_x[0, 1]], [agent_x[0, 2]], color="red", s=100, marker="^", label="Dron")
 
@@ -263,6 +372,7 @@ def animate_pointcloud_and_trajectory(
     dists_0 = np.linalg.norm(cloud_0, axis=1)
     scat_xy = ax_xy.scatter(cloud_0[:, 0], cloud_0[:, 1], c=dists_0, cmap="viridis", s=8, alpha=0.7)
     ax_xy.scatter([0], [0], color="red", s=100, marker="^", label="Dron (0,0)")
+    line_h_xy, = ax_xy.plot([], [], "m-o", markersize=3, linewidth=1.8, label="Horizonte T=8")
     ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
     axis_len = 0.3
@@ -281,6 +391,7 @@ def animate_pointcloud_and_trajectory(
     ax_xz = fig.add_subplot(133)
     scat_xz = ax_xz.scatter(cloud_0[:, 0], cloud_0[:, 2], c=dists_0, cmap="viridis", s=8, alpha=0.7)
     ax_xz.scatter([0], [0], color="red", s=100, marker="^", label="Dron (0,0)")
+    line_h_xz, = ax_xz.plot([], [], "m-o", markersize=3, linewidth=1.8, label="Horizonte T=8")
     ax_xz.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="+X Adelante")
@@ -310,10 +421,22 @@ def animate_pointcloud_and_trajectory(
         scat_xz.set_offsets(np.column_stack([cloud[:, 0], cloud[:, 2]]))
         scat_xz.set_array(dists)
 
+        if horizon_all is not None and frame < len(horizon_all):
+            h_pts = np.vstack([np.zeros((1, 3), dtype=np.float32), horizon_all[frame]])
+            line_h_xy.set_data(h_pts[:, 0], h_pts[:, 1])
+            line_h_xz.set_data(h_pts[:, 0], h_pts[:, 2])
+
         alt_m = agent_x[frame, 2] / scale
         x_m = agent_x[frame, 0] / scale
-        fig.suptitle(f"{title} | Paso {frame}/{T-1} | X: {x_m:.1f} m | Altitud: {alt_m:.2f} m", fontsize=14, fontweight="bold")
-        return line_history, drone_marker, scat_xy, scat_xz
+        s_str = ""
+        if flight_state is not None and frame < len(flight_state):
+            s_val = float(flight_state[frame].reshape(-1)[0])
+            s_str = f" | Estado s_t={int(round(s_val))}"
+        fig.suptitle(
+            f"{title} | Paso {frame}/{T-1} | X: {x_m:.1f} m | Altitud: {alt_m:.2f} m{s_str}",
+            fontsize=14, fontweight="bold"
+        )
+        return line_history, drone_marker, scat_xy, scat_xz, line_h_xy, line_h_xz
 
     anim = FuncAnimation(fig, update, frames=T, interval=1000 // max(1, fps), blit=False)
 
@@ -408,7 +531,7 @@ def main():
             sys.exit(1)
 
         print(f"Cargando dataset desde: {args.file}...")
-        agent_x, agent_y, scene_pos = load_dataset_file(args.file)
+        agent_x, agent_y, scene_pos, extra = load_dataset_file(args.file, return_extra=True)
 
         T = len(scene_pos)
         step = max(0, min(args.step, T - 1))
@@ -419,7 +542,12 @@ def main():
         print(f"Paso seleccionado:              t = {step}")
         print(f"Dimensiones de nubes LiDAR:     {scene_pos.shape}  (T, puntos, 3)")
         print(f"Dimensiones de trayectoria x:   {agent_x.shape}    (T, 3)")
-        print(f"Dimensiones de setpoints y:     {agent_y.shape}    (T, 3)")
+        if agent_y is not None:
+            print(f"Dimensiones de acciones y:      {agent_y.shape}")
+        if extra.get("keyframe_indices") is not None:
+            print(f"Keyframes de contexto (L={len(extra['keyframe_indices'])}):   {extra['keyframe_indices'].tolist()}")
+        if extra.get("keypoints_body") is not None:
+            print(f"Keypoints cuerpo UAV:           {extra['keypoints_body'].shape}")
         print(f"Rango de nube t={step}:         Min={np.min(cloud, axis=0)}, Max={np.max(cloud, axis=0)}")
         print(f"Distancia maxima del LiDAR:     {np.max(np.linalg.norm(cloud, axis=1)):.3f} (en espacio s={args.scale})")
         print("------------------------------------------")
@@ -436,7 +564,8 @@ def main():
                 title=title,
                 output_anim=args.output,
                 fps=args.fps,
-                interactive=not args.no_gui
+                interactive=not args.no_gui,
+                extra=extra
             )
         else:
             title = f"HeteroData: {args.file.name} (Paso t={step}/{T-1})"
@@ -448,7 +577,8 @@ def main():
                 scale=args.scale,
                 title=title,
                 output_image=args.output,
-                interactive=not args.no_gui
+                interactive=not args.no_gui,
+                extra=extra
             )
 
     # 2. Modo B: Inspeccionar LiDAR sintetico directamente desde waypoints.yaml
