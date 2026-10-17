@@ -87,9 +87,19 @@ def yaw_ned_to_gazebo_enu(yaw_ned: float) -> float:
     return (math.pi / 2.0) - yaw_ned
 
 
+def extract_yaw_from_rot_matrix(R: np.ndarray) -> float:
+    """
+    Extrae el angulo de yaw (rotacion alrededor de Z en ENU) a partir de una
+    matriz de rotacion 3x3 FLU-a-ENU:
+        yaw_enu = atan2(R[1, 0], R[0, 0])
+    """
+    return float(math.atan2(float(R[1, 0]), float(R[0, 0])))
+
+
 def px4_odometry_to_gazebo_enu(
     pos_ned: Sequence[float],
-    q_ned: Sequence[float]
+    q_ned: Sequence[float],
+    gravity_aligned: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Convierte pose completa de PX4 (posicion NED + cuaternion FRD-a-NED)
@@ -100,6 +110,10 @@ def px4_odometry_to_gazebo_enu(
     donde:
         M_world = [[0, 1, 0], [1, 0, 0], [0, 0, -1]]
         M_body  = diag([1, -1, -1])
+
+    Si gravity_aligned=True, proyecta la rotacion al marco Horizontal FLU
+    estabilizado por gravedad (conservando unicamente el yaw y anulando
+    el acoplamiento de roll/pitch del chasis subactuado).
     """
     pos_enu = ned_to_gazebo_enu(pos_ned)
     R_ned = quaternion_to_rot_matrix(q_ned)
@@ -112,6 +126,9 @@ def px4_odometry_to_gazebo_enu(
     M_body = np.diag([1.0, -1.0, -1.0])
 
     R_enu_flu = M_world @ R_ned @ M_body
+    if gravity_aligned:
+        yaw_enu = extract_yaw_from_rot_matrix(R_enu_flu)
+        R_enu_flu = rot_z(yaw_enu)
     return pos_enu, R_enu_flu
 
 
@@ -119,31 +136,47 @@ def px4_odometry_to_gazebo_enu(
 # Farthest Point Sampling (FPS)
 # ============================================================================
 
-def fps_numpy(points: np.ndarray, n_samples: int = 2048, seed: Optional[int] = None) -> np.ndarray:
+def fps_numpy(
+    points: np.ndarray,
+    n_samples: int = 2048,
+    seed: Optional[int] = 42,
+    empty_fallback_radius: float = 1.0
+) -> np.ndarray:
     """
     Farthest Point Sampling optimizado en numpy con aceleracion vectorial BLAS.
 
-    Garantiza una cobertura espacial homogenea y determinista.
-    Si N < n_samples, rellena con repeticion aleatoria uniforme.
-    Si N > 4096, realiza un presubmuestreo uniforme a 4096 puntos para
-    mantener latencia < 20 ms sin degradar la representacion geometrica.
+    Garantiza una cobertura espacial homogenea y determinista (seed=42 por defecto).
+    - Si N == 0: coloca los puntos dummy en un anillo sobre la frontera exterior
+      del rango (R = empty_fallback_radius en el plano XY, z = 0), nunca en (0,0,0)
+      para no falsificar obstaculos sobre el centro de masa del dron.
+    - Si N < n_samples: rellena con repeticion aleatoria uniforme determinista.
+    - Si N > 4096: realiza un presubmuestreo uniforme determinista a 4096 puntos
+      para mantener latencia < 20 ms sin degradar la representacion geometrica.
     """
     points = np.asarray(points, dtype=np.float32)
     N = len(points)
 
     if N == 0:
-        return np.zeros((n_samples, 3), dtype=np.float32)
+        if empty_fallback_radius <= 0.0:
+            return np.zeros((n_samples, 3), dtype=np.float32)
+        angles = np.linspace(0.0, 2.0 * math.pi, n_samples, endpoint=False, dtype=np.float32)
+        boundary_pts = np.column_stack([
+            empty_fallback_radius * np.cos(angles),
+            empty_fallback_radius * np.sin(angles),
+            np.zeros(n_samples, dtype=np.float32)
+        ])
+        return boundary_pts.astype(np.float32)
+
+    rng = np.random.RandomState(42 if seed is None else int(seed))
 
     if N <= n_samples:
         indices = np.arange(N)
         if N < n_samples:
-            rng = np.random.RandomState(seed)
             pad = rng.choice(N, n_samples - N, replace=True)
             indices = np.concatenate([indices, pad])
         return points[indices]
 
-    # Pre-submuestreo si la nube supera 4096 puntos para optimizar tiempo de calculo
-    rng = np.random.RandomState(seed)
+    # Pre-submuestreo determinista si la nube supera 4096 puntos
     if N > 4096:
         sub_idx = rng.choice(N, 4096, replace=False)
         working_points = points[sub_idx]
@@ -347,17 +380,70 @@ def generate_canonical_pole(
 
 
 def generate_canonical_landing_pad(
-    n_points: int = 5000,
+    n_points: int = 1000,
     size_x: float = 2.0,
     size_y: float = 2.0,
     height: float = 0.1,
-    seed: Optional[int] = 42
+    seed: Optional[int] = 42,
+    include_bottom: bool = False
 ) -> np.ndarray:
     """
     Genera nube canonica para la plataforma de aterrizaje centrada en (0, 0, 0).
+    Por defecto muestrea exclusivamente la cara superior (+Z) y los bordes laterales
+    (excluyendo la cara inferior invisible apoyada en el suelo) con una cuota acotada
+    (n_points=1000) para evitar eclipsar los landmarks principales en el submuestreo FPS.
     """
-    rng = np.random.RandomState(seed)
-    return sample_box_surface((0.0, 0.0, 0.0), (size_x, size_y, height), n_points, rng).astype(np.float32)
+    rng = np.random.RandomState(42 if seed is None else int(seed))
+    if include_bottom:
+        return sample_box_surface((0.0, 0.0, 0.0), (size_x, size_y, height), n_points, rng).astype(np.float32)
+
+    hx, hy, hz = size_x / 2.0, size_y / 2.0, height / 2.0
+    area_x = size_y * height
+    area_y = size_x * height
+    area_top = size_x * size_y
+    total_area = 2.0 * area_x + 2.0 * area_y + area_top
+
+    p = np.array([area_x, area_x, area_y, area_y, area_top]) / total_area
+    face_counts = rng.multinomial(n_points, p)
+
+    pts = []
+    # +X face
+    if face_counts[0] > 0:
+        pts.append(np.column_stack([
+            np.full(face_counts[0], hx),
+            rng.uniform(-hy, hy, face_counts[0]),
+            rng.uniform(-hz, hz, face_counts[0])
+        ]))
+    # -X face
+    if face_counts[1] > 0:
+        pts.append(np.column_stack([
+            np.full(face_counts[1], -hx),
+            rng.uniform(-hy, hy, face_counts[1]),
+            rng.uniform(-hz, hz, face_counts[1])
+        ]))
+    # +Y face
+    if face_counts[2] > 0:
+        pts.append(np.column_stack([
+            rng.uniform(-hx, hx, face_counts[2]),
+            np.full(face_counts[2], hy),
+            rng.uniform(-hz, hz, face_counts[2])
+        ]))
+    # -Y face
+    if face_counts[3] > 0:
+        pts.append(np.column_stack([
+            rng.uniform(-hx, hx, face_counts[3]),
+            np.full(face_counts[3], -hy),
+            rng.uniform(-hz, hz, face_counts[3])
+        ]))
+    # +Z top face
+    if face_counts[4] > 0:
+        pts.append(np.column_stack([
+            rng.uniform(-hx, hx, face_counts[4]),
+            rng.uniform(-hy, hy, face_counts[4]),
+            np.full(face_counts[4], hz)
+        ]))
+
+    return np.vstack(pts).astype(np.float32) if pts else np.zeros((0, 3), dtype=np.float32)
 
 
 # ============================================================================
@@ -367,6 +453,9 @@ def generate_canonical_landing_pad(
 class SyntheticLidarGenerator:
     """
     Generador de nubes LiDAR 360° omnidireccionales sinteticas (R <= 10.0 m, 2048 puntos, escala s = 0.1).
+    Por defecto opera en el marco egocentrico estabilizado por gravedad (Horizontal FLU,
+    gravity_aligned=True) para eliminar la distorsion geometrica inducida por el cabeceo (pitch)
+    y alabeo (roll) de cuadricopteros subactuados.
     """
 
     def __init__(
@@ -375,7 +464,8 @@ class SyntheticLidarGenerator:
         r_min: float = 0.1,
         scale_factor: float = 0.1,
         target_points: int = 2048,
-        cache_models: bool = True
+        cache_models: bool = True,
+        gravity_aligned: bool = True
     ):
         """
         Args:
@@ -383,12 +473,15 @@ class SyntheticLidarGenerator:
             r_min: Rango minimo del LiDAR en metros (default: 0.1 m).
             scale_factor: Factor de escala metrica s (default: 0.1 para coincidir con espacio sinusoidal).
             target_points: Cantidad exacta de puntos de salida (default: 2048).
-            cache_models: Si True, precacula y cachea los modelos canonicos de alta resolucion.
+            cache_models: Si True, precalcula y cachea los modelos canonicos de alta resolucion.
+            gravity_aligned: Si True (default), proyecta al marco Horizontal FLU estabilizado por
+                gravedad (rotando exclusivamente por yaw).
         """
         self.r_max = float(r_max)
         self.r_min = float(r_min)
         self.scale_factor = float(scale_factor)
         self.target_points = int(target_points)
+        self.gravity_aligned = bool(gravity_aligned)
 
         self._canonical_cache: Dict[str, np.ndarray] = {}
         if cache_models:
@@ -402,7 +495,7 @@ class SyntheticLidarGenerator:
         self._canonical_cache["torus"] = self._canonical_cache["circular_gate"]
         self._canonical_cache["pole"] = generate_canonical_pole(8000)
         self._canonical_cache["cylinder"] = self._canonical_cache["pole"]
-        self._canonical_cache["landing_pad"] = generate_canonical_landing_pad(5000)
+        self._canonical_cache["landing_pad"] = generate_canonical_landing_pad(1000)
         self._canonical_cache["pad"] = self._canonical_cache["landing_pad"]
 
     def get_canonical_points(self, landmark_type: str) -> np.ndarray:
@@ -420,7 +513,7 @@ class SyntheticLidarGenerator:
         elif "pole" in key or "poste" in key or "cyl" in key:
             pts = generate_canonical_pole(8000)
         elif "pad" in key or "land" in key or "plat" in key:
-            pts = generate_canonical_landing_pad(5000)
+            pts = generate_canonical_landing_pad(1000)
         else:
             # Fallback a caja generica
             pts = sample_box_surface((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 4000).astype(np.float32)
@@ -434,7 +527,8 @@ class SyntheticLidarGenerator:
         landmarks: List[Dict[str, Any]],
         landing: Optional[Dict[str, Any]] = None,
         as_tensor: bool = False,
-        seed: Optional[int] = None
+        seed: Optional[int] = 42,
+        gravity_aligned: Optional[bool] = None
     ) -> Union[np.ndarray, "torch.Tensor"]:
         """
         Genera la observacion LiDAR 360° sintetica para una pose dada del dron.
@@ -443,31 +537,42 @@ class SyntheticLidarGenerator:
             drone_pose: Pose del dron en coordenadas Gazebo ENU.
                 Puede ser:
                   - dict: {'x': float, 'y': float, 'z': float, 'yaw': float}
-                  - dict: {'x': float, 'y': float, 'z': float, 'q': [w,x,y,z]}
+                  - dict: {'x': float, 'y': float, 'z': float, 'q_ned': [w,x,y,z]}
+                  - dict: {'x': float, 'y': float, 'z': float, 'R': np.ndarray(3,3)}
                   - lista/tupla: [x, y, z, yaw]
             landmarks: Lista de diccionarios con landmarks desde waypoints.yaml:
                 [{'id': str, 'type': str, 'x': float, 'y': float, 'z': float, 'yaw': float}, ...]
             landing: Opcional dict con posicion de la plataforma de llegada:
                 {'x': float, 'y': float, 'z': optional}
             as_tensor: Si True, retorna torch.Tensor (requiere torch instalado).
-            seed: Semilla opcional para el submuestreo FPS.
+            seed: Semilla determinista para el submuestreo FPS (default: 42).
+            gravity_aligned: Si se especifica, sobreescribe self.gravity_aligned.
 
         Returns:
-            Arreglo o tensor de dimension (2048, 3) escalado por s = 0.1 en marco egocentrico FLU.
+            Arreglo o tensor de dimension (2048, 3) escalado por s = 0.1 en marco egocentrico FLU
+            (o Horizontal FLU si gravity_aligned=True).
         """
+        use_gravity_aligned = self.gravity_aligned if gravity_aligned is None else bool(gravity_aligned)
+
         # Extraer posicion y rotacion del dron en Gazebo ENU
         if isinstance(drone_pose, dict):
             p_drone = np.array([drone_pose["x"], drone_pose["y"], drone_pose["z"]], dtype=np.float64)
-            if "R" in drone_pose:
+            if "yaw" in drone_pose and ("R" not in drone_pose and "q_ned" not in drone_pose and "q" not in drone_pose):
+                R_w_drone = rot_z(float(drone_pose["yaw"]))
+            elif "R" in drone_pose:
                 R_w_drone = np.asarray(drone_pose["R"], dtype=np.float64)
             elif "q_ned" in drone_pose:
-                _, R_w_drone = px4_odometry_to_gazebo_enu([0.0, 0.0, 0.0], drone_pose["q_ned"])
+                _, R_w_drone = px4_odometry_to_gazebo_enu(
+                    [0.0, 0.0, 0.0], drone_pose["q_ned"], gravity_aligned=use_gravity_aligned
+                )
             elif "q" in drone_pose:
                 R_w_drone = quaternion_to_rot_matrix(drone_pose["q"])
-            elif "yaw" in drone_pose:
-                R_w_drone = rot_z(float(drone_pose["yaw"]))
             else:
                 R_w_drone = np.eye(3, dtype=np.float64)
+
+            if use_gravity_aligned:
+                yaw_enu = extract_yaw_from_rot_matrix(R_w_drone)
+                R_w_drone = rot_z(yaw_enu)
         else:
             p_drone = np.array([drone_pose[0], drone_pose[1], drone_pose[2]], dtype=np.float64)
             yaw = float(drone_pose[3]) if len(drone_pose) > 3 else 0.0
@@ -481,6 +586,14 @@ class SyntheticLidarGenerator:
                 lm_c["id"] = lm_c["name"]
             if "type" not in lm_c:
                 lm_c["type"] = "square_gate"
+            # Soportar tanto 'x','y','z','yaw' planos como 'position' y 'rpy' de waypoints.yaml
+            if "x" not in lm_c and "position" in lm_c:
+                pos_seq = lm_c["position"]
+                lm_c["x"] = float(pos_seq[0])
+                lm_c["y"] = float(pos_seq[1])
+                lm_c["z"] = float(pos_seq[2])
+            if "yaw" not in lm_c and "rpy" in lm_c:
+                lm_c["yaw"] = float(lm_c["rpy"][2])
             all_objects.append(lm_c)
 
         if landing is not None:
@@ -528,7 +641,7 @@ class SyntheticLidarGenerator:
         else:
             all_pts_world = np.vstack(accumulated_world_pts)
 
-            # Transformar a marco local del dron FLU:
+            # Transformar a marco local del dron (Horizontal FLU si gravity_aligned=True):
             # P_drone = (P_world - p_drone) * R_{w,drone}
             pts_drone = (all_pts_world - p_drone) @ R_w_drone
 
@@ -540,8 +653,15 @@ class SyntheticLidarGenerator:
         # Aplicar factor de escala metrica s = 0.1
         pts_scaled = (pts_drone_filtered * self.scale_factor).astype(np.float32)
 
-        # Submuestreo por Farthest Point Sampling a exactamente 2048 puntos
-        pts_sampled = fps_numpy(pts_scaled, n_samples=self.target_points, seed=seed)
+        # Submuestreo por Farthest Point Sampling a exactamente 2048 puntos.
+        # Si N=0 (ningun objeto dentro de r_max), coloca los puntos en la frontera exterior
+        # s * r_max (ej. 1.0), nunca en el origen (0,0,0).
+        pts_sampled = fps_numpy(
+            pts_scaled,
+            n_samples=self.target_points,
+            seed=seed,
+            empty_fallback_radius=self.r_max * self.scale_factor,
+        )
 
         if as_tensor:
             if not HAS_TORCH:
@@ -559,18 +679,19 @@ def run_self_tests() -> bool:
     """Ejecuta una bateria completa de tests unitarios y de consistencia."""
     print("Iniciando bateria de tests para synthetic_lidar.py...")
 
-    # 1. Test de modelos canonicos
+    # 1. Test de modelos canonicos y exclusion de cara inferior en landing_pad
     g_sq = generate_canonical_square_gate(2000)
     assert g_sq.shape == (2000, 3), f"Forma incorrecta square_gate: {g_sq.shape}"
     g_circ = generate_canonical_circular_gate(2000)
     assert g_circ.shape == (2000, 3), f"Forma incorrecta circular_gate: {g_circ.shape}"
     p_pole = generate_canonical_pole(2000)
     assert p_pole.shape == (2000, 3), f"Forma incorrecta pole: {p_pole.shape}"
-    pad = generate_canonical_landing_pad(1000)
+    pad = generate_canonical_landing_pad(1000, height=0.1)
     assert pad.shape == (1000, 3), f"Forma incorrecta landing_pad: {pad.shape}"
+    assert np.sum(np.isclose(pad[:, 2], 0.05)) > 800, "La mayoria de puntos de landing_pad deben estar en la cara superior"
     print("  [OK] Generacion de modelos canonicos verificada.")
 
-    # 2. Test de Farthest Point Sampling (FPS)
+    # 2. Test de Farthest Point Sampling (FPS) y fallback en frontera exterior
     test_pts = np.random.uniform(-5, 5, size=(5000, 3)).astype(np.float32)
     sampled = fps_numpy(test_pts, 2048, seed=42)
     assert sampled.shape == (2048, 3), f"FPS retorno forma {sampled.shape}"
@@ -578,11 +699,11 @@ def run_self_tests() -> bool:
     small_pts = np.random.uniform(-1, 1, size=(50, 3)).astype(np.float32)
     sampled_pad = fps_numpy(small_pts, 2048, seed=42)
     assert sampled_pad.shape == (2048, 3), f"FPS padding fallo: {sampled_pad.shape}"
-    # Verificar caso N = 0
+    # Verificar caso N = 0 -> anillo en frontera exterior (r = 1.0), nunca en (0,0,0)
     empty_pts = np.zeros((0, 3), dtype=np.float32)
-    sampled_empty = fps_numpy(empty_pts, 2048, seed=42)
+    sampled_empty = fps_numpy(empty_pts, 2048, seed=42, empty_fallback_radius=1.0)
     assert sampled_empty.shape == (2048, 3)
-    assert np.all(sampled_empty == 0.0)
+    assert np.allclose(np.linalg.norm(sampled_empty, axis=1), 1.0, atol=1e-5)
     print("  [OK] Farthest Point Sampling (FPS) y casos de borde verificados.")
 
     # 3. Test de transformaciones de marco (NED/FRD -> ENU/FLU) para multiples rumbos
@@ -608,8 +729,8 @@ def run_self_tests() -> bool:
     assert np.allclose(R_conv_north, rot_z(math.pi / 2.0)), f"R_conv al Norte debe ser rot_z(pi/2): {R_conv_north}"
     print("  [OK] Transformaciones matematicas de marcos verificadas en multiples cuadrantes.")
 
-    # 4. Test de proyeccion egocentrica rigurosa y soporte R / q_ned
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+    # 4. Test de proyeccion egocentrica rigurosa, soporte R / q_ned e invarianza a pitch/roll
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048, gravity_aligned=True)
 
     # Dron mirando al Norte hacia un aro colocado exactamente al Norte a 5.0m
     lm_north = [{"id": "gate_n", "type": "square_gate", "x": 0.0, "y": 5.0, "z": 1.5, "yaw": math.pi / 2.0}]
@@ -619,11 +740,13 @@ def run_self_tests() -> bool:
     assert mean_north_R[0] > 0.45, f"Aro al Norte con rumbo Norte debe tener X_flu > 0.45: {mean_north_R}"
     assert abs(mean_north_R[1]) < 0.05, f"Aro al Norte con rumbo Norte debe tener Y_flu ~ 0: {mean_north_R}"
 
-    # Verificar que pasar q_ned directamente produce la misma proyeccion
-    drone_north_qned = {"x": 0.0, "y": 0.0, "z": 1.5, "q_ned": q_ned_north}
-    cloud_north_qned = gen.generate_pointcloud(drone_north_qned, lm_north, seed=42)
-    assert np.allclose(cloud_north_R, cloud_north_qned), "Proyeccion con q_ned debe coincidir con R"
-    print("  [OK] Proyeccion egocentrica (rumbo Norte -> X_flu positivo) y equivalencia R / q_ned verificada.")
+    # Verificar que un cabeceo (pitch = 20 deg) en q_ned NO altera la nube con gravity_aligned=True
+    pitch_rad = math.radians(20.0)
+    q_ned_north_pitched = [math.cos(pitch_rad / 2.0), 0.0, math.sin(pitch_rad / 2.0), 0.0]
+    drone_north_pitched = {"x": 0.0, "y": 0.0, "z": 1.5, "q_ned": q_ned_north_pitched}
+    cloud_north_pitched = gen.generate_pointcloud(drone_north_pitched, lm_north, seed=42, gravity_aligned=True)
+    assert np.allclose(cloud_north_R, cloud_north_pitched, atol=1e-6), "gravity_aligned=True debe ser invariante al pitch!"
+    print("  [OK] Proyeccion egocentrica e invarianza al pitch/roll (Horizontal FLU) verificadas.")
 
     # 5. Test del Generador Sintetico completo y retrocompatibilidad con hoops
     dummy_landmarks = [
