@@ -11,10 +11,15 @@ Este documento sirve como registro de los problemas técnicos mas críticos enco
 **Causa:** Colisión y explosión del motor de físicas al iniciar (`Spawn Penetration`). La plataforma de salida en Gazebo (`plataforma_salida`) tiene una altura hasta `Z=0.1`. Si la variable `PX4_GZ_MODEL_POSE` define una altura de spawn inferior a las patas del dron (por ejemplo, `Z=0.2`), el dron "nace" penetrando la estructura estática. El motor ODE intenta expulsarlo de inmediato aplicando fuerzas colosales, lo que hace que el dron salga volando hacia arriba girando sin control (invisble en la UI ya que es muy veloz). Esto satura los sensores simulados.
 
 **Solución:**
-Asegurar que el dron inicie con altura de sobra para caer suavemente sobre la plataforma por gravedad. El script orquestador usa obligatoriamente:
+Asegurar que el dron inicie en $(X, Y) = (0, 0)$ (para que el origen local NED de EKF2 coincida exactamente con el origen ENU de Gazebo) y con altura suficiente para apoyarse suavemente por gravedad sin penetrar la geometría. Tanto `data_collector.py` como `test_flight.sh` usan constantes unificadas:
 ```bash
-export PX4_GZ_MODEL_POSE="0,0,0.8,0,0,0"
+# Modo por defecto (sin plataforma de salida, --no-takeoff-platform):
+export PX4_GZ_MODEL_POSE="0,0,0.15,0,0,0"
+
+# Con plataforma de salida activa (Z_plataforma = 0.10 m) o en test_flight.sh:
+export PX4_GZ_MODEL_POSE="0,0,0.35,0,0,0"
 ```
+*(Nota: La variación de pose inicial entre episodios se realiza en vuelo mediante el waypoint `start_pose` antes de `takeoff_exit`, preservando la alineación exacta del marco EKF2 con el mundo de Gazebo).*
 
 ---
 

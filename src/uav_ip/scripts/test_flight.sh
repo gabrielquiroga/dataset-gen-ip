@@ -4,6 +4,11 @@
 # ==============================================================================
 set -e
 
+export ROS_DOMAIN_ID=33
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export GZ_PARTITION=sim
+export GZ_IP=127.0.0.1
+
 echo "[1/4] Iniciando MicroXRCEAgent..."
 MicroXRCEAgent udp4 -p 8888 > /tmp/xrce_test.log 2>&1 &
 XRCE_PID=$!
@@ -13,7 +18,8 @@ echo "[2/4] Iniciando PX4 SITL y Gazebo..."
 cd ~/PX4-Autopilot
 export GZ_VERSION=harmonic
 export PX4_GZ_WORLD=task_0000
-export PX4_GZ_MODEL_POSE="0,0,0.2,0,0,0"
+# Pose segura sobre suelo o plataforma de salida (evita Spawn Penetration)
+export PX4_GZ_MODEL_POSE="${PX4_GZ_MODEL_POSE:-0,0,0.35,0,0,0}"
 # Usamos HEADLESS=1 para evitar que la GUI consuma recursos si no la necesitas, 
 # pero si quieres ver el simulador, puedes comentar la variable HEADLESS.
 # export HEADLESS=1 

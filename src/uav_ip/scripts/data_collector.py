@@ -70,7 +70,10 @@ POST_EPISODE_COOLDOWN = 5      # Espera tras cerrar procesos
 PROCESS_KILL_TIMEOUT = 10      # Tiempo para que un proceso muera con SIGINT
 
 # Variables de entorno para PX4
-PX4_MODEL_POSE = "0,0,0.3,0,0,0"
+# Spawn en (X=0, Y=0) fijo para preservar la alineacion exacta del origen EKF2 (NED)
+# con el origen del mundo Gazebo (ENU). La variacion de pose inicial ocurre en vuelo (start_pose).
+PX4_MODEL_POSE_GROUND = "0,0,0.15,0,0,0"    # Cuando no hay plataforma_salida (--no-takeoff-platform)
+PX4_MODEL_POSE_PLATFORM = "0,0,0.35,0,0,0"  # Cuando se conserva plataforma_salida (altura 0.10m)
 GZ_VERSION = "harmonic"
 PX4_VEHICLE = "gz_x500"        # Vehiculo estandar gz_x500 (acelera RTF; observacion privilegiada)
 
@@ -247,6 +250,7 @@ class DataCollector:
         num_landmarks: Optional[int] = None,
         min_landmarks: int = 2,
         max_landmarks: int = 5,
+        include_circular_gates: bool = False,
     ):
         self.num_tasks = num_tasks
         self.episodes_per_task = episodes_per_task
@@ -259,6 +263,7 @@ class DataCollector:
         self.num_landmarks = num_landmarks
         self.min_landmarks = min_landmarks
         self.max_landmarks = max_landmarks
+        self.include_circular_gates = include_circular_gates
         self.pm = ProcessManager()
 
         # Contadores globales
@@ -408,6 +413,8 @@ class DataCollector:
         ]
         if self.num_landmarks is not None:
             cmd_task.extend(["--num-landmarks", str(self.num_landmarks)])
+        if self.include_circular_gates:
+            cmd_task.append("--include-circular-gates")
         if task_idx is not None:
             cmd_task.extend(["--task-index", str(task_idx)])
 
@@ -438,10 +445,10 @@ class DataCollector:
             print(f"    [ERROR] world_generator.py fallo:\n{result_world.stderr}")
             return False
 
-        # Mostrar resumen de landmarks generados
+        # Mostrar resumen de pose inicial y landmarks generados
         for line in result_world.stdout.strip().split("\n"):
             line_str = line.strip()
-            if line_str and ("landmark_" in line_str or "Plataforma:" in line_str):
+            if line_str and ("Pose inicial" in line_str or "landmark_" in line_str or "Plataforma:" in line_str):
                 print(f"      {line_str}")
         return True
 
@@ -602,6 +609,9 @@ class DataCollector:
 
             f.write("commander arm -f\n")
 
+        spawn_pose = (
+            PX4_MODEL_POSE_GROUND if self.no_takeoff_platform else PX4_MODEL_POSE_PLATFORM
+        )
         env = {
             "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "33"),
             "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
@@ -610,7 +620,7 @@ class DataCollector:
             "GZ_IP": "127.0.0.1",
             "PX4_SIM_MODEL": PX4_VEHICLE,
             "PX4_GZ_WORLD": world_name,
-            # "PX4_GZ_MODEL_POSE": PX4_MODEL_POSE,
+            "PX4_GZ_MODEL_POSE": spawn_pose,
         }
         self.pm.start(
             "px4",
@@ -717,6 +727,11 @@ class DataCollector:
         ep_seed: Optional[int] = None,
     ) -> None:
         """Guarda metadata del episodio en JSON."""
+        spawn_pose = (
+            PX4_MODEL_POSE_GROUND
+            if self.no_takeoff_platform
+            else PX4_MODEL_POSE_PLATFORM
+        )
         meta = {
             "task_id": task_id,
             "episode_id": ep_id,
@@ -725,6 +740,8 @@ class DataCollector:
             "status": status,
             "timestamp": datetime.datetime.now().isoformat(),
             "vehicle_model": PX4_VEHICLE,
+            "spawn_pose": spawn_pose,
+            "no_takeoff_platform": self.no_takeoff_platform,
             "embodiment": "uav_lidar_360_privileged",
             "scale_factor": 0.1,
             "lidar_r_max": 10.0,
@@ -853,6 +870,10 @@ def main():
         "--max-landmarks", type=int, default=5,
         help="Cantidad maxima de landmarks acotados por tarea (default: 5).",
     )
+    parser.add_argument(
+        "--include-circular-gates", action="store_true",
+        help="Incluir aros circulares (circular_gate) en el catalogo de tareas.",
+    )
 
     args = parser.parse_args()
 
@@ -871,6 +892,7 @@ def main():
         num_landmarks=args.num_landmarks,
         min_landmarks=args.min_landmarks,
         max_landmarks=args.max_landmarks,
+        include_circular_gates=args.include_circular_gates,
     )
     
     try:

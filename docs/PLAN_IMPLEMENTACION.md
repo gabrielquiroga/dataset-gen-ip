@@ -96,35 +96,35 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 *Objetivo: Corregir las discrepancias matemáticas y de ingeniería detectadas en la auditoría técnica antes de ejecutar la recolección masiva de vuelos (Hito 3) y el entrenamiento del modelo (Hito 4).*
 
-#### Bloque A: Correcciones que Afectan la Simulación y Recolección en Gazebo/PX4
+#### Bloque A: Correcciones que Afectan la Simulación y Recolección en Gazebo/PX4 — [COMPLETADO]
 
-##### Tarea 1.5.1: Corrección de Firma Semántica (`profile`) y Ampliación de Catálogo en `task_generator.py` y `world_generator.py` — [ ] PENDIENTE
+##### Tarea 1.5.1: Corrección de Firma Semántica (`profile`) y Ampliación de Catálogo en `task_generator.py` y `world_generator.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. `task_generator.py` asigna aleatoriamente `profile: B1_LINEAR` o `B2_BSPLINE` y lo incluye en `get_task_signature()`, pero `waypoint_controller.py` ignora ese campo. Dos tareas con idéntica secuencia de objetos y primitivas pero distinto `profile` reciben firmas distintas, provocando una **fuga de datos silenciosa (*data leakage*)** entre Train y Held-Out.
   2. La primitiva `slalom` carece del parámetro `side` en `DEFAULT_ACTION_CATALOG`, por lo que `waypoint_controller.py` ejecuta el 100% de los slaloms por la derecha (`side="right"`).
   3. El tipo `circular_gate` está implementado en `synthetic_lidar.py`, pero nunca se instancia en `world_generator.py`.
 - **Acciones de Implementación:**
-  * En `task_generator.py`: fijar `profile = "B1_LINEAR"` (o excluirlo de `get_task_signature` hasta que exista un controlador diferenciado) para garantizar unicidad semántica real.
-  * Expandir `DEFAULT_ACTION_CATALOG` o parametrizar `slalom` con `side="left"` y `side="right"` (ej. `("pole", "slalom", {"side": "left"})` y `("pole", "slalom", {"side": "right"})`) para que el modelo aprenda desvíos bilaterales en contexto.
-  * Añadir soporte opcional en `world_generator.py` (`_create_circular_gate_element` mediante aproximación poligonal o cilindro hueco/toroide en SDF) para poder evaluar generalización a geometrías novedosas en inferencia.
+  * En `task_generator.py`: fijar `profile = "B1_LINEAR"` y excluirlo de `get_task_signature` hasta que exista un controlador diferenciado para garantizar unicidad semántica real.
+  * Expandir `DEFAULT_ACTION_CATALOG` parametrizando `slalom` con `side="left"` y `side="right"` (`("pole", "slalom", {"side": "left"})` y `("pole", "slalom", {"side": "right"})`) para que el modelo aprenda desvíos bilaterales en contexto.
+  * Añadir soporte en `world_generator.py` (`_create_circular_gate_element` mediante anillo poligonal de 16 cilindros en el plano $Y\text{-}Z$) y flag `--include-circular-gates` para evaluar generalización a geometrías novedosas.
 - **Criterio de Aceptación:** `audit_dataset.py` verifica que no existan dos tareas con la misma secuencia de `(landmark, primitiva, side)` en particiones distintas, y los vuelos de `slalom` incluyen pases por izquierda y derecha.
 
-##### Tarea 1.5.2: Suavizado Cinemático en `waypoint_controller.py` y Corrección de Marco en `tracking_controller.py` — [ ] PENDIENTE
+##### Tarea 1.5.2: Suavizado Cinemático en `waypoint_controller.py` y Corrección de Marco en `tracking_controller.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. En `waypoint_controller.py`, el dron conmuta discretamente entre `pre` $\to$ `center` $\to$ `post` al entrar en una esfera de tolerancia, haciendo que el controlador de posición de PX4 desacelere al llegar a cada punto intermedio y vuelva a acelerar. Según el Apéndice G de *Instant Policy*, las detenciones o cambios bruscos de velocidad a mitad de una maniobra degradan severamente la inferencia.
   2. En `tracking_controller.py` (línea 112), se resta `self.current_pos_ned` (marco NED) directamente de `self.target_gazebo` (marco ENU) sin conversión previa.
 - **Acciones de Implementación:**
-  * En `waypoint_controller.py`: implementar seguimiento continuo de trayectoria (mediante interpolación suave B-spline / punto guía móvil *carrot-chasing* a velocidad tangencial constante $v_{\text{ref}}$, o aumentando el radio de aceptación de paso *fly-by* en puntos `pre` y `center` acompañado de vector de velocidad feed-forward `msg.velocity` en `TrajectorySetpoint`).
-  * En `tracking_controller.py`: convertir `self.current_pos_ned` a ENU (o `self.target_gazebo` a NED) antes de calcular `math.atan2`.
+  * En `base_pilot.py` y `waypoint_controller.py`: habilitar `use_velocity` y vectores de velocidad *feed-forward* (`vel_ff` a `TRANSIT_SPEED_FF = 1.4` m/s en `pre` y `center` de `traverse`, `overfly` y `slalom`, con radios de paso *fly-by* ampliados) y discretizar `orbit` en `ORBIT_ARC_STEPS = 12` puntos de arco suave con velocidad tangencial `ORBIT_SPEED_FF = 1.2` m/s y yaw centrípeto continuo.
+  * En `tracking_controller.py`: convertir `self.current_pos_ned` a ENU mediante `self.ned_to_gazebo(self.current_pos_ned)` antes de calcular `math.atan2`.
 - **Criterio de Aceptación:** El perfil de velocidad $|v_{xy}(t)|$ registrado en `/fmu/out/vehicle_odometry` durante el cruce de un aro o slalom no cae a cero en los puntos `pre` y `center`.
 
-##### Tarea 1.5.3: Unificación de `PX4_GZ_MODEL_POSE` y Variación de Pose Inicial en `data_collector.py` — [ ] PENDIENTE
+##### Tarea 1.5.3: Unificación de `PX4_GZ_MODEL_POSE` y Variación de Pose Inicial en `data_collector.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. En `data_collector.py` (línea 613), `"PX4_GZ_MODEL_POSE"` está comentado; en `test_flight.sh` vale `"0,0,0.2,0,0,0"` (valor que `TROUBLESHOOTING.md` advierte que causa explosión física si está la plataforma de salida), y en `TROUBLESHOOTING.md` figura `"0,0,0.8,0,0,0"`.
   2. El dron inicia todos los episodios exactamente en $(0, 0, 1.5, \text{yaw}=0)$, desaprovechando la variación de pose inicial recomendada por *Instant Policy* (Sec. 3.4).
 - **Acciones de Implementación:**
-  * Unificar la constante `PX4_GZ_MODEL_POSE` en `data_collector.py`, `test_flight.sh` y la documentación.
-  * Agregar una perturbación aleatoria acotada y determinista (por `ep_seed`) al waypoint inicial de salida (`takeoff` / `takeoff_exit`): $y_0 \in [-1.0, 1.0]\text{ m}$, $z_0 \in [1.2, 2.0]\text{ m}$, $\psi_0 \in [-0.25, 0.25]\text{ rad}$, guardándola en `waypoints.yaml`.
+  * Unificar las constantes `PX4_MODEL_POSE_GROUND = "0,0,0.15,0,0,0"` y `PX4_MODEL_POSE_PLATFORM = "0,0,0.35,0,0,0"` en `data_collector.py`, `test_flight.sh` y `TROUBLESHOOTING.md`, manteniendo el despegue físico en $(X, Y) = (0, 0)$ para no desalinear el origen NED de EKF2 respecto a Gazebo ENU.
+  * Agregar una perturbación aleatoria acotada y determinista (por `ep_seed` en `generate_start_pose`) al waypoint aéreo inicial (`start_pose` previo a `takeoff_exit`): $y_0 \in [-0.8, 0.8]\text{ m}$, $z_0 \in [1.2, 1.8]\text{ m}$, $\psi_0 \in [-0.20, 0.20]\text{ rad}$, guardándola en `waypoints.yaml`.
 - **Criterio de Aceptación:** Cada episodio de una misma tarea arranca el circuito desde una posición y orientación inicial ligeramente distinta sin fallos de pre-armado en PX4.
 
 ---
