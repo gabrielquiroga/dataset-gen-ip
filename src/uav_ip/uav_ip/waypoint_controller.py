@@ -128,7 +128,7 @@ class WaypointController(BasePilot):
                     "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz],
                     "type": "pre",
                     "yaw": yaw,
-                    "vel_ff": v_pass_enu,
+                    "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx, cy, cz],
@@ -148,7 +148,7 @@ class WaypointController(BasePilot):
                     "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz + OVER_Z],
                     "type": "pre",
                     "yaw": yaw,
-                    "vel_ff": v_pass_enu,
+                    "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx, cy, cz + OVER_Z],
@@ -172,7 +172,7 @@ class WaypointController(BasePilot):
                     "pos": [cx - OFFSET * fwd_x + right_x * LAT_OFFSET, cy - OFFSET * fwd_y + right_y * LAT_OFFSET, cz],
                     "type": "pre",
                     "yaw": yaw,
-                    "vel_ff": v_pass_enu,
+                    "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx + right_x * LAT_OFFSET, cy + right_y * LAT_OFFSET, cz],
@@ -220,7 +220,8 @@ class WaypointController(BasePilot):
                     centripetal_yaw = math.atan2(cy - py, cx - px)
 
                     wp_kind = "pre" if k == 0 else "orbit_arc"
-                    vel_ff_enu = [
+                    # El punto de entrada pre no lleva feed-forward para posicionamiento exacto
+                    vel_ff_enu = None if k == 0 else [
                         self.ORBIT_SPEED_FF * tx,
                         self.ORBIT_SPEED_FF * ty,
                         0.0,
@@ -262,48 +263,65 @@ class WaypointController(BasePilot):
             if abs(self.current_pos_ned[2] - target[2]) < 0.2:
                 self.current_wp = 1
                 self.nav_state = 2
-                self.get_logger().info("Despegue completado. Iniciando circuito...")
+                next_wp_type = self.waypoints_ned[1]["type"] if len(self.waypoints_ned) > 1 else "FINAL"
+                self.get_logger().info(
+                    f"Despegue completado. Iniciando circuito hacia waypoint [1] ({next_wp_type})..."
+                )
         elif self.nav_state == 2:
             wp_info = self.waypoints_ned[self.current_wp]
             target = self.gazebo_to_ned(wp_info["pos"])
             wp_type = wp_info["type"]
+            wp_yaw = wp_info["yaw"]
 
             if wp_info.get("vel_ff") is not None:
                 vel_ff_ned = self.gazebo_to_ned(wp_info["vel_ff"])
 
-            dx = target[0] - self.current_pos_ned[0]
-            dy = target[1] - self.current_pos_ned[1]
-            dz = target[2] - self.current_pos_ned[2]
-            dist_xy = math.sqrt(dx * dx + dy * dy)
-            dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+            curr_enu = self.ned_to_gazebo(self.current_pos_ned)
+            wp_pos = wp_info["pos"]
+            dx_enu = curr_enu[0] - wp_pos[0]
+            dy_enu = curr_enu[1] - wp_pos[1]
+            dz_enu = curr_enu[2] - wp_pos[2]
+            dist_xy = math.hypot(dx_enu, dy_enu)
+            dist_3d = math.hypot(dx_enu, dy_enu, dz_enu)
 
-            if wp_type in ("start_pose", "pre", "center", "orbit_arc", "post"):
-                self.target_yaw = self.yaw_gazebo_to_ned(wp_info["yaw"])
-            elif dist_xy > 0.5:
-                self.target_yaw = math.atan2(dy, dx)
+            # Proyección geométrica sobre el rumbo local del waypoint
+            fwd_x = math.cos(wp_yaw)
+            fwd_y = math.sin(wp_yaw)
+            along_track = dx_enu * fwd_x + dy_enu * fwd_y
+            cross_track = abs(-dx_enu * fwd_y + dy_enu * fwd_x)
+            alt_err = abs(dz_enu)
 
+            self.target_yaw = self.yaw_gazebo_to_ned(wp_yaw)
+
+            wp_reached = False
             if wp_type == "landing_touchdown":
-                if dist_xy < 0.15 and abs(dz) < 0.15:
+                if dist_xy < 0.25 and alt_err < 0.25:
                     self.get_logger().info("Aterrizaje alcanzado. Comandando AUTO_LAND...")
                     self.nav_state = 3
             elif wp_type == "landing_hover":
-                if dist_xy < 0.3:
-                    self.current_wp += 1
+                wp_reached = (dist_xy < 0.40 and alt_err < 0.40)
             elif wp_type == "start_pose":
-                if dist_3d < 0.35:
-                    self.current_wp += 1
+                wp_reached = (dist_3d < 0.50 or (along_track > 0.0 and cross_track < 1.0 and alt_err < 0.6))
             elif wp_type == "pre":
-                if dist_xy < 0.35 and abs(dz) < 0.35:
-                    self.current_wp += 1
+                wp_reached = (dist_3d < 0.65 or (along_track > -0.10 and cross_track < 0.8 and alt_err < 0.6))
             elif wp_type == "center":
-                if dist_3d < 0.50:
-                    self.current_wp += 1
+                wp_reached = (dist_3d < 0.85 or (along_track > -0.10 and cross_track < 1.4 and alt_err < 0.8))
             elif wp_type == "orbit_arc":
-                if dist_3d < 0.45:
-                    self.current_wp += 1
+                wp_reached = (dist_3d < 0.65)
             elif wp_type == "post":
-                if dist_3d < 0.60:
-                    self.current_wp += 1
+                wp_reached = (dist_3d < 0.85 or (along_track > 0.0 and cross_track < 1.4 and alt_err < 0.8))
+
+            if wp_reached:
+                self.current_wp += 1
+                next_wp_type = (
+                    self.waypoints_ned[self.current_wp]["type"]
+                    if self.current_wp < len(self.waypoints_ned)
+                    else "FINAL"
+                )
+                self.get_logger().info(
+                    f"Waypoint alcanzado: [{self.current_wp - 1}/{len(self.waypoints_ned) - 1}] ({wp_type}). "
+                    f"Avanzando a [{self.current_wp}] ({next_wp_type})."
+                )
         elif self.nav_state == 3:
             target = self.gazebo_to_ned(self.waypoints_ned[-1]["pos"])
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)

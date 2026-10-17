@@ -137,7 +137,7 @@ export ROS_DOMAIN_ID=33
 
 # Ejecutar el controlador hacia los waypoints
 ros2 run uav_ip waypoint_controller --ros-args \
-  -p waypoints_file:=~/ros2_ws/src/uav_ip/generated_worlds/test_001/waypoints.yaml
+  -p waypoints_file:=src/uav_ip/generated_worlds/test_001/waypoints.yaml
 ```
 
 Cuando el dron aterrice en la plataforma verde, el piloto experto finalizará automáticamente con exit code 0. Detén el grabador en la Terminal 3 con `Ctrl+C`.
