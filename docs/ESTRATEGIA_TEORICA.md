@@ -61,12 +61,12 @@ Instant Policy formula la política como un mapeo puramente reactivo y condicion
 
 ---
 
-## 5. Unificación Analítica de Marcos de Coordenadas
+## 5. Unificación Analítica de Marcos de Coordenadas y Estabilización por Gravedad
 
-Para evitar rotaciones u offsets espaciales sistemáticos y silenciosos entre el simulador y el estimador de vuelo, se fija la siguiente convención única para todo el dataset:
+Para evitar rotaciones u offsets espaciales sistemáticos y silenciosos entre el simulador y el estimador de vuelo, y desacoplar las inclinaciones de aceleración del dron de la geometría observada, se fija la siguiente convención única:
 
 1. **Marco Global de Simulación:** Gazebo World **ENU** (East-North-Up). Origen $(0,0,0)$ en el centro del mundo.
-2. **Marco Local del Dron:** **FLU** (Forward-Left-Up), centrado en el centro de masa del UAV.
+2. **Marco Local de Cuerpo del Dron:** **FLU** (Forward-Left-Up), centrado en el centro de masa del UAV.
 3. **Conversión desde PX4 EKF2 (NED/FRD):**
    * Posición del dron en ENU:
      $$p_{\text{ENU}} = \begin{bmatrix} y_{\text{NED}} \\ x_{\text{NED}} \\ -z_{\text{NED}} \end{bmatrix}$$
@@ -74,9 +74,14 @@ Para evitar rotaciones u offsets espaciales sistemáticos y silenciosos entre el
      $$R_{\text{ENU}}^{\text{FLU}} = M_{\text{world}} \cdot R_{\text{NED}}^{\text{FRD}} \cdot M_{\text{body}}$$
      donde:
      $$M_{\text{world}} = \begin{bmatrix} 0 & 1 & 0 \\ 1 & 0 & 0 \\ 0 & 0 & -1 \end{bmatrix}, \quad M_{\text{body}} = \begin{bmatrix} 1 & 0 & 0 \\ 0 & -1 & 0 \\ 0 & 0 & -1 \end{bmatrix}$$
-4. **Proyección Egocéntrica de Puntos de la Escena:**
-   Cualquier punto en coordenadas del mundo $P_w$ se proyecta al marco local del dron FLU mediante:
-   $$P_{\text{dron}} = (P_w - p_{\text{ENU}}) \cdot R_{\text{ENU}}^{\text{FLU}}$$
+4. **Marco Egocéntrico Estabilizado por Gravedad (*Horizontal FLU*):**
+   Dado que un cuadricóptero subactuado se inclina en *roll* y *pitch* para acelerar horizontalmente, proyectar la nube rígidamente en el cuerpo del dron provocaría que las estructuras verticales aparezcan inclinadas. Se define el marco *Horizontal FLU* ($H$):
+   * Pose de rotación: Conserva la guiñada (*yaw*, $\psi$) del dron pero fuerza $\text{roll} = 0, \text{pitch} = 0$:
+     $$R_{\text{ENU}}^H = R_z(\psi_{\text{ENU}})$$
+   * De este modo, el eje $+Z_H$ permanece en todo momento estrictamente alineado con la vertical gravitatoria opuesta a la gravedad.
+5. **Proyección Egocéntrica de Puntos de la Escena:**
+   Cualquier punto en coordenadas del mundo $P_w$ se proyecta al marco egocéntrico Horizontal FLU mediante:
+   $$P_H = (P_w - p_{\text{ENU}}) \cdot R_{\text{ENU}}^H$$
 
 ---
 
@@ -148,12 +153,12 @@ Para cada clase de landmark se define un modelo canónico de alta resolución $P
 
 ### 8.2 Transformación y Filtrado Dinámico por Alcance (`range`)
 En cada instante $t$, dada la pose del dron $T_{w,d}(t)$ y la pose ground-truth del landmark $T_{w,o}$:
-1. Se proyectan los puntos del landmark al marco local FLU del dron:
-   $$P_{\text{dron}}^{(k)} = T_{w,d}(t)^{-1} \cdot T_{w,o} \cdot P_{\text{can}}^{(k)}$$
+1. Se proyectan los puntos del landmark al marco egocéntrico **Horizontal FLU** del dron (estabilizado por gravedad con $\text{roll}=0, \text{pitch}=0$):
+   $$P_H^{(k)} = (T_{w,o} \cdot P_{\text{can}}^{(k)} - p_{\text{ENU}}) \cdot R_{\text{ENU}}^H$$
 2. **Filtro de Alcance Omnidireccional:** Se seleccionan únicamente los puntos cuya distancia radial euclídea satisfaga:
-   $$\| P_{\text{dron}}^{(k)} \|_2 \le R_{\text{max}} = 10.0\text{ m}$$
+   $$\| P_H^{(k)} \|_2 \le R_{\text{max}} = 10.0\text{ m}$$
 3. Se concatenan los puntos visibles de todos los landmarks en el entorno.
-4. **Submuestreo Uniforme por FPS:** Se aplica *Farthest Point Sampling* para reducir la nube combinada a exactamente $M = 2048$ puntos con máxima cobertura espacial.
+4. **Submuestreo Uniforme por FPS Acelerado:** Se aplica *Farthest Point Sampling* mediante un kernel C vectorizado (SIMD `-O3 -march=native -ffast-math`) para reducir la nube combinada a exactamente $M = 2048$ puntos en $\sim 6\text{ ms}$.
 5. **Escalado Métrica:** Se multiplica por el factor $s = 0.1$:
    $$P_{\text{scene}} = 0.1 \cdot P_{\text{FPS}}$$
 
@@ -162,16 +167,57 @@ En cada instante $t$, dada la pose del dron $T_{w,d}(t)$ y la pose ground-truth 
 ## 9. Esquema de Salida y Representación de la Acción
 
 Siguiendo el análisis de riesgo del Apéndice H de Instant Policy, se implementa una estrategia de fases:
-1. **Fase 1 (Nativa Instant Policy):** Predicción de secuencias densas de pequeños desplazamientos relativos $(\Delta x, \Delta y, \Delta z, \Delta \text{yaw})$ a 10–25 Hz, escalados por $s = 0.1$.
+1. **Fase 1 (Nativa Instant Policy):** Predicción de secuencias de $T=8$ acciones relativas en $SE(3)$ ($\Delta p$ escalado por $s = 0.1$, $\Delta q$) a 10 Hz extraídas directamente de la trayectoria de vuelo real.
 2. **Fase 2 (Postproceso B-spline):** Ajuste de curvas polinomiales suaves sobre el rollout predicho por la red para alimentar el controlador de seguimiento de PX4.
 3. **Fase 3 (CGD / Restricciones QP):** Acople futuro de guiado por difusión con restricciones cinemáticas y dinámicas (arXiv:2405.01758).
 
 ---
 
-## 10. Fuentes y Bibliografía
+## 10. Aumento de Datos Sintético para Recuperación (*Tube Augmentation*) y Mitigación del Covariate Shift
+
+### 10.1 Fundamento Teórico: El Desafío del *Covariate Shift* en Aprendizaje por Imitación
+En *Behavioral Cloning* (BC) estándar (Ross & Bagnell, 2011), la política se entrena minimizando la pérdida sobre estados extraídos exclusivamente de la distribución del experto:
+$$\min_\theta \mathbb{E}_{s \sim d^{\pi^*}} [\mathcal{L}(\pi_\theta(s), \pi^*(s))]$$
+Sin embargo, durante la ejecución en bucle cerrado (*closed-loop*), pequeños errores de predicción $\epsilon$ acumulan desviaciones que empujan al UAV hacia estados no vistos $s \notin d^{\pi^*}$. Bajo distribución fuera de soporte, los errores compuestos crecen cuadráticamente con el horizonte temporal:
+$$\mathcal{O}(\epsilon T^2)$$
+provocando que el dron diverja irremediablemente de la trayectoria segura y colisione con el entorno o landmarks.
+
+### 10.2 Formulación Matemática del Flujo Correctivo en $SE(3)$
+Para dotar a la política de difusión de capacidad intrínseca de autocorrección sin requerir bucles interactivos online costosos (DAgger), se sintetiza un conjunto de demostraciones de recuperación dentro de un **tubo de perturbación $\epsilon$** (*Tube Augmentation*):
+
+1. **Muestreo de Estados Perturbados:**
+   Para un $30\%$ de los instantes temporales $t$, se aplica una perturbación estocástica a la pose nominal del dron $T_{WE}^t = (p_t, R_t) \in SE(3)$:
+   $$\delta p \sim \mathcal{N}(0, \sigma_p^2 I_3), \quad \|\delta p\| \le 0.60\text{ m}, \quad \sigma_p = 0.25\text{ m}$$
+   $$\delta \psi \sim \mathcal{N}(0, \sigma_\psi^2), \quad |\delta \psi| \le 15^\circ, \quad \sigma_\psi = 5^\circ$$
+   La pose perturbada resultante en coordenadas del mundo ENU es:
+   $$\tilde{T}_{WE}^t = \begin{bmatrix} R_z(\psi_t + \delta \psi) & p_t + \delta p \\ 0 & 1 \end{bmatrix}$$
+
+2. **Generación de la Observación Perturbada:**
+   Dado el modelo analítico de superficies de los landmarks, la nube de puntos LiDAR egocéntrica $\tilde{P}_{\text{scene}}^t$ se calcula evaluando directamente el sensor desde la pose perturbada $\tilde{T}_{WE}^t$ en el marco Horizontal FLU, aplicando el filtro de rango omnidireccional $R_{\text{max}} = 10.0\text{ m}$ y FPS submuestreado a 2048 puntos.
+
+3. **Demostración de la Acción Correctiva hacia el Horizonte Nominal:**
+   Dada la trayectoria futura de referencia del experto $\{ T_{WE}^{t+k} \}_{k=1}^T$ ($T=8$ pasos a $\sim 10\text{ Hz}$), la acción objetivo requerida para corregir el desvío se formula unívocamente mediante la transformación relativa entre la pose perturbada actual y el hito nominal futuro:
+   $$\tilde{T}_{EA}^{(t,k)} = (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} \in SE(3)$$
+   
+   **Propiedad de Convergencia por Identidad de Grupo:**
+   $$\tilde{T}_{WE}^t \cdot \tilde{T}_{EA}^{(t,k)} = \tilde{T}_{WE}^t \cdot (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} = T_{WE}^{t+k}$$
+   Esta formulación matemática garantiza que, al aplicar la acción relativa predicha, el cuadricóptero no sólo compensa el desplazamiento erróneo $\delta p$ y $\delta \psi$, sino que converge suavemente de regreso hacia la trayectoria óptima del experto en el horizonte anticipado.
+
+4. **Perturbación del Estado Binario de Vuelo ($10\%$ flip):**
+   Para robustecer el modelo en las fases críticas de despegue y aterrizaje y evitar que memorice el estado binario $s_t \in \{0, 1\}$ como un oráculo determinista:
+   $$\tilde{s}_t = \begin{cases} 1 - s_t & \text{con probabilidad } 0.10 \\ s_t & \text{con probabilidad } 0.90 \end{cases}$$
+   Esto fuerza al encoder geométrico a correlacionar la proximidad espacial de los puntos de la escena (distancia al suelo y a la plataforma) con la maniobra de aterrizaje, previniendo fallos si el estimador de aterrizaje de PX4 reporta retardos.
+
+5. **Aislamiento en el Grafo Heterogéneo (`data['aug']`):**
+   Para respetar el protocolo riguroso de *In-Context Imitation Learning*, las demostraciones de contexto que definen el prompt de la tarea en la GNN deben provenir estrictamente de ejecuciones nominales limpias. Por ello, los datos aumentados se encapsulan en el tipo de nodo independiente `data['aug']`, permitiendo que el entrenamiento de la difusión sobre el target query utilice recuperación mientras que el contexto $N-1$ se mantiene puro en `data['agent']`.
+
+---
+
+## 11. Fuentes y Bibliografía
 
 1. **Instant Policy:** Vosylius y Johns. *In-Context Imitation Learning via Graph Diffusion*. ICLR 2025. arXiv:2411.12633. https://www.robot-learning.uk/instant-policy
-2. **CGD:** Kondo et al. *Constraint-Guided Diffusion Policies for UAV Trajectory Planning*. arXiv:2405.01758 (2024).
-3. **In-Context Regression Diversity:** Raventós et al. *Pretraining task diversity and the emergence of non-Bayesian in-context learning for regression*. NeurIPS 2023.
-4. **PX4 SITL & Vehicle Odometry:** Dronecode Foundation. *PX4 Architectural Documentation (v1.14 / v1.15)*. https://docs.px4.io
-5. **Rosbags Library:** Ternaris. *Pure Python ROS 2 MCAP/CDR Parser*. https://ternaris.gitlab.io/rosbags/
+2. **DAgger & Covariate Shift:** Ross, Gordon, Bagnell. *A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning*. AISTATS 2011.
+3. **CGD:** Kondo et al. *Constraint-Guided Diffusion Policies for UAV Trajectory Planning*. arXiv:2405.01758 (2024).
+4. **In-Context Regression Diversity:** Raventós et al. *Pretraining task diversity and the emergence of non-Bayesian in-context learning for regression*. NeurIPS 2023.
+5. **PX4 SITL & Vehicle Odometry:** Dronecode Foundation. *PX4 Architectural Documentation (v1.14 / v1.15)*. https://docs.px4.io
+6. **Rosbags Library:** Ternaris. *Pure Python ROS 2 MCAP/CDR Parser*. https://ternaris.gitlab.io/rosbags/

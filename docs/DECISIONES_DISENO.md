@@ -168,10 +168,14 @@ En la configuración de pasillo 1D con 3 landmarks:
 | **Vehículo SITL** | `gz_x500` | Máxima aceleración RTF; prescinde de sensor de profundidad |
 | **Observación** | Privilegiada (`range` 360°) | Sin ruido de suelo; reduce rosbag a $< 5\text{ MB}$ |
 | **Alcance LiDAR ($R_{\text{max}}$)** | $10.0\text{ m}$ | Suficiente para anticipar y retener el landmark activo y previo |
-| **Puntos por Nube ($N$)** | $2048$ | Estándar de Instant Policy; submuestreado con FPS |
+| **Puntos por Nube ($N$)** | $2048$ | Estándar de Instant Policy; submuestreado con FPS (kernel SIMD C en $\sim 6\text{ ms}$) |
 | **Factor de Escala ($s$)** | $0.1$ | Previene aliasing en codificación posicional sinusoidal |
-| **Marcos** | ENU (Mundo) / FLU (Cuerpo) | Unificación analítica estricta con odometría PX4 NED/FRD |
+| **Marcos** | ENU (Mundo) / Horizontal FLU (Egocéntrico) | Estabilizado por gravedad ($\text{roll}=0, \text{pitch}=0$), unificado con PX4 NED/FRD |
 | **Lógica Pasillo 1D** | `A1_DIRECT` | Trayectorias monótonas libres de colisión por construcción |
+| **Horizonte de Acción ($T$)** | $8$ pasos ($\approx 0.8\text{ s}$ a $10\text{ Hz}$) | Desplazamientos relativos $T_{EA}^{(t,k)} \in SE(3)$ de la trayectoria real |
+| **Keyframes de Contexto ($L$)** | $10$ pasos | Submuestreo uniforme de trayectorias de contexto para el prompt geométrico |
+| **Tube Augmentation** | $30\%$ de pasos con $\sigma_p = 0.25\text{ m}, \sigma_\psi = 5^\circ$ | Mitigación del *covariate shift* con flujo correctivo monótono $SE(3)$ en `data['aug']` |
+| **Perturbación de Estado Binario** | $10\%$ de probabilidad ($\tilde{s}_t = 1 - s_t$) | Robustez en transiciones despegue/aterrizaje; evita sobreajuste a estados discretos |
 | **Entorno de Simulación** | ROS 2 Jazzy (Sistema) | Control de vuelo, PX4 SITL, Gazebo Harmonic |
 | **Entorno de ML** | Python venv (`~/venv_ip`) | PyTorch, PyG, rosbags puro, sin interferir con PEP 668 |
 
@@ -231,3 +235,99 @@ En la configuración de pasillo 1D con 3 landmarks:
   * Reposicionamiento automático de la plataforma de aterrizaje a $X_N + \Delta X_{\text{land}}$, garantizando que cualquier circuito de longitud acotada $N \in [2, 5]$ sea físicamente factible.
   * Catálogo combinatorio dinámico balanceado e intercalado en `task_generator.py`, garantizando muestreo sin reemplazo estricto (cero duplicados) a través de todas las longitudes.
 
+---
+
+## 11. Marco Egocéntrico Estabilizado por Gravedad (*Horizontal FLU*)
+
+### 11.1 Contexto y Limitación del Marco Rígido de Cuerpo (FLU)
+Un cuadricóptero es un sistema subactuado: para acelerar horizontalmente (hacia adelante o a los lados), debe inclinarse físicamente (*pitch* y *roll*).
+* Si las observaciones LiDAR y las acciones se expresan rígidamente en el marco del cuerpo del dron (Body FLU), cualquier aceleración o frenado inclina el sistema de coordenadas respecto al plano horizontal.
+* Esto provoca que los puntos del suelo o landmarks verticales aparezcan inclinados durante maniobras rápidas, acoplando de forma espuria la dinámica de actitud transitoria con la geometría del entorno.
+* Más crítico aún: en robótica de manipulación (dominio nativo de Instant Policy), el efector final no depende de inclinarse contra la gravedad para desplazarse horizontalmente.
+
+### 11.2 Decisión Adoptada: Marco Horizontal FLU
+Se define el marco egocéntrico **Horizontal FLU** ($H$):
+1. **Origen:** Coincidente con la posición 3D del dron $(x, y, z)$ en ENU.
+2. **Orientación:** Comparte el ángulo de guiñada (*yaw*, $\psi$) del dron, pero fuerza $\text{roll} = 0$ y $\text{pitch} = 0$:
+   $$R_{\text{ENU}}^H = R_z(\psi)$$
+3. **Alineación con la Gravedad:** El eje $+Z_H$ coincide exactamente con la vertical opuesta al vector gravitatorio terrestre (Up).
+4. **Beneficios Teóricos y Prácticos:**
+   * La geometría observada de los landmarks verticales (postes, aros) permanece invariante ante inclinaciones de aceleración del cuadricóptero.
+   * Elimina la confusión del modelo neuronal entre actitud transitoria y geometría espacial del mundo.
+   * Facilita el desacoplamiento entre el planificador de trayectorias (que emite referencias en el plano horizontal y vertical puro) y el controlador de actitud de bajo nivel de PX4.
+
+---
+
+## 12. Arquitectura de Poses Relativas $SE(3)$, Horizonte $T=8$ y $L=10$ Keyframes
+
+### 12.1 Limitaciones del Esquema Original (Setpoints Escalonados y Coordenadas Globales)
+La versión previa de `bag_to_heterodata.py` extraía como acciones futuras los setpoints brutos de PX4 (`trajectory_setpoint`), que presentaban dos patologías:
+1. Eran escalones constantes que permanecían idénticos durante decenas de pasos hasta alcanzar la esfera de aceptación del waypoint, perdiendo la suavidad continua de la dinámica real.
+2. Se almacenaban como posiciones absolutas en el marco del mundo, forzando a la red a memorizar localizaciones globales en lugar de aprender transformaciones geométricas relativas invariantes a traslación/rotación.
+
+### 12.2 Decisión Adoptada: Horizonte Relativo de Trayectoria Real en $SE(3)$
+1. **Poses $SE(3)$ y Keypoints:** Cada estado del agente se representa como una pose rígida tridimensional $T_{WE} \in SE(3)$ conformada por posición $p \in \mathbb{R}^3$ (escalada por $s = 0.1$) y orientación en cuaternión unitario $q = (q_w, q_x, q_y, q_z)$, complementada con 6 keypoints geométricos del cuadricóptero (centro, proa, popa, babor, estribor y mástil superior).
+2. **Horizonte de Acción ($T=8$ pasos):** Para cada instante temporal $t$, se muestrea la trayectoria de vuelo real a una tasa de $\sim 10\text{ Hz}$ en los pasos futuros $t+k$ ($k=1, \dots, 8$, cubriendo $\approx 0.8\text{ s}$ de dinámica futura):
+   $$T_{EA}^{(t,k)} = (T_{WE}^t)^{-1} \cdot T_{WE}^{t+k} \in SE(3)$$
+   donde $\Delta p = 0.1 \cdot (R_{WE}^t)^T (p^{t+k} - p^t)$ y $\Delta q = (q^t)^{-1} \otimes q^{t+k}$.
+3. **Keyframes de Contexto ($L=10$ pasos):** Las $N-1$ demostraciones de contexto que condicionan a la red se subsamplean uniformemente a $L=10$ hitos temporales representativos a lo largo de toda la duración del episodio, preservando la coherencia global de la tarea con un tamaño de grafo acotado.
+
+---
+
+## 13. Aumento de Datos para Recuperación (*30% Tube Augmentation*)
+
+### 13.1 El Problema del *Covariate Shift* en Vuelo Autónomo
+En aprendizaje por imitación estándar (*Behavioral Cloning*), el modelo aprende únicamente sobre trayectorias nominales óptimas ejecutadas por el piloto experto. Si durante la ejecución autónoma el vehículo sufre una pequeña perturbación aerodinámica o error de inferencia:
+* El dron entra en un estado espacial fuera de la distribución de entrenamiento ($s \notin \mathcal{D}_{\text{train}}$).
+* Al carecer de datos de corrección, los errores se acumulan de forma exponencial (*compounding errors*), conduciendo a colisiones o divergencia irreversible.
+
+### 13.2 Decisión Adoptada: Aumento Sintético de Tubo (*Tube Augmentation*)
+Aprovechando la naturaleza analítica de nuestro generador LiDAR privilegiado y la geometría de las trayectorias de vuelo, se implementó en `bag_to_heterodata.py`:
+1. **Muestreo de Perturbaciones (30% de los timesteps):**
+   * Perturbación de traslación: $\delta p \sim \mathcal{N}(0, \sigma_p^2 I_3)$ con $\sigma_p = 0.25\text{ m}$ (acotada a $\|\delta p\| \le 0.60\text{ m}$).
+   * Perturbación de orientación (yaw): $\delta \psi \sim \mathcal{N}(0, \sigma_\psi^2)$ con $\sigma_\psi = 5^\circ$ (acotada a $|\delta \psi| \le 15^\circ$).
+   * Pose perturbada: $\tilde{T}_{WE}^t = T_{WE}^t \cdot \Delta T_{\text{pert}}$.
+2. **Observación y Acción de Recuperación:**
+   * Se evalúa la nube LiDAR analítica $\tilde{P}_{\text{scene}}^t$ desde la pose perturbada $\tilde{T}_{WE}^t$ en el marco Horizontal FLU.
+   * Se calculan las acciones relativas dirigidas hacia los hitos nominales futuros:
+     $$\tilde{T}_{EA}^{(t,k)} = (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} \in SE(3)$$
+   * Esta transformación garantiza que la acción predicha guíe convergente y suavemente al dron de regreso a la trayectoria nominal de referencia.
+3. **Perturbación del Estado Binario (10% flip):**
+   * En un 10% de las muestras aumentadas se invierte el estado de vuelo ($\tilde{s}_t = 1 - s_t$), forzando a la red a discernir la fase de vuelo a partir de la proximidad geométrica al suelo y landmarks, evitando atajos espurios basados en el bit discreto.
+4. **Almacenamiento Separado en `data['aug']`:**
+   * Los datos aumentados se almacenan bajo el tipo de nodo `aug` en el `HeteroData`, garantizando que las demostraciones de contexto nominales en `data['agent']` permanezcan inalteradas.
+
+---
+
+## 14. Aceleración Computacional: Kernel SIMD C para FPS y Procesamiento Batch
+
+### 14.1 Cuello de Botella de Farthest Point Sampling (FPS)
+El submuestreo de nubes LiDAR de $M \approx 4096$ puntos a $N = 2048$ puntos mediante FPS en NumPy puro requería $\approx 43\text{ ms}$ por fotograma. Para un vuelo de 100 pasos, esto sumaba $> 4.3\text{ s}$ solo en FPS, haciendo que procesar un dataset de 1000 episodios tomara más de una hora.
+
+### 14.2 Decisión Adoptada: Kernel SIMD en C y Multiprocesamiento
+1. **Kernel C Vectorizado Dinámico:** Se implementó en `src/uav_ip/uav_ip/synthetic_lidar.py` (`_get_fps_c_kernel`):
+   * Disposición de datos en Estructura de Arreglos (SoA: `xs`, `ys`, `zs` contiguos) para optimizar el acceso a caché L1/L2.
+   * Compilación dinámica bajo demanda con `gcc -O3 -march=native -ffast-math -shared -fPIC`.
+   * Redujo el tiempo de cómputo por nube de $\approx 43\text{ ms}$ a **$\approx 6\text{ ms}$** ($\sim 7\times$ de aceleración).
+2. **Procesamiento por Lotes Multiproceso:**
+   * Soporte en `bag_to_heterodata.py` mediante `--dataset-dir` y `--workers`.
+   * Utiliza `multiprocessing.Pool` para paralelizar la conversión de episodios entre todos los núcleos disponibles de la CPU.
+   * Procesamiento de 100 episodios en $\sim 5\text{ segundos}$ en un procesador moderno de 16 hilos.
+
+---
+
+## 15. Patrón Arquitectónico: Módulo Central `uav_ip` y Thin Wrappers Ejecutables
+
+### 15.1 El Riesgo de Duplicación de Código
+En versiones tempranas existían copias independientes de archivos como `synthetic_lidar.py` y `visualize_dataset.py` tanto en `src/uav_ip/scripts/` como en `src/uav_ip/uav_ip/`. Esto generaba riesgo inminente de desincronización, donde correcciones en un archivo no se propagaban al otro.
+
+### 15.2 Decisión Adoptada: Punto Único de Verdad
+1. Toda la lógica de negocio, algoritmos matemáticos y clases residen de manera unificada en `src/uav_ip/uav_ip/`.
+2. Los scripts homónimos en `src/uav_ip/scripts/` se transformaron en **thin wrappers** mínimos (menos de 10 líneas) que importan `main()` o las funciones respectivas desde `uav_ip`:
+   ```python
+   #!/usr/bin/env python3
+   from uav_ip.synthetic_lidar import main
+   if __name__ == '__main__':
+       main()
+   ```
+3. Esto garantiza que la ejecución directa desde terminal (`python3 src/uav_ip/scripts/synthetic_lidar.py`), la importación como módulo de Python (`from uav_ip.synthetic_lidar import ...`) y la ejecución vía ROS 2 (`ros2 run uav_ip ...`) ejecuten exactamente la misma base de código validada.

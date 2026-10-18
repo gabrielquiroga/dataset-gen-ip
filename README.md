@@ -27,22 +27,24 @@ ros2_ws/
 │       ├── worlds/                # Plantillas SDF de Gazebo (circuito_aros_01.sdf)
 │       ├── generated_worlds/      # Tareas generadas procedimentalmente (.sdf + waypoints.yaml)
 │       ├── scripts/
+│       │   ├── setup_venv_ip.sh       # Configurador automatizado de virtualenv ML (~/venv_ip)
 │       │   ├── task_generator.py      # Generador de recetas semánticas de tareas (sin reemplazo)
 │       │   ├── world_generator.py     # Generador de mundos SDF y waypoints.yaml
-│       │   ├── synthetic_lidar.py     # Generador de nubes LiDAR 360° sintéticas (FPS 2048 pts)
+│       │   ├── synthetic_lidar.py     # Thin wrapper CLI para LiDAR sintético 360°
 │       │   ├── audit_dataset.py       # Auditoría semántica, métricas de vuelo y particionado Train/Val/Held-Out
-│       │   ├── bag_to_heterodata.py   # Conversor de rosbag a grafos PyTorch Geometric (.pt)
-│       │   ├── visualize_dataset.py   # Visualizador 3D estático y animador GIF de trayectorias
+│       │   ├── bag_to_heterodata.py   # Conversor batch multiproceso a HeteroData PyG (.pt) con Tube Augmentation
+│       │   ├── visualize_dataset.py   # Thin wrapper CLI para visualización 3D y análisis de recuperación
 │       │   ├── data_collector.py      # Orquestador automático del dataset (doble bucle)
 │       │   ├── test_flight.sh         # Script rápido para vuelo de prueba
 │       │   └── kill_sim.sh            # Limpieza agresiva de procesos huérfanos
-│       └── uav_ip/                    # Módulo Python principal
+│       └── uav_ip/                    # Módulo Python principal (Punto Único de Verdad)
 │           ├── __init__.py
 │           ├── base_pilot.py          # Máquina de estados, QoS y protocolo seguro de armado
 │           ├── waypoint_controller.py # Piloto experto feed-forward (traverse, overfly, slalom)
 │           ├── tracking_controller.py # Piloto experto feedback (orbit)
-│           └── synthetic_lidar.py     # Módulo empotrado de generación LiDAR
-├── datasets/                      # Salida del dataset estructurado por tarea y episodio
+│           ├── synthetic_lidar.py     # Generador LiDAR analítico (Horizontal FLU, kernel C SIMD FPS)
+│           └── visualize_dataset.py   # Visualizador 3D, animación GIF e inspección Tube Augmentation
+│   ├── datasets/                      # Salida del dataset estructurado por tarea y episodio
 ├── docs/                          # Documentación técnica canónica
 │   ├── ESTRATEGIA_TEORICA.md      # Marco teórico, preservación de Markov, escala s=0.1 y taxonomía
 │   ├── PLAN_IMPLEMENTACION.md     # Hoja de ruta, hitos de desarrollo (0-4) y backlog operativo
@@ -61,9 +63,21 @@ ros2_ws/
 - **Simulación:** PX4 Autopilot (rama `main` compilada para SITL: `make px4_sitl gz_x500`).
 - **Middleware:** ROS 2 Jazzy con `MicroXRCEAgent` (`udp4 -p 8888`).
 - **Python:** Python 3.12+ con librerías:
-  - `rclpy`, `px4_msgs`, `sensor_msgs` (Ecosistema ROS 2)
-  - `numpy`, `yaml` (Generación geométrica y procedural)
+  - `rclpy`, `px4_msgs`, `sensor_msgs` (Ecosistema ROS 2 en el sistema)
+  - `numpy`, `yaml`, `scipy` (Generación geométrica y procedural)
   - `rosbags`, `torch`, `torch_geometric` (Procesamiento offline a HeteroData)
+
+### Configuración del Entorno Virtual de Machine Learning (`~/venv_ip`)
+Para aislar las dependencias de PyTorch y PyTorch Geometric sin interferir con la instalación de ROS 2 ni con la política PEP 668 de Ubuntu 24.04:
+
+```bash
+# Ejecutar el script automatizado de configuración:
+bash src/uav_ip/scripts/setup_venv_ip.sh
+
+# Activar el entorno virtual para procesamiento y entrenamiento ML:
+source ~/venv_ip/bin/activate
+```
+*(Nota: El script enlaza automáticamente el módulo `uav_ip` dentro del entorno virtual y soporta tanto instalaciones directas con `pip` como entornos base con `--system-site-packages`).*
 
 ---
 
@@ -154,13 +168,15 @@ python3 src/uav_ip/scripts/bag_to_heterodata.py \
 ```
 *(Nota: Por defecto, `bag_to_heterodata.py` recorta automáticamente los tiempos estáticos en tierra antes del despegue y tras el aterrizaje. Puedes desactivarlo con `--no-trim-idle` o cambiar el umbral con `--trim-start liftoff`).*
 
-El archivo `test_001.pt` resultante contendrá el grafo con:
-- `data['scene'].pos`: nubes de 2048 puntos de los landmarks visibles a $\le 10\text{ m}$ en marco FLU egocéntrico escaladas a $s = 0.1$.
-- `data['agent'].x`: trayectoria real ejecutada ($s = 0.1$).
-- `data['agent'].y`: acciones / setpoints futuros ($s = 0.1$).
+El archivo `test_001.pt` resultante contendrá el grafo heterogéneo con:
+- `data['scene'].pos`: nubes de 2048 puntos de los landmarks visibles a $\le 10\text{ m}$ en marco egocéntrico **Horizontal FLU** (estabilizado por gravedad con roll=0, pitch=0), escaladas a $s = 0.1$.
+- `data['agent'].x`: poses $SE(3)$ del dron ($x, y, z$ escalados por $s = 0.1$, cuaternión $q_w, q_x, q_y, q_z$) más los 6 keypoints del cuadricóptero para visualización y aprendizaje geométrico.
+- `data['agent'].y`: horizonte de $T=8$ acciones relativas $T_{EA}^{(t,k)} \in SE(3)$ muestreadas de la trayectoria de vuelo real a $\sim 10\text{ Hz}$.
+- `data['aug']`: nodos de aumento sintético para recuperación (*30% Tube Augmentation*) con poses perturbadas $\tilde{T}_{WE}$, nubes sintéticas recalculadas $\tilde{P}_{\text{scene}}$, perturbación del 10% en el estado binario de vuelo $\tilde{s}_t$, y secuencias de acción correctivas orientadas a retornar a la trayectoria nominal.
+- Demos de contexto reducidas a $L=10$ keyframes temporales representativos.
 
-### Paso 6: Visualizar e Inspeccionar los Datos en 3D (Instantáneo o Animación)
-Para auditar visualmente tanto la nube LiDAR egocéntrica como la trayectoria del dron:
+### Paso 6: Visualizar e Inspeccionar los Datos en 3D (Instantáneo, Animación y Recuperación)
+Para auditar visualmente tanto la nube LiDAR egocéntrica como la trayectoria del dron y las maniobras de recuperación:
 
 ```bash
 cd ~/ros2_ws
@@ -168,10 +184,13 @@ cd ~/ros2_ws
 # 1. Reproducir el vuelo completo como ANIMACION tipo video (GUI o GIF):
 python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --animate --output vuelo_animado.gif
 
-# 2. Visualizar un fotograma estático específico (ej. paso t=10):
+# 2. Visualizar la recuperación y Tube Augmentation (poses perturbadas y trayectorias correctivas):
+python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --show-aug --output tube_recovery.png
+
+# 3. Visualizar un fotograma estático específico (ej. paso t=10):
 python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --step 10 --output vista_lidar.png
 
-# 3. O verificar directamente el LiDAR sintético sobre los waypoints sin necesidad de volar:
+# 4. O verificar directamente el LiDAR sintético sobre los waypoints sin necesidad de volar:
 python3 src/uav_ip/scripts/visualize_dataset.py \
   --waypoints src/uav_ip/generated_worlds/test_001/waypoints.yaml \
   --drone-pose 0.0 0.0 1.5 0.0 \
@@ -262,19 +281,25 @@ Este comando realiza las siguientes validaciones y exportaciones:
 *(Para realizar un chequeo rápido en terminal sin generar archivos JSON, puedes agregar el flag `--no-export`).*
 
 ### 3. Conversión por Lotes a Formato PyTorch Geometric
-Una vez validado el dataset, puedes convertir todos los episodios a grafos `.pt` iterando con `bag_to_heterodata.py`:
+Una vez validado el dataset, puedes convertir automáticamente todos los episodios de todas las tareas a grafos `HeteroData` (`data.pt`) utilizando el modo batch multiproceso de `bag_to_heterodata.py`:
+
 ```bash
-# Ejemplo de procesamiento por lotes en bash:
-for ep_dir in datasets/task_*/episode_*/; do
-  if [ -d "$ep_dir/rosbag" ]; then
-    echo "Procesando $ep_dir..."
-    python3 src/uav_ip/scripts/bag_to_heterodata.py \
-      --bag-dir "$ep_dir/rosbag" \
-      --waypoints "$ep_dir/waypoints.yaml" \
-      --output "$ep_dir/data.pt"
-  fi
-done
+# Activar entorno ML
+source ~/venv_ip/bin/activate
+
+# Conversión masiva en paralelo (ej. 8 trabajadores / núcleos):
+python3 src/uav_ip/scripts/bag_to_heterodata.py \
+  --dataset-dir datasets \
+  --workers 8 \
+  --fps-points 2048 \
+  --scale 0.1
 ```
+
+**Ventajas y Características del Procesamiento por Lotes:**
+- **Procesamiento Multiproceso:** Distribuye los episodios uniformemente entre la cantidad de trabajadores (`--workers`), procesando 100 episodios en segundos en lugar de minutos.
+- **Aceleración SIMD C:** El submuestreo FPS de nubes de puntos compila dinámicamente un kernel en C vectorizado (`-O3 -march=native -ffast-math`), reduciendo el tiempo de cálculo de $\sim 43\text{ ms}$ a $\sim 6\text{ ms}$ por nube.
+- **Generación Automática de Tube Augmentation:** Incorpora en cada episodio un conjunto de nodos de recuperación `data['aug']` (30% de pasos perturbados con horizonte de acción correctiva en $SE(3)$ y 10% flip de estado de vuelo), listos para el entrenamiento del modelo de difusión.
+- **Keyframes de Contexto:** Extrae automáticamente $L=10$ hitos temporales para estructurar el condicionamiento *in-context*.
 
 ---
 ### 🎯 Embodiment y Observación Privilegiada (LiDAR 360°)
