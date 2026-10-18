@@ -150,3 +150,106 @@ def test_generator_hoops_backwards_compatibility():
     cloud = gen.generate_pointcloud(drone_pose, legacy_hoops, landing=landing, seed=42)
     assert cloud.shape == (2048, 3)
     assert np.max(np.linalg.norm(cloud, axis=1)) <= 1.0 + 1e-4
+
+
+def test_tube_augmentation_se3_convergence():
+    """
+    Valida Tarea 2.3 (30% Tube Augmentation):
+    1. Exactamente el 30% de los instantes T generan muestras de recuperacion.
+    2. Cada accion correctiva cumple la identidad de grupo SE(3):
+           \\tilde{T}_{WE}^t @ \\tilde{T}_{EA}^{(t, k)} == T_{WE}^{t+k}
+    3. Ante una desviacion lateral (+Y / -Y) o vertical (+Z / -Z) respecto al eje de un aro,
+       el vector de accion local \\Delta\\tilde{p}_{FLU} apunta convergentemente de regreso al eje.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from bag_to_heterodata import compute_se3_action_horizon, compute_tube_augmentation
+
+    T = 40
+    scale = 0.1
+    # Trayectoria nominal recta por el eje del aro en Y=0, Z=1.5 m, avanzando en +X
+    pos_enu_m = np.column_stack([
+        np.linspace(0.0, 12.0, T),
+        np.zeros(T),
+        np.full(T, 1.5),
+    ]).astype(np.float64)
+    yaw_enu = np.zeros((T, 1), dtype=np.float32)
+    flight_state = np.ones((T, 1), dtype=np.float32)
+    flight_state[-4:, 0] = 0.0
+
+    landmarks = [{"id": "gate_1", "type": "square_gate", "x": 6.0, "y": 0.0, "z": 1.5, "yaw": 0.0}]
+    landing = {"x": 12.0, "y": 0.0, "z": 0.05}
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=scale, target_points=2048)
+
+    pose_se3_nom, _, _ = compute_se3_action_horizon(
+        (pos_enu_m * scale).astype(np.float32), yaw_enu, flight_state, horizon=8, action_stride=1
+    )
+
+    aug = compute_tube_augmentation(
+        pos_enu_m=pos_enu_m,
+        yaw_enu=yaw_enu,
+        flight_state=flight_state,
+        landmarks=landmarks,
+        landing=landing,
+        lidar_gen=gen,
+        ep_seed=42001,
+        scale_factor=scale,
+        horizon=8,
+        action_stride=1,
+        tube_aug_prob=0.30,
+        tube_sigma_pos=0.25,
+        tube_sigma_yaw_deg=5.0,
+        state_flip_prob=0.10,
+    )
+
+    T_aug = len(aug["timestep_idx"])
+    assert T_aug == int(round(0.30 * T))  # 12 de 40 (30%)
+    assert int(np.sum(aug["aug_mask"])) == T_aug
+    assert aug["scene_pos"].shape == (T_aug, 2048, 3)
+    assert aug["y"].shape == (T_aug, 8, 5)
+    assert aug["action_se3"].shape == (T_aug, 8, 4, 4)
+
+    for i in range(T_aug):
+        t = int(aug["timestep_idx"][i])
+        T_we_pert = aug["pose_se3"][i]
+        for k in range(1, 9):
+            tk = min(T - 1, t + k)
+            T_ea_corr = aug["action_se3"][i, k - 1]
+            # Identidad exacta en SE(3): \tilde{T}_{WE}^t * \tilde{T}_{EA}^{(t,k)} == T_{WE}^{t+k}
+            T_reconstructed = T_we_pert @ T_ea_corr
+            assert np.allclose(T_reconstructed, pose_se3_nom[tk], atol=1e-5)
+
+            # Verificar signo de recuperacion transversal/vertical hacia el eje Y=0, Z=1.5
+            world_recovery_vec = aug["target_pos_enu"][i, k - 1] - aug["pos_enu"][i]
+            dp_injected_scaled = aug["delta_pos_m"][i] * scale
+            # Como la trayectoria nominal tiene Y=0 y Z=constante, el desplazamiento mundial de
+            # recuperacion en Y y Z debe ser exactamente -dp_injected_scaled[1:3]
+            assert np.allclose(world_recovery_vec[1], -dp_injected_scaled[1], atol=1e-5)
+            assert np.allclose(world_recovery_vec[2], -dp_injected_scaled[2], atol=1e-5)
+
+
+def test_discover_dataset_episodes():
+    """Valida Tarea 2.2: descubrimiento recursivo de episodios en datasets/."""
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from bag_to_heterodata import discover_dataset_episodes
+
+    dataset_dir = repo_root / "datasets"
+    if dataset_dir.is_dir():
+        eps = discover_dataset_episodes(dataset_dir)
+        assert len(eps) >= 6
+        labels = [e["label"] for e in eps]
+        assert "task_0000/episode_00" in labels
+        assert "task_0001/episode_02" in labels
+

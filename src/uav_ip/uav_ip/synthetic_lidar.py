@@ -185,20 +185,125 @@ def fps_numpy(
         working_points = points
 
     selected = np.zeros(n_samples, dtype=np.int64)
+    current = int(rng.randint(0, N))
+
+    fps_c_fn = _get_fps_c_kernel()
+    if fps_c_fn is not None and N <= 8192:
+        import ctypes
+        cols = np.ascontiguousarray(working_points.T, dtype=np.float32)
+        fps_c_fn(
+            cols[0].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            cols[1].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            cols[2].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            int(N),
+            int(n_samples),
+            int(current),
+            selected.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+        )
+        return working_points[selected]
+
     distances = np.full(N, np.inf, dtype=np.float32)
-    norm_sq = np.sum(working_points ** 2, axis=1).astype(np.float32)
-    current = rng.randint(0, N)
+    norm_sq = np.einsum("ij,ij->i", working_points, working_points)
+    neg_two_wp = (-2.0 * working_points).astype(np.float32)
+    dists = np.empty(N, dtype=np.float32)
+    dot_fn = np.dot
+    min_fn = np.minimum
+    argmax_fn = distances.argmax
 
     for i in range(n_samples):
         selected[i] = current
-        p = working_points[current]
-        p_sq = norm_sq[current]
-        # Distancia euclidea al cuadrado optimizada con BLAS: ||x - p||^2 = ||x||^2 + ||p||^2 - 2 <x, p>
-        dists = np.maximum(0.0, norm_sq + p_sq - 2.0 * np.dot(working_points, p))
-        np.minimum(distances, dists, out=distances)
-        current = int(np.argmax(distances))
+        dot_fn(neg_two_wp, working_points[current], out=dists)
+        dists += norm_sq
+        dists += norm_sq[current]
+        min_fn(distances, dists, out=distances)
+        current = int(argmax_fn())
 
     return working_points[selected]
+
+
+_FPS_C_KERNEL = False
+
+
+def _get_fps_c_kernel():
+    """Compila y carga dinamicamente (una sola vez) un kernel C SIMD para acelerar FPS ~7x."""
+    global _FPS_C_KERNEL
+    if _FPS_C_KERNEL is not False:
+        return _FPS_C_KERNEL
+
+    import ctypes
+    import os
+    import subprocess
+    import tempfile
+
+    so_path = Path(tempfile.gettempdir()) / f"uav_ip_fps_soa_py{os.getuid()}.so"
+    c_code = """
+#include <stdint.h>
+void fps_soa(const float* restrict x, const float* restrict y, const float* restrict z,
+             int N, int K, int start_idx, int64_t* restrict selected) {
+    float dists[8192];
+    for (int j = 0; j < N; ++j) dists[j] = 1e30f;
+    int current = start_idx;
+    for (int i = 0; i < K; ++i) {
+        selected[i] = current;
+        float px = x[current];
+        float py = y[current];
+        float pz = z[current];
+        for (int j = 0; j < N; ++j) {
+            float dx = x[j] - px;
+            float dy = y[j] - py;
+            float dz = z[j] - pz;
+            float d = dx * dx + dy * dy + dz * dz;
+            dists[j] = (d < dists[j]) ? d : dists[j];
+        }
+        int best_idx = 0;
+        float best_d = dists[0];
+        for (int j = 1; j < N; ++j) {
+            if (dists[j] > best_d) {
+                best_d = dists[j];
+                best_idx = j;
+            }
+        }
+        current = best_idx;
+    }
+}
+"""
+    try:
+        if not so_path.is_file():
+            with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f_c:
+                f_c.write(c_code)
+                c_name = f_c.name
+            tmp_so = so_path.with_suffix(f".{os.getpid()}.so")
+            try:
+                subprocess.run(
+                    ["gcc", "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", c_name, "-o", str(tmp_so)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+                os.replace(tmp_so, so_path)
+            finally:
+                if os.path.exists(c_name):
+                    os.remove(c_name)
+                if os.path.exists(tmp_so):
+                    os.remove(tmp_so)
+
+        lib = ctypes.CDLL(str(so_path))
+        lib.fps_soa.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        _FPS_C_KERNEL = lib.fps_soa
+    except Exception:
+        _FPS_C_KERNEL = None
+
+    return _FPS_C_KERNEL
+
 
 
 # ============================================================================

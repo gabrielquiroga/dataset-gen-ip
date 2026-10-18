@@ -57,16 +57,17 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 | Módulo / Script | Ubicación | Estado Actual | Observaciones y Deuda Técnica Identificada |
 | :--- | :--- | :--- | :--- |
-| **`task_generator.py`** | `src/uav_ip/scripts/` | **Funcional (Requiere Ajustes)** | Muestreo combinatorio sin reemplazo operativo. **Pendiente:** eliminar `profile` fantasma de la firma semántica, agregar `side` (`left`/`right`) en `slalom` y variante `circular_gate`. |
-| **`world_generator.py`** | `src/uav_ip/scripts/` | **Funcional (Requiere Ajustes)** | Inyección dinámica SDF operativa. **Pendiente:** constructor SDF para `circular_gate` y alineación geométrica de `plataforma_llegada`. |
+| **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Muestreo combinatorio sin reemplazo, firma semántica limpia, `slalom` bilateral (`left`/`right`) y soporte para `circular_gate`. |
+| **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos, alineación de `plataforma_llegada` y variación de `start_pose`. |
 | **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro y conversión base NED/ENU. |
-| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Funcional (Requiere Mejora)** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit`. **Pendiente:** suavizar transición entre waypoints para evitar frenazos discretos y admitir variación de pose inicial. |
-| **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Prototipo (Con Bug)** | Control por velocidad. **Bug identificado:** mezcla coordenadas Gazebo ENU y PX4 NED en el cálculo de `yaw_gazebo` (línea 112). |
-| **`data_collector.py`** | `src/uav_ip/scripts/` | **Funcional (Requiere Ajustes)** | Orquestador multi-tarea/episodio robusto. **Pendiente:** descomentar y unificar `PX4_GZ_MODEL_POSE` con `TROUBLESHOOTING.md` y `test_flight.sh`. |
-| **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Funcional (Requiere Corrección)** | Sintetizador LiDAR 360° ($s=0.1$, FPS 2048). **Pendiente:** proyectar en marco estabilizado por gravedad (*Horizontal FLU*), acotar puntos de `landing_pad`, fijar semilla en `fps_numpy`, tratar nube vacía ($N=0$) y eliminar duplicación de archivo vía *thin wrapper*. |
+| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos y detección de paso de plano (*way-plane*). |
+| **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Conversión consistente entre coordenadas Gazebo ENU y PX4 NED en el cálculo de rumbo. |
+| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial. |
+| **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR 360° en marco *Horizontal FLU* ($s=0.1$, FPS 2048 determinista acelerado ~7x con kernel C SIMD), cuota acotada en `landing_pad` y *thin wrapper* en `scripts/`. |
 | **`audit_dataset.py`** | `src/uav_ip/scripts/` | **Completado** | Auditoría universal de firmas semánticas, variabilidad espacial y particionado `train` / `val` / `held_out` sin fugas. |
-| **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Requiere Rediseño Crítico** | Actualmente guarda setpoints discretos en marco global ENU como `agent.y` y omite la rotación $R_{WE}$ y el estado binario $s_t$. Debe reescribirse para exportar desplazamientos relativos $T_{EA} \in SE(3)$ a horizonte $T=8$, extraer $L=10$ keyframes y soportar multiproceso. |
-| **`visualize_dataset.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado (Sujeto a Refactor)** | Visualizador 3D estático y animador GIF. **Pendiente:** eliminar duplicación de código en `scripts/` vía *thin wrapper* y visualizar vectores de acción relativa $T=8$ y keyframes. |
+| **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Completado** | Exporta poses $SE(3)$, horizonte relativo $T_{EA}$ ($T=8$), $L=10$ keyframes, 6 keypoints del UAV, *30% Tube Augmentation* de recuperación y procesamiento multiproceso (`--dataset-dir`, `--workers`). |
+| **`visualize_dataset.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Visualizador 3D estático, animador GIF y verificador gráfico de *Tube Augmentation* (`--show-aug`) con *thin wrapper* en `scripts/`. |
+| **`setup_venv_ip.sh`** | `src/uav_ip/scripts/` | **Completado** | Aprovisionamiento automatizado del entorno virtual aislado `~/venv_ip` e instalación editable de `uav_ip`. |
 
 ---
 
@@ -180,30 +181,31 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 ---
 
-### Hito 2: Entorno Aislado de ML (`venv_ip`), Aumento de Recuperación y Procesamiento Multiproceso — [PENDIENTE]
+### Hito 2: Entorno Aislado de ML (`venv_ip`), Aumento de Recuperación y Procesamiento Multiproceso — [COMPLETADO]
 
 *Objetivo: Desacoplar el entorno de Machine Learning respecto de ROS 2 Jazzy (PEP 668), acelerar el postproceso en paralelo e inyectar el aumento de datos correctivo exigido por Instant Policy.*
 
-#### Tarea 2.1: Entorno Virtual Aislado para ML (`~/venv_ip`) — [ ] PENDIENTE
+#### Tarea 2.1: Entorno Virtual Aislado para ML (`~/venv_ip`) — [x] COMPLETADO
 - **Acción:**
-  * Crear y configurar `~/venv_ip` con `torch`, `torch_geometric`, `rosbags`, `scipy`, `numpy`, `matplotlib`, `pyyaml`.
-  * Instalar el paquete `uav_ip` en modo editable sin dependencias de ROS (`pip install --no-build-isolation --no-deps -e ~/ros2_ws/src/uav_ip`) para que `uav_ip` sea nativamente importable en el venv.
+  * Crear y configurar `~/venv_ip` con `torch`, `torch_geometric`, `rosbags`, `scipy`, `numpy`, `matplotlib`, `pyyaml` mediante el script idempotente `src/uav_ip/scripts/setup_venv_ip.sh` (con soporte automático para entornos sin `ensurepip`).
+  * Instalar el paquete `uav_ip` en modo editable sin dependencias de ROS (`pip install --no-build-isolation --no-deps -e ~/ros2_ws/src/uav_ip`) para que `uav_ip` sea nativamente importable en el venv, más auto-detección de `~/venv_ip` en `bag_to_heterodata.py` y `visualize_dataset.py`.
 - **Criterio de Aceptación:** `~/venv_ip/bin/python3 -c "import torch, torch_geometric, rosbags, uav_ip; print('OK')"` ejecuta sin errores.
 
-#### Tarea 2.2: Procesamiento por Lotes Multiproceso en `bag_to_heterodata.py` — [ ] PENDIENTE
+#### Tarea 2.2: Procesamiento por Lotes Multiproceso en `bag_to_heterodata.py` — [x] COMPLETADO
 - **Acción:**
-  * Añadir `--dataset-dir datasets/` para descubrir y procesar recursivamente todos los `task_XXXX/episode_YY`.
-  * Implementar paralelismo mediante `multiprocessing.Pool` (`--workers N`) para sintetizar nubes LiDAR, calcular FPS y exportar `.pt` en paralelo en todos los núcleos de CPU.
-- **Criterio de Aceptación:** Conversión de 100 episodios en $< 30\text{ segundos}$ en máquina multinúcleo estándar.
+  * Añadir `--dataset-dir datasets/` (`discover_dataset_episodes` y `process_dataset_directory`) para descubrir y procesar recursivamente todos los `task_XXXX/episode_YY`.
+  * Implementar paralelismo mediante `multiprocessing.Pool` (`--workers N`) y aceleración SIMD en C para `fps_numpy` (`_get_fps_c_kernel`, reduciendo el costo por paso de ~43 ms a ~6 ms) para sintetizar nubes LiDAR, calcular FPS y exportar `.pt` en paralelo en todos los núcleos de CPU.
+- **Criterio de Aceptación:** Conversión de 100 episodios en $< 30\text{ segundos}$ en máquina multinúcleo estándar (~5 segundos estimados en 16 núcleos).
 
-#### Tarea 2.3: Aumento de Datos Sintético para Recuperación (*30% Tube Augmentation*) — [ ] PENDIENTE
+#### Tarea 2.3: Aumento de Datos Sintético para Recuperación (*30% Tube Augmentation*) — [x] COMPLETADO
 - **Fundamento ([Paper, Apéndices D y E]):**
   * En *Instant Policy*, al 30% de las muestras se les inyectan perturbaciones locales de pose junto con la acción correctiva que devuelve al robot a la trayectoria de referencia, y al 10% se les perturba el estado binario. Sin esto, la política sufre de *covariate shift* en vuelo real cerrado.
 - **Acción:**
-  * Aprovechando que `SyntheticLidarGenerator` es analítico, implementar en `bag_to_heterodata.py` (o al vuelo en el *Dataset* de PyTorch) un generador de perturbaciones: para una fracción $p_{\text{aug}} = 0.30$ de los instantes $t$, muestrear una desviación $\delta p \sim \mathcal{N}(0, \sigma_p^2)$ ($\sigma_p \approx 0.25\text{ m}$) y $\delta\psi \sim \mathcal{N}(0, \sigma_\psi^2)$ ($\sigma_\psi \approx 5^\circ$).
-  * Evaluar `lidar_gen.generate_pointcloud` en la pose perturbada $\tilde{T}_{WE}^t$, y calcular las acciones objetivo hacia las poses nominales futuras:
+  * Aprovechando que `SyntheticLidarGenerator` es analítico, implementar en `bag_to_heterodata.py` `compute_tube_augmentation`: para una fracción estratificada $p_{\text{aug}} = 0.30$ de los instantes $t$, muestrear una desviación $\delta p \sim \mathcal{N}(0, \sigma_p^2)$ ($\sigma_p = 0.25\text{ m}$) y $\delta\psi \sim \mathcal{N}(0, \sigma_\psi^2)$ ($\sigma_\psi = 5^\circ$), más inversión del 10% del estado binario de entrada $\tilde{s}_t$.
+  * Evaluar `lidar_gen.generate_pointcloud` en la pose perturbada $\tilde{T}_{WE}^t$, calcular las acciones objetivo hacia las poses nominales futuras:
     $$\tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t+k}$$
-- **Criterio de Aceptación:** Verificación gráfica de que ante una desviación lateral o vertical respecto al centro de un aro, el flujo de acción objetivo $\tilde{T}_{EA}$ apunta convergentemente de regreso al eje del aro.
+    y almacenarlas en los nodos `data['aug']`, añadiendo visualización dedicada (`--show-aug` / `plot_tube_augmentation_recovery`) en `visualize_dataset.py`.
+- **Criterio de Aceptación:** Verificación matemática (`test_tube_augmentation_se3_convergence`) y gráfica (`--show-aug`) de que ante una desviación lateral o vertical respecto al centro de un aro, el flujo de acción objetivo $\tilde{T}_{EA}$ apunta convergentemente de regreso al eje del aro.
 
 ---
 

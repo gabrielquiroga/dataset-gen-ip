@@ -33,6 +33,15 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation, PillowWriter
 
+# Asegurar inclusion de ~/venv_ip y ~/.local en sys.path
+_py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+for _candidate_site in [
+    Path.home() / "venv_ip" / "lib" / _py_ver / "site-packages",
+    Path.home() / ".local" / "lib" / _py_ver / "site-packages",
+]:
+    if _candidate_site.is_dir() and str(_candidate_site) not in sys.path:
+        sys.path.insert(0, str(_candidate_site))
+
 # Agregar directorio local al sys.path para importar synthetic_lidar
 script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
@@ -76,7 +85,7 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
     - agent_y: (T, 8, 5) horizonte de acciones relativas SE(3) o (T, 3) en archivos legados
     - scene_pos: (T, 2048, 3) nubes de puntos LiDAR egocentricas (escaladas s=0.1)
     - extra (opcional si return_extra=True): dict con 'action_horizon_flu', 'keyframe_indices',
-      'flight_state', 'setpoint_raw', 'yaw_enu', 'keypoints_body'.
+      'flight_state', 'setpoint_raw', 'yaw_enu', 'keypoints_body' y campos 'aug_*' de Tube Augmentation.
     """
     ext = file_path.suffix.lower()
     extra = {
@@ -86,6 +95,18 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
         "setpoint_raw": None,
         "yaw_enu": None,
         "keypoints_body": None,
+        "aug_mask": None,
+        "aug_timestep_idx": None,
+        "aug_scene_pos": None,
+        "aug_pos_enu": None,
+        "aug_yaw_enu": None,
+        "aug_delta_pos_m": None,
+        "aug_delta_yaw": None,
+        "aug_flight_state_in": None,
+        "aug_y": None,
+        "aug_action_se3": None,
+        "aug_target_pos_enu": None,
+        "aug_action_horizon_flu": None,
     }
 
     if ext == ".npz":
@@ -105,6 +126,18 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
             extra["yaw_enu"] = np.asarray(data["yaw_enu"], dtype=np.float32)
         if "keypoints_body" in data:
             extra["keypoints_body"] = np.asarray(data["keypoints_body"], dtype=np.float32)
+        if "aug_mask" in data:
+            extra["aug_mask"] = np.asarray(data["aug_mask"], dtype=np.uint8)
+        for aug_k in (
+            "aug_timestep_idx", "aug_scene_pos", "aug_pos_enu", "aug_yaw_enu",
+            "aug_delta_pos_m", "aug_delta_yaw", "aug_flight_state_in",
+            "aug_y", "aug_action_se3", "aug_target_pos_enu"
+        ):
+            if aug_k in data:
+                extra[aug_k] = np.asarray(data[aug_k])
+        extra["aug_action_horizon_flu"] = _extract_local_horizon_flu(
+            extra["aug_y"], extra["aug_action_se3"]
+        )
         return (agent_x, agent_y, scene_pos, extra) if return_extra else (agent_x, agent_y, scene_pos)
 
     elif ext == ".pt":
@@ -114,7 +147,7 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
         except ImportError:
             raise ImportError(
                 "Para visualizar archivos .pt se requiere 'torch' y 'torch_geometric'. "
-                "Instala las librerias con: pip install torch torch_geometric\n"
+                "Ejecuta: bash src/uav_ip/scripts/setup_venv_ip.sh\n"
                 "O genera/visualiza el archivo en formato .npz."
             )
 
@@ -131,6 +164,23 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
             extra["setpoint_raw"] = _to_numpy(getattr(ag, "setpoint_raw", None))
             extra["yaw_enu"] = _to_numpy(getattr(ag, "yaw_enu", None))
             extra["keypoints_body"] = _to_numpy(getattr(ag, "keypoints_body", None))
+            extra["aug_mask"] = _to_numpy(getattr(ag, "aug_mask", None))
+
+            if "aug" in data:
+                aug = data["aug"]
+                extra["aug_timestep_idx"] = _to_numpy(getattr(aug, "timestep_idx", None))
+                extra["aug_scene_pos"] = _to_numpy(getattr(aug, "scene_pos", None))
+                extra["aug_pos_enu"] = _to_numpy(getattr(aug, "pos_enu", None))
+                extra["aug_yaw_enu"] = _to_numpy(getattr(aug, "yaw_enu", None))
+                extra["aug_delta_pos_m"] = _to_numpy(getattr(aug, "delta_pos_m", None))
+                extra["aug_delta_yaw"] = _to_numpy(getattr(aug, "delta_yaw", None))
+                extra["aug_flight_state_in"] = _to_numpy(getattr(aug, "flight_state_in", None))
+                extra["aug_y"] = _to_numpy(getattr(aug, "y", None))
+                extra["aug_action_se3"] = _to_numpy(getattr(aug, "action_se3", None))
+                extra["aug_target_pos_enu"] = _to_numpy(getattr(aug, "target_pos_enu", None))
+                extra["aug_action_horizon_flu"] = _extract_local_horizon_flu(
+                    extra["aug_y"], extra["aug_action_se3"]
+                )
         elif isinstance(data, dict):
             agent_x = _to_numpy(data.get("pos_enu", data.get("agent_x", data.get("x"))))
             agent_y = _to_numpy(data.get("agent_y", data.get("y")))
@@ -457,6 +507,135 @@ def animate_pointcloud_and_trajectory(
         print(f"[OK] Animacion guardada en: {default_out.resolve()}")
 
 
+def plot_tube_augmentation_recovery(
+    agent_x: np.ndarray,
+    extra: dict,
+    aug_idx: int = 0,
+    scale: float = 0.1,
+    title: str = "Verificacion de Tube Augmentation (30% Recuperacion SE(3))",
+    output_image: Path = None,
+    interactive: bool = True,
+):
+    r"""
+    Genera un panel triple para verificar graficamente el aumento de datos sintetico
+    de recuperacion (30% Tube Augmentation):
+      1. Izquierda (3D Global ENU): Trayectoria nominal experta + todas las poses perturbadas
+         \tilde{p}_t y sus polilineas de accion correctiva convergiendo hacia la ruta nominal.
+      2. Centro (Vista Superior XY en marco perturbado \tilde{T}_{WE}^t): Nube LiDAR 360°
+         sintetizada en la pose desviada y flujo de accion \tilde{T}_{EA} corrigiendo el error lateral.
+      3. Derecha (Vista Lateral XZ en marco perturbado \tilde{T}_{WE}^t): Flujo de accion
+         \tilde{T}_{EA} corrigiendo la desviacion vertical de regreso al eje nominal.
+    """
+    aug_pos = extra.get("aug_pos_enu")
+    aug_cloud_all = extra.get("aug_scene_pos")
+    aug_h_flu = extra.get("aug_action_horizon_flu")
+    aug_t_idx = extra.get("aug_timestep_idx")
+    aug_target_enu = extra.get("aug_target_pos_enu")
+    aug_dp_m = extra.get("aug_delta_pos_m")
+    aug_dyaw = extra.get("aug_delta_yaw")
+
+    if aug_pos is None or len(aug_pos) == 0:
+        raise ValueError("El archivo no contiene muestras de Tube Augmentation ('aug').")
+
+    T_aug = len(aug_pos)
+    k_sel = max(0, min(int(aug_idx), T_aug - 1))
+    t_nom = int(aug_t_idx[k_sel]) if aug_t_idx is not None else k_sel
+    cloud = aug_cloud_all[k_sel]
+    h_flu = np.vstack([np.zeros((1, 3), dtype=np.float32), aug_h_flu[k_sel]])
+
+    dp_m = aug_dp_m[k_sel] if aug_dp_m is not None else np.zeros(3)
+    dyaw_deg = math.degrees(float(aug_dyaw[k_sel].reshape(-1)[0])) if aug_dyaw is not None else 0.0
+
+    fig = plt.figure(figsize=(17, 6))
+    fig.suptitle(
+        f"{title}\nMuestra aug #{k_sel}/{T_aug-1} (instante nominal t={t_nom}) | "
+        f"Desviacion inyectada: dX={dp_m[0]:+.2f}m, dY={dp_m[1]:+.2f}m, dZ={dp_m[2]:+.2f}m, dYaw={dyaw_deg:+.1f}°",
+        fontsize=12,
+        fontweight="bold",
+    )
+
+    # 1. Vista 3D Global ENU con tubo de recuperacion completo
+    ax3d = fig.add_subplot(131, projection="3d")
+    ax3d.plot(
+        agent_x[:, 0], agent_x[:, 1], agent_x[:, 2],
+        "b-", linewidth=2.0, alpha=0.85, label="Trayectoria nominal experta"
+    )
+    ax3d.scatter(
+        aug_pos[:, 0], aug_pos[:, 1], aug_pos[:, 2],
+        color="darkorange", s=35, marker="^", alpha=0.85, label=f"Poses perturbadas ({T_aug})"
+    )
+
+    if aug_target_enu is not None:
+        for i in range(T_aug):
+            poly = np.vstack([aug_pos[i:i+1], aug_target_enu[i]])
+            lbl = "Flujo correctivo -> nominal" if i == 0 else None
+            lw = 2.4 if i == k_sel else 1.0
+            col = "crimson" if i == k_sel else "limegreen"
+            alp = 0.95 if i == k_sel else 0.55
+            ax3d.plot(poly[:, 0], poly[:, 1], poly[:, 2], color=col, linewidth=lw, alpha=alp, label=lbl)
+
+    ax3d.scatter(
+        [aug_pos[k_sel, 0]], [aug_pos[k_sel, 1]], [aug_pos[k_sel, 2]],
+        color="crimson", edgecolors="black", s=120, marker="^", zorder=10,
+        label=f"Pose activa aug #{k_sel} (t={t_nom})"
+    )
+    ax3d.set_xlabel("X ENU [m·s]")
+    ax3d.set_ylabel("Y ENU [m·s]")
+    ax3d.set_zlabel("Z ENU [m·s]")
+    ax3d.set_title("Convergencia 3D del Tubo hacia Ruta Nominal")
+    ax3d.legend(loc="upper left", fontsize=8)
+
+    # 2. Vista Superior XY en el marco perturbado \tilde{T}_{WE}^t
+    ax_xy = fig.add_subplot(132)
+    dists = np.linalg.norm(cloud, axis=1)
+    ax_xy.scatter(cloud[:, 0], cloud[:, 1], c=dists, cmap="viridis", s=8, alpha=0.65, label="LiDAR en pose perturbada")
+    ax_xy.scatter([0], [0], color="crimson", s=110, marker="^", zorder=5, label="Dron desviado (0,0)")
+    ax_xy.plot(
+        h_flu[:, 0], h_flu[:, 1],
+        "r-o", markersize=4, linewidth=2.2, label="Accion correctiva \\tilde{T}_{EA} (T=8)"
+    )
+    ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xy.set_xlabel("X FLU Perturbado [m·s] (Adelante ->)")
+    ax_xy.set_ylabel("Y FLU Perturbado [m·s] (<- Izq / Der ->)")
+    ax_xy.set_title("Recuperacion Lateral (Plano XY Egocentrico)")
+    ax_xy.grid(True, linestyle=":", alpha=0.6)
+    ax_xy.axis("equal")
+    ax_xy.legend(loc="upper left", fontsize=8)
+
+    # 3. Vista Lateral XZ en el marco perturbado \tilde{T}_{WE}^t
+    ax_xz = fig.add_subplot(133)
+    ax_xz.scatter(cloud[:, 0], cloud[:, 2], c=dists, cmap="viridis", s=8, alpha=0.65, label="LiDAR en pose perturbada")
+    ax_xz.scatter([0], [0], color="crimson", s=110, marker="^", zorder=5, label="Dron desviado (0,0)")
+    ax_xz.plot(
+        h_xz_x := h_flu[:, 0], h_flu[:, 2],
+        "r-o", markersize=4, linewidth=2.2, label="Accion correctiva \\tilde{T}_{EA} (T=8)"
+    )
+    ax_xz.axhline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
+    ax_xz.set_xlabel("X FLU Perturbado [m·s] (Adelante ->)")
+    ax_xz.set_ylabel("Z FLU Perturbado [m·s] (Arriba ->)")
+    ax_xz.set_title("Recuperacion Vertical (Plano XZ Egocentrico)")
+    ax_xz.grid(True, linestyle=":", alpha=0.6)
+    ax_xz.axis("equal")
+    ax_xz.legend(loc="upper left", fontsize=8)
+
+    plt.tight_layout()
+
+    if output_image:
+        output_image = Path(output_image)
+        output_image.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_image, dpi=180)
+        print(f"\n[OK] Grafica de Tube Augmentation guardada en: {output_image.resolve()}")
+
+    if interactive and has_display:
+        plt.show()
+    elif not has_display and not output_image:
+        default_out = Path("visualizacion_tube_aug.png")
+        plt.savefig(default_out, dpi=180)
+        print(f"\n[INFO] Grafica de Tube Augmentation guardada en: {default_out.resolve()}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualizador 3D para HeteroData y LiDAR Sintetico 360°"
@@ -486,6 +665,17 @@ def main():
         type=int,
         default=0,
         help="Indice del paso temporal a visualizar en archivos .pt / .npz (default: 0)"
+    )
+    parser.add_argument(
+        "--show-aug",
+        action="store_true",
+        help="Visualizar las muestras de recuperacion del 30%% Tube Augmentation y su convergencia a la ruta nominal"
+    )
+    parser.add_argument(
+        "--aug-index",
+        type=int,
+        default=0,
+        help="Indice de la muestra perturbada a detallar en modo --show-aug (default: 0)"
     )
     parser.add_argument(
         "--animate", "-a",
@@ -548,9 +738,24 @@ def main():
             print(f"Keyframes de contexto (L={len(extra['keyframe_indices'])}):   {extra['keyframe_indices'].tolist()}")
         if extra.get("keypoints_body") is not None:
             print(f"Keypoints cuerpo UAV:           {extra['keypoints_body'].shape}")
+        if extra.get("aug_pos_enu") is not None and len(extra["aug_pos_enu"]) > 0:
+            n_aug = len(extra["aug_pos_enu"])
+            print(f"Muestras Tube Augmentation:     {n_aug}/{T} ({100.0 * n_aug / max(1, T):.1f}%)")
         print(f"Rango de nube t={step}:         Min={np.min(cloud, axis=0)}, Max={np.max(cloud, axis=0)}")
         print(f"Distancia maxima del LiDAR:     {np.max(np.linalg.norm(cloud, axis=1)):.3f} (en espacio s={args.scale})")
         print("------------------------------------------")
+
+        if args.show_aug:
+            plot_tube_augmentation_recovery(
+                agent_x=agent_x,
+                extra=extra,
+                aug_idx=args.aug_index,
+                scale=args.scale,
+                title=f"Tube Augmentation Recovery: {args.file.name}",
+                output_image=args.output,
+                interactive=not args.no_gui,
+            )
+            return
 
         is_anim = args.animate or (args.output is not None and args.output.suffix.lower() in [".gif", ".mp4"])
 
