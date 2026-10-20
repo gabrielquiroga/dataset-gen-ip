@@ -29,8 +29,7 @@ Para evitar desincronizaciones, la información del proyecto se encuentra formal
 
 ## 🛠️ Próximas Tareas Inmediatas (Hito 3 en `docs/PLAN_IMPLEMENTACION.md`)
 
-1. **Hito 3 — Arquitectura del Modelo de Difusión sobre Grafos (GNN In-Context):**
-   * Definir el `Dataset` y `DataLoader` de PyTorch Geometric para estructurar pares (Contexto $N-1$ demos, Query/Target 1 demo) con soporte para Tube Augmentation.
-   * Adaptar el backbone de difusión sobre grafos heterogéneos de Instant Policy (MLP/Transformer geométrico + Denoising Diffusion Probabilistic Model / Flow Matching).
-   * Implementar la función de pérdida de difusión sobre el horizonte de acción relativo $T=8$ en $SE(3)$.
-   * Pipeline de validación offline sobre el conjunto de tareas *Held-Out*.
+1. **Hito 3 — Campaña de Recolección del Dataset Completo y Auditoría Formal:**
+   * **Tarea 3.1: Campaña de Vuelo en SITL:** Ejecutar `data_collector.py` para generar el corpus completo de demostraciones en simulación (ej. 45–64 tareas únicas $\times$ 10–15 episodios con muestreo sin reemplazo).
+   * **Tarea 3.2: Auditoría y Partición Oficial (`audit_dataset.py`):** Verificar 0 colisiones semánticas, tasa de éxito $> 95\%$, variabilidad espacial intra-tarea y exportar particiones oficiales `datasets/splits/{train,val,held_out}_tasks.json`.
+   * **Tarea 3.3: Generación Masiva de Grafos `.pt` y Validación Visual:** Ejecutar `bag_to_heterodata.py --dataset-dir datasets/ --workers N` para procesar el dataset a grafos `HeteroData` con Tube Augmentation y auditar muestras en 3D con `visualize_dataset.py`.
