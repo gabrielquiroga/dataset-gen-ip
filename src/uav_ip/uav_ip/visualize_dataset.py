@@ -152,7 +152,22 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
             )
 
         data = torch.load(file_path, map_location="cpu", weights_only=False)
-        if hasattr(data, "__getitem__") and "agent" in data and "scene" in data:
+        
+        # HeteroData de PyTorch Geometric almacena tipos de nodo en .node_types.
+        # El operador `in data` en PyG verifica nombres de atributos (no tipos de nodo),
+        # por lo que verificamos .node_types o acceso directo por clave.
+        has_agent_scene = False
+        if hasattr(data, "node_types"):
+            has_agent_scene = "agent" in data.node_types and "scene" in data.node_types
+        elif hasattr(data, "__getitem__"):
+            try:
+                _ = data["agent"]
+                _ = data["scene"]
+                has_agent_scene = True
+            except (KeyError, IndexError, TypeError):
+                has_agent_scene = False
+
+        if has_agent_scene:
             ag = data["agent"]
             agent_x = _to_numpy(getattr(ag, "pos_enu", getattr(ag, "x", None)))
             agent_y = _to_numpy(getattr(ag, "y", None))
@@ -166,7 +181,17 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
             extra["keypoints_body"] = _to_numpy(getattr(ag, "keypoints_body", None))
             extra["aug_mask"] = _to_numpy(getattr(ag, "aug_mask", None))
 
-            if "aug" in data:
+            has_aug = False
+            if hasattr(data, "node_types"):
+                has_aug = "aug" in data.node_types
+            elif hasattr(data, "__getitem__"):
+                try:
+                    _ = data["aug"]
+                    has_aug = True
+                except (KeyError, IndexError, TypeError):
+                    has_aug = False
+
+            if has_aug:
                 aug = data["aug"]
                 extra["aug_timestep_idx"] = _to_numpy(getattr(aug, "timestep_idx", None))
                 extra["aug_scene_pos"] = _to_numpy(getattr(aug, "scene_pos", None))

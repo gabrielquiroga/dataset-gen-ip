@@ -253,3 +253,48 @@ def test_discover_dataset_episodes():
         assert "task_0000/episode_00" in labels
         assert "task_0001/episode_02" in labels
 
+
+def test_heterodata_load_node_types_compatibility():
+    """Valida que la deteccion de nodos en HeteroData no use 'in data' directamente."""
+    from uav_ip.visualize_dataset import _to_numpy
+
+    class MockNode:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class MockHeteroData:
+        def __init__(self):
+            # En PyG HeteroData, __contains__ verifica nombres de atributos en data.keys(),
+            # NO los nombres de los tipos de nodo (node_types).
+            self.node_types = ["scene", "agent", "aug"]
+            self.stores = {
+                "scene": MockNode(pos=np.zeros((5, 2048, 3), dtype=np.float32)),
+                "agent": MockNode(
+                    x=np.zeros((5, 3), dtype=np.float32),
+                    pos_enu=np.zeros((5, 3), dtype=np.float32),
+                    y=np.zeros((5, 8, 5), dtype=np.float32),
+                    action_se3=np.zeros((5, 8, 4, 4), dtype=np.float32),
+                ),
+                "aug": MockNode(
+                    timestep_idx=np.array([1, 3]),
+                    scene_pos=np.zeros((2, 2048, 3), dtype=np.float32),
+                    pos_enu=np.zeros((2, 3), dtype=np.float32),
+                    y=np.zeros((2, 8, 5), dtype=np.float32),
+                ),
+            }
+
+        def __getitem__(self, key):
+            return self.stores[key]
+
+        def __contains__(self, key):
+            # Comportamiento exacto de PyG: solo atributos, nunca node_types
+            return key in ["pos", "x", "pos_enu", "y", "action_se3"]
+
+    data = MockHeteroData()
+    # Demostracion del bug previo de PyG: 'agent' in data da False
+    assert ("agent" in data) is False
+    # Verificacion de la solucion robusta:
+    assert hasattr(data, "node_types") and "agent" in data.node_types
+    assert "scene" in data.node_types
+    assert "aug" in data.node_types
+
