@@ -201,7 +201,7 @@ Para dotar a la política de difusión de capacidad intrínseca de autocorrecci�
    
    **Propiedad de Convergencia por Identidad de Grupo:**
    $$\tilde{T}_{WE}^t \cdot \tilde{T}_{EA}^{(t,k)} = \tilde{T}_{WE}^t \cdot (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} = T_{WE}^{t+k}$$
-   Esta formulación matemática garantiza que, al aplicar la acción relativa predicha, el cuadricóptero no sólo compensa el desplazamiento erróneo $\delta p$ y $\delta \psi$, sino que converge suavemente de regreso hacia la trayectoria óptima del experto en el horizonte anticipado.
+   Por construcción, la acción relativa etiquetada compensa el desplazamiento $\delta p$ y $\delta \psi$ y apunta de regreso a la trayectoria del experto en el horizonte anticipado. Que la política aprendida reproduzca esa convergencia en lazo cerrado es una hipótesis a evaluar experimentalmente, no una consecuencia garantizada.
 
 4. **Perturbación del Estado Binario de Vuelo ($10\%$ flip):**
    Para robustecer el modelo en las fases críticas de despegue y aterrizaje y evitar que memorice el estado binario $s_t \in \{0, 1\}$ como un oráculo determinista:

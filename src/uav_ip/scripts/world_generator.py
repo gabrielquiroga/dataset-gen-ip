@@ -317,14 +317,18 @@ def check_circuit_transition_feasibility(
     landing: Optional[dict] = None,
     start_pose: Optional[dict] = None,
 ) -> tuple[bool, list[str]]:
-    """Verifica que las transiciones entre primitivas consecutivas sean fisicamente ejecutables.
+    """Filtro previo de dificultad geometrica para las transiciones entre primitivas consecutivas.
+
+    Nota de alcance: Este filtro descarta configuraciones geometricamente degeneradas antes de
+    simular, pero no sustituye la validacion dinamica post-vuelo (`validate_episode.py`).
 
     Comprueba:
       1. Progresion longitudinal monotona entre `post_i` y `pre_{i+1}` (`dx >= 1.0m`).
       2. Distancia horizontal minima de maniobra (`dxy >= 1.4m`).
       3. Pendiente vertical maxima (`|dz| / dxy <= 1.15` si interviene un `traverse`,
          o `<= 1.60` entre maniobras abiertas sobre postes).
-      4. Ausencia de interferencia entre puntos `pre`/`post` y otros landmarks vecinos.
+      4. Ausencia de interferencia entre puntos `pre`/`post` (y segmentos rectos de transicion)
+         y otros landmarks vecinos.
       5. Margen longitudinal suficiente desde `post_N` hasta la plataforma de aterrizaje.
 
     Returns:
@@ -336,6 +340,7 @@ def check_circuit_transition_feasibility(
 
     hoops_map = {str(h["id"]): h for h in hoops}
     if primitives:
+        # Mismo orden que ejecuta waypoint_controller.py y que exporta export_waypoints_yaml (x creciente)
         prims_sorted = sorted(
             primitives,
             key=lambda p: float(hoops_map.get(str(p.get("target")), {}).get("x", 0.0)),
@@ -378,7 +383,7 @@ def check_circuit_transition_feasibility(
 
         if dx < MIN_TRANSITION_DX_M:
             reasons.append(
-                f"transition_{i}_{i+1}_ longitudinal_overlap (dx={dx:.2f}m < {MIN_TRANSITION_DX_M:.2f}m)"
+                f"transition_{i}_{i+1}_longitudinal_overlap (dx={dx:.2f}m < {MIN_TRANSITION_DX_M:.2f}m)"
             )
         if dxy < MIN_TRANSITION_DXY_M:
             reasons.append(
@@ -394,6 +399,31 @@ def check_circuit_transition_feasibility(
             reasons.append(
                 f"transition_{i}_{i+1}_excessive_slope (slope={slope:.2f} > {max_slope:.2f})"
             )
+
+        # Verificar que el segmento recto post_i -> pre_{i+1} no atraviese un tercer landmark
+        for k_step in range(1, 15):
+            alpha = k_step / 15.0
+            sx_k = p_post[0] + alpha * dx
+            sy_k = p_post[1] + alpha * dy
+            sz_k = p_post[2] + alpha * dz
+            for h in hoops:
+                hid = str(h["id"])
+                if hid in (a_curr["target"], a_next["target"]):
+                    continue
+                hx, hy, hz = float(h["x"]), float(h["y"]), float(h["z"])
+                d_xy_seg = math.hypot(sx_k - hx, sy_k - hy)
+                if str(h.get("type", "gate")) == "pole":
+                    if d_xy_seg < 0.65 and sz_k < 3.2:
+                        reasons.append(
+                            f"transition_segment_{i}_{i+1}_intersects_pole_{hid} (dxy={d_xy_seg:.2f}m)"
+                        )
+                        break
+                else:
+                    if d_xy_seg < 0.85 and abs(sz_k - hz) < 1.00:
+                        reasons.append(
+                            f"transition_segment_{i}_{i+1}_intersects_gate_{hid} (dxy={d_xy_seg:.2f}m)"
+                        )
+                        break
 
     # 3. Verificar que ningun waypoint pre/post invada el volumen de otro landmark distinto
     for anc in anchors:
@@ -436,6 +466,7 @@ def generate_random_circuit(
     seed: Optional[int] = None,
     max_attempts: int = 100,
     primitives: Optional[list] = None,
+    start_pose: Optional[dict] = None,
 ) -> tuple[list[dict], dict]:
     """Genera poses aleatorias para los landmarks y la plataforma de aterrizaje.
 
@@ -521,8 +552,9 @@ def generate_random_circuit(
             "z": 0.05,
         }
 
+        eff_start_pose = start_pose if start_pose is not None else generate_start_pose(seed=seed)
         trans_ok, _ = check_circuit_transition_feasibility(
-            hoops, primitives=primitives, landing=landing
+            hoops, primitives=primitives, landing=landing, start_pose=eff_start_pose
         )
         if not trans_ok:
             continue
@@ -752,10 +784,10 @@ def main() -> None:
     primitives = cfg["primitives"]
 
     print(f"Generando circuito para '{args.task_id}' (seed={args.seed})...")
-    hoops, landing = generate_random_circuit(
-        landmarks_info, seed=args.seed, primitives=primitives
-    )
     start_pose = generate_start_pose(seed=args.seed)
+    hoops, landing = generate_random_circuit(
+        landmarks_info, seed=args.seed, primitives=primitives, start_pose=start_pose
+    )
 
     print(
         f"  Pose inicial aerea: X={start_pose['x']:5.2f}  Y={start_pose['y']:5.2f}  "

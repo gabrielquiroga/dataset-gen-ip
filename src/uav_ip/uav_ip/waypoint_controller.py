@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import sys
 from pathlib import Path
 from typing import Optional
 import yaml
@@ -45,6 +46,7 @@ class WaypointController(BasePilot):
         self.waypoints_ned = self.waypoints_gazebo
         self.current_wp = 0
         self.target_yaw = math.pi / 2.0
+        self.exit_code = 0
 
         self.timer = self.create_timer(0.02, self._control_loop)
 
@@ -327,14 +329,15 @@ class WaypointController(BasePilot):
                 wp_reached = (dist_3d < 0.50 or (along_track > 0.0 and cross_track < 0.65 and alt_err < 0.50))
             elif wp_type == "pre":
                 if wp_prim == "traverse":
-                    wp_reached = (dist_3d < 0.50 or (along_track > -0.15 and cross_track < 0.42 and alt_err < 0.42))
+                    wp_reached = (dist_3d < 0.50 or (along_track > -0.15 and cross_track < 0.35 and alt_err < 0.38))
                 else:
                     wp_reached = (dist_3d < 0.60 or (along_track > -0.15 and cross_track < 0.60 and alt_err < 0.50))
             elif wp_type == "center":
-                # Para traverse (ventana libre +-0.75m, radio UAV 0.28m -> ventana segura +-0.47m),
-                # exigir cross_track < 0.38m y alt_err < 0.42m impide falsos cruces por fuera del marco.
+                # Para traverse en square_gate (semiancho libre horizontal +-0.65m, vertical +-0.70m,
+                # envolvente UAV 0.28m -> ventana libre de colision +-0.37m x +-0.42m),
+                # exigir cross_track < 0.35m y alt_err < 0.40m mantiene el avance dentro de la ventana segura.
                 if wp_prim == "traverse":
-                    wp_reached = ((dist_3d < 0.45 or along_track >= -0.05) and cross_track < 0.38 and alt_err < 0.42)
+                    wp_reached = ((dist_3d < 0.45 or along_track >= -0.05) and cross_track < 0.35 and alt_err < 0.40)
                 else:
                     wp_reached = ((dist_3d < 0.65 or along_track >= -0.08) and cross_track < 0.65 and alt_err < 0.55)
             elif wp_type == "orbit_arc":
@@ -366,19 +369,21 @@ class WaypointController(BasePilot):
                 self.land_start_time = self.get_clock().now()
             elapsed = (self.get_clock().now() - self.land_start_time).nanoseconds / 1e9
             curr_enu = self.ned_to_gazebo(self.current_pos_ned)
-            landed_ok = (self.landed_detected and elapsed >= 3.0) or (curr_enu[2] < 0.22 and elapsed >= 4.0)
+            landed_ok = bool(self.landed_detected and curr_enu[2] <= 0.25 and elapsed >= 3.0)
             if landed_ok:
                 self.get_logger().info(
-                    f"Aterrizaje confirmado (landed_detected={self.landed_detected}, z={curr_enu[2]:.2f}m, t={elapsed:.1f}s)."
+                    f"Aterrizaje confirmado por detector PX4 (landed={self.landed_detected}, z={curr_enu[2]:.2f}m, t={elapsed:.1f}s)."
                 )
+                self.exit_code = 0
                 self.nav_state = 5
             elif elapsed >= 10.0:
-                self.get_logger().warning(
-                    f"Timeout de confirmación de aterrizaje ({elapsed:.1f}s, z={curr_enu[2]:.2f}m). Finalizando controlador."
+                self.get_logger().error(
+                    f"Timeout de confirmación de aterrizaje sin señal landed ({elapsed:.1f}s, z={curr_enu[2]:.2f}m). Saliendo con error."
                 )
+                self.exit_code = 1
                 self.nav_state = 5
         elif self.nav_state == 5:
-            raise SystemExit(0)
+            raise SystemExit(self.exit_code)
 
         self.publish_offboard_mode(use_velocity=(vel_ff_ned is not None))
         if self.nav_state < 4:
@@ -392,14 +397,18 @@ class WaypointController(BasePilot):
 def main(args=None):
     rclpy.init(args=args)
     node = WaypointController()
+    exit_code = 0
     try:
         rclpy.spin(node)
     except SystemExit as e:
-        node.get_logger().info(f"Nodo terminado con codigo {e.code}.")
+        exit_code = int(e.code) if isinstance(e.code, int) else (1 if e.code else 0)
+        node.get_logger().info(f"Nodo terminado con codigo {exit_code}.")
     finally:
         if rclpy.ok():
             node.destroy_node()
             rclpy.shutdown()
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

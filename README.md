@@ -262,7 +262,19 @@ datasets/
     └── ...
 ```
 
-### 2. Auditoría del Dataset y Partición Formal (`audit_dataset.py`)
+### 2. Validación Post-Vuelo de Episodios (`validate_episode.py`)
+Verificador geométrico y de grabación independiente del piloto. Lee el `.mcap` y `waypoints.yaml` de cada episodio y decide `accepted`/`rejected` con una lista de `rejection_reasons`:
+
+```bash
+# Reporte en terminal (no modifica archivos)
+python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --strict
+# Persistir resultados en cada episode_meta.json
+python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --update-meta
+```
+
+Es un **filtro conservador bajo hipótesis explícitas** (envolvente del UAV de 0,28 m, obstáculos estáticos con la geometría declarada, movimiento aproximadamente rectilíneo entre muestras). No es una certificación física de ausencia de colisiones. Por ahora se ejecuta offline: `data_collector.py` todavía marca el éxito por el código de salida del piloto, y la integración está planificada para la Fase 2. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
+
+### 3. Auditoría del Dataset y Partición Formal (`audit_dataset.py`)
 Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría para verificar la integridad del dataset y generar las particiones oficiales:
 
 ```bash
@@ -276,12 +288,12 @@ Este comando realiza las siguientes validaciones y exportaciones:
 - **Generación de particiones Train / Val / Held-Out:** Crea en `datasets/splits/`:
   - `train_tasks.json` ($\sim 70\%$ de las firmas semánticas).
   - `val_tasks.json` ($\sim 15\%$ de las firmas).
-  - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, garantizando **cero fugas de información** para evaluar generalización *in-context*).
+  - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, sin solapamiento de firmas semánticas con train/val, para evaluar generalización *in-context* sobre estructuras de tarea no vistas).
   - `dataset_summary.json` (resumen estadístico global).
 
 *(Para realizar un chequeo rápido en terminal sin generar archivos JSON, puedes agregar el flag `--no-export`).*
 
-### 3. Conversión por Lotes a Formato PyTorch Geometric
+### 4. Conversión por Lotes a Formato PyTorch Geometric
 Una vez validado el dataset, puedes convertir automáticamente todos los episodios de todas las tareas a grafos `HeteroData` (`data.pt`) utilizando el modo batch multiproceso de `bag_to_heterodata.py`:
 
 ```bash

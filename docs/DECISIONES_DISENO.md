@@ -36,7 +36,7 @@ La primera versión del pipeline intentó grabar directamente el tópico de ROS 
 - El dataset almacena exclusivamente **telemetría ligera** de PX4 (`vehicle_odometry`, `trajectory_setpoint`, `vehicle_local_position_v1`, `vehicle_status_v4`, `vehicle_command`, `vehicle_land_detected`) y los metadatos de poses de los landmarks (`waypoints.yaml`). Cada vuelo pesa **$< 5\text{ MB}$** (reducción $> 1.000\times$).
 - La simulación SITL se ejecuta con el modelo estándar **`gz_x500`** (sin sensor de profundidad), disparando el RTF a $\times1.0$ (o superior en modo *fast-forward*).
 - Las nubes de puntos de 2048 puntos se generan **sintéticamente bajo demanda** (al vuelo o en el script `bag_to_heterodata.py`) mediante el generador modular `synthetic_lidar.py`.
-- **Segmentación perfecta garantizada:** La observación privilegiada elimina por construcción el suelo, paredes, el propio chasis del dron y distractores, entregando exactamente los objetos de interés tal como exige Instant Policy (Apéndice E).
+- **Segmentación por construcción:** La observación privilegiada no incluye el suelo, paredes, el propio chasis del dron ni distractores, y entrega solo los objetos de interés tal como exige Instant Policy (Apéndice E).
 
 ---
 
@@ -88,7 +88,7 @@ El firmware PX4 cuenta con un mecanismo estricto de protección:
 Se diseñó una máquina de estados determinista en `base_pilot.py`:
 1. **Estado `nav_state = 0` (Calentamiento):** El nodo se suscribe a `/fmu/out/vehicle_local_position_v1` y publica 50 setpoints continuos a 50 Hz fijados en la posición actual de spawn en reposo antes de solicitar cualquier cambio de modo.
 2. **Estado `nav_state = 1` (Armado):** Una vez verificado el flujo estable de 50 mensajes, se comanda el modo Offboard (`VEHICLE_CMD_DO_SET_MODE`) y se solicita el armado forzado (`VEHICLE_CMD_COMPONENT_ARM_DISARM`).
-3. Esto garantiza un 100% de éxito en la transición sin abortos de pre-vuelo ni cuelgues del planificador.
+3. En los episodios grabados hasta ahora, esto eliminó los abortos de pre-vuelo y los cuelgues del planificador observados con la configuración anterior (evidencia empírica sobre pocos episodios, no una garantía).
 
 ---
 
@@ -232,7 +232,7 @@ En la configuración de pasillo 1D con 3 landmarks:
 * **Resolución Definitiva (Octubre 2026):**
   * Desacoplamiento total entre el entorno base de Gazebo (física, iluminación, plano de tierra, plataforma de salida y plataforma de llegada) y los landmarks.
   * Implementación de constructores modulares de XML en Python (`_create_gate_element` y `_create_pole_element`) que inyectan dinámicamente $N$ elementos en tiempo de ejecución.
-  * Reposicionamiento automático de la plataforma de aterrizaje a $X_N + \Delta X_{\text{land}}$, garantizando que cualquier circuito de longitud acotada $N \in [2, 5]$ sea físicamente factible.
+  * Reposicionamiento automático de la plataforma de aterrizaje a $X_N + \Delta X_{\text{land}}$, para dar margen longitudinal de aterrizaje a circuitos de longitud $N \in [2, 5]$. La factibilidad real se comprueba después del vuelo con `validate_episode.py`.
   * Catálogo combinatorio dinámico balanceado e intercalado en `task_generator.py`, garantizando muestreo sin reemplazo estricto (cero duplicados) a través de todas las longitudes.
 
 ---
@@ -291,7 +291,7 @@ Aprovechando la naturaleza analítica de nuestro generador LiDAR privilegiado y 
    * Se evalúa la nube LiDAR analítica $\tilde{P}_{\text{scene}}^t$ desde la pose perturbada $\tilde{T}_{WE}^t$ en el marco Horizontal FLU.
    * Se calculan las acciones relativas dirigidas hacia los hitos nominales futuros:
      $$\tilde{T}_{EA}^{(t,k)} = (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} \in SE(3)$$
-   * Esta transformación garantiza que la acción predicha guíe convergente y suavemente al dron de regreso a la trayectoria nominal de referencia.
+   * Por construcción, la acción etiquetada apunta de regreso a la trayectoria nominal (identidad en $SE(3)$ verificada en `test_tube_augmentation_se3_convergence`). Que la política aprendida reproduzca esa convergencia en lazo cerrado es una hipótesis a evaluar.
 3. **Perturbación del Estado Binario (10% flip):**
    * En un 10% de las muestras aumentadas se invierte el estado de vuelo ($\tilde{s}_t = 1 - s_t$), forzando a la red a discernir la fase de vuelo a partir de la proximidad geométrica al suelo y landmarks, evitando atajos espurios basados en el bit discreto.
 4. **Almacenamiento Separado en `data['aug']`:**
@@ -337,28 +337,71 @@ En versiones tempranas existían copias independientes de archivos como `synthet
 ## 16. Verificación Física Independiente Post-Vuelo, Tolerancias de Apertura y Factibilidad de Transiciones
 
 ### 16.1 El Problema de Acoplar el Éxito del Episodio al Código de Salida del Controlador
-En la versión previa del pipeline, `data_collector.py` etiquetaba un episodio con `"status": "success"` únicamente si el proceso `waypoint_controller` terminaba con `returncode == 0`. Una revisión técnica exhaustiva identificó cuatro riesgos críticos en ese diseño:
-1. **Falsos cruces de puerta (`traverse`):** El criterio de avance del waypoint `center` en `waypoint_controller.py` permitía `(along_track > -0.10 and cross_track < 1.4 and alt_err < 0.8)`. Dado que la ventana interior libre de una puerta cuadrada mide $1.5\text{ m} \times 1.5\text{ m}$ (semiancho libre $\pm 0.75\text{ m}$, semiancho exterior del marco $\pm 0.85\text{ m}$), una desviación lateral de $0.85\text{–}1.39\text{ m}$ rodeaba la puerta por fuera y aun así era marcada como alcanzada por el piloto.
-2. **Ausencia de verificación de colisiones:** Ni Gazebo ni el piloto verificaban si el radio físico de los rotores del cuadricóptero `gz_x500` ($R_{\text{UAV}} \approx 0.28\text{ m}$) intersectaba las barras del aro o el cilindro de un poste.
-3. **Finalización de aterrizaje por temporizador fijo:** El piloto salía con `SystemExit(0)` exactamente $4.0\text{ s}$ después de enviar `VEHICLE_CMD_NAV_LAND`, sin comprobar `/fmu/out/vehicle_land_detected` ni la altura final real sobre la plataforma.
-4. **Saltos de offset en reloj `Timesync` de XRCE-DDS:** En PX4 SITL conectado mediante `MicroXRCEAgent`, el cliente `uxrce_dds_client` recalibra periódicamente el offset entre el reloj de arranque de PX4 y el reloj UNIX del host. En $1\text{–}4$ muestras aisladas por episodio (de $\sim 3500$ mensajes a $125\text{ Hz}$), `VehicleOdometry.timestamp` cae transitoriamente al tiempo crudo de boot ($\sim 60\text{ s}$) o salta $\sim 280\text{ ms}$, mientras que el reloj de grabación MCAP (`log_time`) avanza monótonamente a $\Delta t = 8.0\text{ ms}$.
+En la versión previa del pipeline, `data_collector.py` etiquetaba un episodio con `"status": "success"` únicamente si el proceso `waypoint_controller` terminaba con `returncode == 0`. La primera revisión técnica identificó cuatro riesgos:
+1. **Falsos cruces de puerta (`traverse`):** El avance del waypoint `center` aceptaba `cross_track < 1.4 m`. La puerta cuadrada tiene barras de 0,10 m centradas en y = ±0,70 m y z = ±0,75 m, por lo que la luz libre es ±0,65 m (Y) × ±0,70 m (Z). Con ese umbral, un dron que pasara a 1,1 m del centro esquivaba la puerta por fuera y el piloto lo daba por cruzada.
+2. **Ausencia de verificación de colisiones:** Ni Gazebo ni el piloto comprobaban la distancia del vehículo a las barras o postes.
+3. **Aterrizaje por temporizador fijo:** El piloto salía con `SystemExit(0)` 4,0 s después de `VEHICLE_CMD_NAV_LAND`, sin consultar `/fmu/out/vehicle_land_detected`.
+4. **Saltos de offset `Timesync` en XRCE-DDS:** En 1–4 muestras por episodio, `VehicleOdometry.timestamp` cae al tiempo de arranque de PX4 o salta un escalón, mientras `log_time` del MCAP avanza normalmente.
 
-### 16.2 Decisión Adoptada: Validador Físico Analítico Independiente (`validate_episode.py`)
-En lugar de instrumentar sensores de contacto en Gazebo (*contact plugins* en XML SDF y puentes adicionales `ros_gz_bridge`), los cuales dependen de que el motor de colisiones discreto no sufra *tunneling* y no detectan errores semánticos (como pasar por fuera de un aro o por el flanco opuesto de un poste), se diseñó el validador independiente [`src/uav_ip/uav_ip/validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py):
-1. **Separación de Estados en `episode_meta.json`:**
-   * `pilot_exit_code`: Código de retorno del proceso `waypoint_controller`.
-   * `recording_status` (`"valid"` / `"invalid"`): Integridad del archivo `.mcap`, presencia y cantidad mínima de mensajes en `/fmu/out/vehicle_odometry`, ausencia de `NaN`/cuaterniones degenerados, continuidad temporal ($\Delta t_{\max} \le 0.60\text{ s}$) y **cero resets del estimador EKF2 en vuelo** ($\Delta\text{reset\_counter} = 0$ durante la ventana aérea).
-   * `mission_status` (`"valid"` / `"invalid"`): Cumplimiento geométrico de despegue, primitivas, margen libre de colisión contra todos los obstáculos y aterrizaje sobre la plataforma.
-   * `validation_status` (`"accepted"` / `"rejected"`): Aceptado sí y solo si `recording_status == "valid"` y `mission_status == "valid"`, acompañado de `rejection_reasons`, `primitive_validation` y `validation_metrics`.
-2. **Geometría Analítica Exacta de Colisión y Primitivas a $125\text{ Hz}$:**
-   * Como los landmarks son cuerpos rígidos estáticos de dimensiones conocidas exactamente en `waypoints.yaml`, la distancia mínima desde la trayectoria 3D $\mathbf{p}(t)$ a las 4 cajas AABB de cada `square_gate`, al toroide $(R=0.75\text{ m}, r=0.05\text{ m})$ de cada `circular_gate` y al cilindro $(r=0.10\text{ m}, h=3.0\text{ m})$ de cada `pole` se evalúa analíticamente con precisión milimétrica en todos los instantes de odometría ($125\text{ Hz}$, espaciado espacial $\sim 1\text{ cm}$), exigiendo $d_{\text{min}} \ge R_{\text{UAV}} = 0.28\text{ m}$.
-   * Para **`traverse`**: se interpola la intersección exacta de la trayectoria con el plano local $x_{\text{loc}} = 0$ del aro y se exige $|y_{\text{cross}}| \le 0.58\text{ m}$, $|z_{\text{cross}}| \le 0.58\text{ m}$ (dentro de la abertura libre de $\pm 0.70\text{ m}$).
-   * Para **`slalom`**: se verifica el cruce de $x_{\text{loc}} = 0$ por el semiplano lateral correcto en el marco FLU del poste ($y_{\text{cross}} \in [+0.45, +2.60]\text{ m}$ para `left`, $y_{\text{cross}} \in [-2.60, -0.45]\text{ m}$ para `right`).
-   * Para **`overfly`**: se verifica el paso sobre el poste con $z_{\text{cross}} \ge 3.30\text{ m}$ ($0.30\text{ m}$ por encima de la cima física de $3.0\text{ m}$) y alineación lateral $|y_{\text{cross}}| \le 0.85\text{ m}$.
-   * Para **`orbit`**: se mide la progresión angular antihoraria acumulada $\Delta\theta_{\text{ccw}} = \max_t (\theta(t) - \min_{s \le t} \theta(s))$ alrededor del eje del poste, exigiendo $\Delta\theta_{\text{ccw}} \ge 210^\circ$ y error medio de guiñada centrípeta $\le 45^\circ$.
-3. **Reconstrucción Monótona del Reloj de Simulación (`reconstruct_simulation_clock`):**
-   * Cuando un paso $\Delta t_{\text{px4}} = t_{\text{px4}}[i] - t_{\text{px4}}[i-1]$ difiere del paso del grabador $\Delta t_{\text{bag}}$ en más de $50\text{ ms}$ mientras $\Delta t_{\text{bag}} \in [0, 100]\text{ ms}$ (firma inequívoca de actualización de `time_offset` en `uxrce_dds_client`), el incremento anómalo se sustituye por $\Delta t_{\text{bag}}$, preservando el reloj físico de PX4 libre de saltos de sincronización.
-4. **Endurecimiento del Controlador y Factibilidad de Transiciones:**
-   * En `waypoint_controller.py`, el cruce `center` de una primitiva `traverse` exige ahora `cross_track < 0.38 m` y `alt_err < 0.42 m`, impidiendo que el piloto dé por superada una puerta si no está alineado con su ventana central, y el estado `nav_state == 4` aguarda confirmación de `/fmu/out/vehicle_land_detected` (`landed == True`) o $z_{\text{ENU}} < 0.22\text{ m}$.
-   * En `world_generator.py`, `check_circuit_transition_feasibility` verifica antes de aceptar un mundo aleatorio que todo par de primitivas consecutivas cumpla progresión longitudinal $\Delta x = x_{\text{pre}, i+1} - x_{\text{post}, i} \ge 1.0\text{ m}$, distancia horizontal $d_{xy} \ge 1.4\text{ m}$ y pendiente vertical $|\Delta z| / d_{xy} \le 1.15$ cuando interviene un `traverse` ($\le 1.60$ entre postes abiertos).
+La segunda revisión (`docs/feedback/respuesta.md`) encontró que la primera implementación todavía permitía aceptaciones incorrectas. La sección siguiente describe el estado **después de la Fase 1.1**. La trazabilidad completa (riesgo · solución · hipótesis · evidencia · limitación · condición de revisión) está en [`JUSTIFICACION_REVISION_TECNICA.md`](JUSTIFICACION_REVISION_TECNICA.md).
 
+### 16.2 Decisión Adoptada: Validador Geométrico Conservador Post-Vuelo (`validate_episode.py`)
+
+Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semánticas (pasar por fuera de un aro, tomar el flanco equivocado de un poste) y agregan carga al simulador. En su lugar se implementó [`validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py), un **filtro conservador bajo hipótesis explícitas**. No es una certificación física de ausencia de colisiones.
+
+1. **Estados en `episode_meta.json`:**
+   * `pilot_exit_code`: código de retorno del piloto.
+   * `recording_status`: el `.mcap` tiene *magic* inicial y final y `Footer`, y no presenta:
+     * NaN ni cuaterniones degenerados,
+     * marcos distintos de NED (`pose_frame`/`velocity_frame == 1`),
+     * retrocesos de reloj no explicados por `Timesync`,
+     * huecos de más de 0,15 s ni pasos de más de 0,35 m entre muestras,
+     * resets de EKF2 en vuelo.
+   * `mission_status`: despegue, primitivas en el orden declarado, distancia a obstáculos y aterrizaje.
+   * `validation_status`: `accepted` si y solo si `recording_status` y `mission_status` son `valid`.
+2. **Envolvente y geometría** (constantes en el módulo):
+
+   | Constante | Valor |
+   |---|---|
+   | `UAV_PHYSICAL_RADIUS_XY` | 0,23 m |
+   | `UAV_SAFETY_MARGIN_XY` | 0,05 m |
+   | `UAV_COLLISION_RADIUS_XY` | 0,28 m |
+
+   La distancia se evalúa sobre la trayectoria **subdividida a ≤ 0,02 m** contra:
+   * las 4 cajas de cada `square_gate`,
+   * el anillo de cada `circular_gate`, restando la sagita de 0,0144 m del polígono de 16 segmentos,
+   * el cilindro (r = 0,10 m, h = 3,0 m) de cada `pole`.
+
+   > **Pendiente:** el radio físico de 0,23 m no está verificado contra `x500_base/model.sdf`. Con hélices de 10″ en 500 mm entre ejes de motores, la envolvente de los discos podría rondar 0,38 m. Ver `JUSTIFICACION_REVISION_TECNICA.md` §4.2.
+3. **Criterios por primitiva:**
+   * **`traverse`:** cruce del plano x_loc = 0 con |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada) o r ≤ 0,4056 m (puerta circular). Son la luz libre menos `UAV_COLLISION_RADIUS_XY`.
+   * **`slalom`:** cruce por el flanco pedido con y_cross ∈ [0,45; 2,60] m en el marco del poste.
+   * **`overfly`:** z ≥ 3,30 m sobre el poste y |y| ≤ 0,85 m.
+   * **`orbit`:** barrido antihorario ≥ 240° y error medio de guiñada centrípeta ≤ 45°.
+   * **Orden:** los eventos de las primitivas deben ser estrictamente crecientes en el tiempo.
+4. **Aterrizaje:**
+   * Debe haber mensajes de `VehicleLandDetected`, y el último no puede tener más de 2,0 s de antigüedad.
+   * `landed == True` en los dos últimos mensajes; `ground_contact` no alcanza.
+   * En las últimas 25 muestras (≈ 0,2 s): error XY ≤ 0,75 m, z ≤ 0,25 m y velocidad ≤ 0,25 m/s.
+5. **Reloj:**
+   * Se usa `timestamp_sample`.
+   * Solo se reparan dos patrones verificados de `Timesync`: una muestra aislada con tiempo de arranque entre muestras con tiempo UNIX, o un escalón que cierra un retraso acumulado de al menos 0,15 s.
+   * Los huecos hacia adelante se conservan y los retrocesos no explicados provocan el rechazo.
+6. **Lectura de bags:** se prioriza `rosbags`. Si no está disponible, se usa el parser nativo MCAP/CDR (offsets verificados con un MCAP sintético y contra `rosbags` sobre un bag real).
+
+### 16.3 Endurecimiento del Piloto y del Generador
+
+* **`waypoint_controller.py`:**
+  * En `traverse`, el paso por `center` exige `cross_track < 0.35 m` y `alt_err < 0.40 m`, dentro de la ventana de 0,37 × 0,42 m.
+  * El aterrizaje requiere `landed == True`, z ≤ 0,25 m y al menos 3 s; a los 10 s sin confirmación termina con código 1, que `main()` propaga.
+* **`world_generator.py`:** `check_circuit_transition_feasibility` recibe `start_pose` y comprueba, para cada transición:
+  * Δx ≥ 1,0 m y d_xy ≥ 1,4 m;
+  * pendiente ≤ 1,15 si interviene un `traverse` (≤ 1,60 entre postes);
+  * que los tramos rectos no se acerquen a landmarks de terceros.
+
+  Es un filtro heurístico previo; no reemplaza la validación posterior al vuelo.
+
+### 16.4 Alcance Actual
+
+* El validador se ejecuta **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]`). `data_collector.py` todavía usa `returncode`; la integración es la **Fase 2**.
+* Los 12 episodios locales (`task_0000`–`task_0003`) son aceptados por el validador actual. Es una muestra pequeña y **no** constituye una estimación de la tasa de éxito.

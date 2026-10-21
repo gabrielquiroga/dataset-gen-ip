@@ -60,7 +60,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 | **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Muestreo combinatorio sin reemplazo, firma semántica limpia, `slalom` bilateral (`left`/`right`) y soporte para `circular_gate`. |
 | **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos, validación de factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`), alineación de `plataforma_llegada` y variación de `start_pose`. |
 | **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro, suscripción a `/fmu/out/vehicle_land_detected` y conversión base NED/ENU. |
-| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de ventana estrictas por primitiva (`cross_track < 0.38m` en `traverse`) y confirmación real de aterrizaje. |
+| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de paso dentro de la ventana segura (`cross_track < 0.35m`, `alt_err < 0.40m` en `traverse`) y aterrizaje confirmado por `landed` del detector de PX4 (código 1 si vence el plazo). |
 | **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Conversión consistente entre coordenadas Gazebo ENU y PX4 NED en el cálculo de rumbo. |
 | **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial. |
 | **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador físico, geométrico y temporal independiente (parser nativo MCAP + CDR sin dependencias, clearance 3D analítico contra AABB/toroide/cilindro, verificación de primitivas y reconstrucción monótona del reloj ante saltos `Timesync`). |
@@ -75,7 +75,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 ## 3. Plan de Hitos de Implementación (Paso a Paso)
 
 ### Hito 0: Pipeline Core E2E y Validación de Vuelo Base — [COMPLETADO]
-- [x] Modelo de simulación ligero `gz_x500` (sin cámara física de profundidad), garantizando $\text{RTF} \ge 1.0\times$.
+- [x] Modelo de simulación ligero `gz_x500` (sin cámara física de profundidad), con $\text{RTF} \ge 1.0\times$ observado en la máquina de desarrollo.
 - [x] Transición de armado seguro a Offboard en `base_pilot.py` (50 setpoints previos a 50 Hz).
 - [x] Generador base de LiDAR privilegiado `synthetic_lidar.py` (2048 puntos, FPS, escala $s=0.1$).
 - [x] Grabación compacta en rosbags MCAP ($< 5\text{ MB}$ por demo frente a los 6 GB originales).
@@ -205,34 +205,71 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 ---
 
-### Hito 2.5: Blindaje Pre-Campaña contra Falsos Positivos y Auditoría Física (Revisión Experta) — [EN PROGRESO: FASE 1 COMPLETADA]
+### Hito 2.5: Blindaje Pre-Campaña contra Falsos Positivos (Revisión Experta) — [EN PROGRESO: FASE 1 Y 1.1 COMPLETADAS]
 
-*Objetivo: Eliminar cualquier posibilidad de aceptar vuelos colisionados, cruces por fuera del aro, aterrizajes incompletos o grabaciones corruptas antes de lanzar la recolección masiva de demostraciones.*
+*Objetivo: reducir la probabilidad de aceptar vuelos con colisión, cruces por fuera del aro, aterrizajes incompletos o grabaciones corruptas, con criterios explícitos y verificables, antes de la recolección masiva. El validador es un filtro conservador bajo hipótesis declaradas, no una certificación física (ver [`JUSTIFICACION_REVISION_TECNICA.md`](JUSTIFICACION_REVISION_TECNICA.md)).*
 
-#### Fase 1: Validador Físico Independiente, Endurecimiento del Piloto y Factibilidad de Transiciones — [x] COMPLETADO
-- [x] **Tarea 2.5.1: Validador Independiente de Episodio (`src/uav_ip/uav_ip/validate_episode.py`):**
-  * Parser nativo MCAP + CDR de cero dependencias externas para leer `/fmu/out/vehicle_odometry`, `/fmu/out/vehicle_local_position_v1`, `/fmu/out/vehicle_land_detected`, `/fmu/out/vehicle_status_v4` y `/fmu/in/trajectory_setpoint`.
-  * Reconstrucción monótona del reloj de simulación (`reconstruct_simulation_clock`) ante recalibraciones de `time_offset` en `uxrce_dds_client` (`Timesync`).
-  * Cálculo analítico exacto de distancia libre 3D ($d_{\text{min}} \ge 0.28\text{ m}$) contra las 4 barras AABB de `square_gate`, el toroide de `circular_gate` y el cilindro de `pole`.
-  * Verificación geométrica independiente por primitiva (`traverse` con interpolación en $x_{\text{loc}}=0$, `slalom` por flanco `left`/`right`, `overfly` sobre $z \ge 3.30\text{ m}$ y `orbit` con barrido $\Delta\theta_{\text{ccw}} \ge 210^\circ$ y guiñada centrípeta).
-  * Separación explícita en `episode_meta.json` entre `pilot_exit_code`, `recording_status`, `mission_status`, `validation_status` (`"accepted"` / `"rejected"`), `rejection_reasons` y `validation_metrics`.
-- [x] **Tarea 2.5.2: Endurecimiento de Tolerancias y Confirmación de Aterrizaje (`waypoint_controller.py`, `base_pilot.py`):**
-  * Reducción del umbral de cruce `center` en `traverse` de `cross_track < 1.4m` a `cross_track < 0.38m` y `alt_err < 0.42m`.
-  * Suscripción a `/fmu/out/vehicle_land_detected` en `BasePilot` y espera activa de confirmación de toque de tierra (`landed == True` o $z_{\text{ENU}} < 0.22\text{ m}$) en `nav_state == 4`.
-- [x] **Tarea 2.5.3: Factibilidad Geométrica de Transiciones (`world_generator.py`):**
-  * Implementación de `check_circuit_transition_feasibility` verificando avance longitudinal $\Delta x \ge 1.0\text{ m}$, distancia horizontal $d_{xy} \ge 1.4\text{ m}$, pendiente máxima $|\Delta z|/d_{xy} \le 1.15$ con `traverse` ($\le 1.60$ entre postes abiertos) y ausencia de invasión de waypoints vecinos.
+#### Fase 1: Validador Independiente, Endurecimiento del Piloto y Factibilidad de Transiciones — [x] COMPLETADO (corregido en Fase 1.1)
+- [x] **Tarea 2.5.1: Validador de episodio (`src/uav_ip/uav_ip/validate_episode.py`):** estados separados (`pilot_exit_code`, `recording_status`, `mission_status`, `validation_status`), `rejection_reasons` y métricas, verificación geométrica por primitiva y distancia a todos los landmarks.
+- [x] **Tarea 2.5.2: Tolerancias del piloto y confirmación de aterrizaje (`waypoint_controller.py`, `base_pilot.py`).**
+- [x] **Tarea 2.5.3: Factibilidad de transiciones (`world_generator.py`).**
 
-#### Fase 2: Orquestación Resiliente con Reintentos, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
-- [ ] **Tarea 2.5.4: Integración de Validación y Reintentos con Nueva Semilla en `data_collector.py`:**
-  * Espera de *topics* activos antes de lanzar el piloto, invocación automática de `validate_episode_directory(..., update_meta=True)` al cerrar el bag y bucle de hasta `MAX_EPISODE_ATTEMPTS = 3` con semilla derivada si `validation_status != "accepted"`.
-- [ ] **Tarea 2.5.5: Filtrado Estricto y Re-muestreo Uniforme en Tiempo en `bag_to_heterodata.py`:**
-  * Ignorar episodios con `validation_status == "rejected"`, usar `reconstruct_simulation_clock` e interpolar uniformemente en el tiempo ($\Delta t = 0.10\text{ s}$, $10\text{ Hz}$, `SLERP`/interpolación angular en guiñada) en lugar de diezmado por índice fijo (`[::10]`), además de verificar ausencia de colisión en las poses perturbadas del *Tube Augmentation*.
-- [ ] **Tarea 2.5.6: Auditoría en 3 Capas (`audit_dataset.py`):**
-  * Incorporar Capa 2 (auditoría de vuelos crudos, tasas de aceptación/rechazo y métricas cinemáticas) y Capa 3 (auditoría de tensores `.pt`: finitud, formas, ortogonalidad $SO(3)$ y horizonte $T=8$), exigiendo $\ge 3$ episodios `"accepted"` por tarea antes de incluirla en los splits.
+#### Fase 1.1: Correcciones por la Segunda Revisión (`docs/feedback/respuesta.md`) — [x] COMPLETADO
+- [x] **Aterrizaje:**
+  * El validador exige mensajes de `VehicleLandDetected` con una antigüedad de hasta 2 s y `landed == True` en los dos últimos (nunca solo `ground_contact`).
+  * Sobre la ventana final (25 muestras) exige error XY ≤ 0,75 m, z ≤ 0,25 m y velocidad ≤ 0,25 m/s.
+  * El piloto termina con código 1 si se vence el plazo de 10 s, y `main()` propaga ese código.
+- [x] **Envolvente única:**
+  * `UAV_COLLISION_RADIUS_XY = 0.23 + 0.05 = 0.28 m`.
+  * Ventana de `traverse`: |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada), r ≤ 0,4056 m (puerta circular).
+  * Piloto: `cross_track < 0.35 m`, `alt_err < 0.40 m`.
+- [x] **Colisiones entre muestras:**
+  * Subdivisión de segmentos a ≤ 0,02 m.
+  * Hueco temporal máximo de 0,15 s y paso espacial máximo de 0,35 m.
+  * Sagita del anillo poligonal de 16 segmentos.
+- [x] **Lectura de bags:**
+  * Se prioriza `rosbags`.
+  * Verificación de *magic* inicial y final y `Footer` (los MCAP truncados se rechazan).
+  * Offsets CDR corregidos (`vx` 56, `heading` 104, `at_rest` 23, `arming_state` 28, `nav_state` 45, `failsafe` 62).
+- [x] **Reloj:**
+  * `timestamp_sample`.
+  * Solo se reparan los patrones verificados de `Timesync`.
+  * Los huecos hacia adelante se conservan y los retrocesos no explicados provocan el rechazo.
+- [x] **Condiciones exigidas:**
+  * Orden temporal de las primitivas.
+  * Error medio de guiñada ≤ 45° y barrido ≥ 240° en `orbit`.
+  * `pose_frame`/`velocity_frame == 1` y *flags* de validez.
+- [x] **`world_generator.py`:**
+  * `start_pose` se genera antes del circuito y se pasa al chequeo de factibilidad.
+  * Los tramos rectos de transición se comparan contra landmarks de terceros.
+- [x] **Tests:**
+  * `test_validation_clock.py`: los tests de reloj propuestos por el experto.
+  * Batería de 9 falsos positivos (`respuesta.md` §6.D).
+  * MCAP binario sintético (offsets e integridad).
+  * Comparación `rosbags` vs parser nativo sobre un bag real.
+  * `pytest.skip` explícito si `datasets/` no existe.
+- [ ] **Pendiente antes de la campaña:** verificar `UAV_PHYSICAL_RADIUS_XY = 0.23 m` contra `x500_base/model.sdf`. La envolvente de los discos de hélice podría rondar 0,38 m (`JUSTIFICACION_REVISION_TECNICA.md` §4.2).
+
+#### Fase 2: Integración en la Recolección, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
+- [ ] **Tarea 2.5.4: Integrar el validador en `data_collector.py`:**
+  * Esperar *topics* activos antes de lanzar el piloto e invocar `validate_episode_directory(..., update_meta=True)` al cerrar el bag.
+  * **Conservar los intentos fallidos** con sus `rejection_reasons`.
+  * Si hay reintentos con semilla derivada, registrarlos como intentos nuevos y no sobrescribir el original.
+- [ ] **Tarea 2.5.5: Filtrado y re-muestreo en `bag_to_heterodata.py`:**
+  * Ignorar los episodios `rejected` y usar el reloj reconstruido.
+  * Interpolar uniformemente en el tiempo (10 Hz) en lugar de diezmar por índice.
+  * Verificar la distancia a obstáculos en las poses perturbadas del *Tube Augmentation*.
+- [ ] **Tarea 2.5.6: Auditoría en 3 capas (`audit_dataset.py`):**
+  * Vuelos crudos: tasas de aceptación y rechazo por causa.
+  * Tensores `.pt`: finitud, formas, ortogonalidad $SO(3)$ y horizonte $T=8$.
+  * Mínimo de episodios aceptados por tarea antes de incluirla en los *splits*.
+- [ ] **Congelar los umbrales del validador** (con versión registrada en `episode_meta.json`) antes de medir el lote de evaluación.
 
 #### Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [ ] PENDIENTE
-- [ ] **Tarea 2.5.7: Ejecución y Verificación Estadística del Piloto Pre-Campaña:**
-  * Ejecutar campaña piloto de 50 episodios, verificar tasa de aceptación primaria $\ge 85\%$, $100\%$ de episodios aceptados tras reintentos, $0$ colisiones y $0$ violaciones en las 3 capas de `audit_dataset.py`.
+- [ ] **Tarea 2.5.7: Ejecución y reporte del piloto pre-campaña:**
+  * Reportar la **tasa de aceptación por intento original**, por separado de la tasa tras reintentos. Reintentar con otra semilla desplaza la distribución hacia escenarios que el experto resuelve, así que no debe presentarse como éxito sobre los escenarios pedidos.
+  * Inspeccionar manualmente una muestra de episodios aceptados y rechazados.
+  * Objetivo orientativo: aceptación primaria ≥ 85 %.
 
 ---
 
