@@ -298,3 +298,178 @@ def test_heterodata_load_node_types_compatibility():
     assert "scene" in data.node_types
     assert "aug" in data.node_types
 
+
+def _make_synthetic_telemetry(pos_enu_arr: np.ndarray, yaw_enu_arr: np.ndarray, dt_s: float = 0.02):
+    """Construye telemetria sintetica en formato PX4 NED para pruebas unitarias de validate_episode."""
+    N = len(pos_enu_arr)
+    odom = []
+    vel_enu = np.zeros_like(pos_enu_arr)
+    if N > 1:
+        vel_enu[:-1] = np.diff(pos_enu_arr, axis=0) / dt_s
+    for i in range(N):
+        t_us = int((100.0 + i * dt_s) * 1e6)
+        t_ns = t_us * 1000
+        # ENU -> NED: [N, E, D] = [y, x, -z]
+        p_ned = [float(pos_enu_arr[i, 1]), float(pos_enu_arr[i, 0]), float(-pos_enu_arr[i, 2])]
+        v_ned = [float(vel_enu[i, 1]), float(vel_enu[i, 0]), float(-vel_enu[i, 2])]
+        yaw_ned = math.pi / 2.0 - float(yaw_enu_arr[i])
+        q_ned = [math.cos(yaw_ned * 0.5), 0.0, 0.0, math.sin(yaw_ned * 0.5)]
+        odom.append({
+            "timestamp": t_ns,
+            "timestamp_us": t_us,
+            "position": p_ned,
+            "q": q_ned,
+            "velocity": v_ned,
+            "reset_counter": 0,
+        })
+    return {
+        "odometry": odom,
+        "local_pos": [],
+        "land_detected": [{"timestamp": int((100.0 + N * dt_s) * 1e9), "landed": True, "ground_contact": True}],
+        "vehicle_status": [],
+        "setpoints": [],
+    }
+
+
+def test_validate_episode_physical_geometry_and_failure_modes():
+    """
+    Valida Fase 1 (Tarea 1.1): verificador independiente de colisiones, primitivas,
+    aterrizaje e integridad temporal de grabacion.
+    """
+    from uav_ip.validate_episode import validate_episode_data, reconstruct_simulation_clock
+
+    waypoints_cfg = {
+        "landmarks": [
+            {"id": "landmark_1", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0},
+            {"id": "landmark_2", "type": "pole", "x": 10.0, "y": 0.0, "z": 1.5, "yaw": 0.0},
+            {"id": "landmark_3", "type": "pole", "x": 15.0, "y": 0.0, "z": 1.5, "yaw": 0.0},
+        ],
+        "primitives": [
+            {"type": "traverse", "target": "landmark_1"},
+            {"type": "slalom", "target": "landmark_2", "side": "left"},
+            {"type": "overfly", "target": "landmark_3"},
+        ],
+        "landing": {"x": 20.0, "y": 0.0, "z": 0.05},
+    }
+
+    # 1. Construir vuelo valido que despega, cruza gate_1 centrado, hace slalom izquierdo (+Y) en pole_2,
+    #    sobrevuela pole_3 a Z=4.0m, y aterriza suavemente en (20, 0, 0.08).
+    N = 400
+    x_arr = np.linspace(0.0, 20.0, N)
+    y_arr = 1.5 * np.exp(-0.5 * ((x_arr - 10.0) / 1.2) ** 2)  # +1.5m en X=10 (left flank)
+    z_arr = np.full(N, 1.5)
+    z_arr[:15] = np.linspace(0.15, 1.5, 15)
+    # Ascenso para overfly en X=15 hasta Z=4.0m
+    z_arr += 2.5 * np.exp(-0.5 * ((x_arr - 15.0) / 1.3) ** 2)
+    # Descenso final a plataforma en X=20
+    z_arr[-25:] = np.linspace(1.5, 0.08, 25)
+    z_arr[-5:] = 0.08
+    x_arr[-5:] = 20.0
+    y_arr[-5:] = 0.0
+
+    pos_valid = np.column_stack([x_arr, y_arr, z_arr])
+    yaw_valid = np.zeros(N)
+    tel_valid = _make_synthetic_telemetry(pos_valid, yaw_valid, dt_s=0.05)
+
+    res_valid = validate_episode_data(tel_valid, waypoints_cfg, pilot_exit_code=0)
+    assert res_valid["validation_status"] == "accepted", f"Reasons: {res_valid['rejection_reasons']}"
+    assert res_valid["recording_status"] == "valid"
+    assert res_valid["mission_status"] == "valid"
+
+    # 2. Falso positivo historico del controlador: bypass lateral del gate a Y=1.10m
+    #    (antes aceptado porque cross_track < 1.4m, pero fisicamente fuera de la ventana +-0.75m)
+    pos_bypass = pos_valid.copy()
+    pos_bypass[:, 1] += 1.10 * np.exp(-0.5 * ((x_arr - 5.0) / 1.0) ** 2)
+    tel_bypass = _make_synthetic_telemetry(pos_bypass, yaw_valid, dt_s=0.05)
+    res_bypass = validate_episode_data(tel_bypass, waypoints_cfg, pilot_exit_code=0)
+    assert res_bypass["validation_status"] == "rejected"
+    assert any("outside_gate_aperture" in r or "collision" in r for r in res_bypass["rejection_reasons"])
+
+    # 3. Colision contra la barra superior del gate en (X=5.0, Y=0.0, Z=2.25)
+    pos_col = pos_valid.copy()
+    pos_col[:, 2] += 0.75 * np.exp(-0.5 * ((x_arr - 5.0) / 0.5) ** 2)
+    tel_col = _make_synthetic_telemetry(pos_col, yaw_valid, dt_s=0.05)
+    res_col = validate_episode_data(tel_col, waypoints_cfg, pilot_exit_code=0)
+    assert res_col["validation_status"] == "rejected"
+    assert any("collision_with_landmark_1" in r for r in res_col["rejection_reasons"])
+
+    # 4. Slalom por el flanco equivocado (derecho Y=-1.5m cuando se pidio left)
+    pos_wrong_slalom = pos_valid.copy()
+    pos_wrong_slalom[:, 1] = -1.5 * np.exp(-0.5 * ((x_arr - 10.0) / 1.2) ** 2)
+    tel_wrong_slalom = _make_synthetic_telemetry(pos_wrong_slalom, yaw_valid, dt_s=0.05)
+    res_wrong_slalom = validate_episode_data(tel_wrong_slalom, waypoints_cfg, pilot_exit_code=0)
+    assert res_wrong_slalom["validation_status"] == "rejected"
+    assert any("wrong_flank_or_offset_left" in r for r in res_wrong_slalom["rejection_reasons"])
+
+    # 5. Reset del estimador EKF2 a mitad de vuelo
+    tel_reset = _make_synthetic_telemetry(pos_valid, yaw_valid, dt_s=0.05)
+    for item in tel_reset["odometry"][N // 2:]:
+        item["reset_counter"] = 1
+    res_reset = validate_episode_data(tel_reset, waypoints_cfg, pilot_exit_code=0)
+    assert res_reset["recording_status"] == "invalid"
+    assert res_reset["validation_status"] == "rejected"
+    assert any("ekf2_estimator_reset_in_flight" in r for r in res_reset["rejection_reasons"])
+
+    # 6. Reconstruccion de reloj ante salto de offset Timesync de uxrce_dds_client
+    ts_bag = np.linspace(1000.0, 1010.0, 200)
+    ts_px4 = ts_bag.copy()
+    ts_px4[85] = 62.10  # Muestra aislada con timestamp crudo de boot PX4 sin offset UNIX (salto de bajada y subida)
+    ts_reconstructed, jumps = reconstruct_simulation_clock(ts_px4, ts_bag)
+    assert jumps == 2
+    assert np.all(np.diff(ts_reconstructed) > 0)
+    assert np.allclose(ts_reconstructed, ts_bag - ts_bag[0], atol=1e-6)
+
+
+def test_world_generator_transition_feasibility():
+    """Valida Fase 1 (Tarea 1.3): chequeo de factibilidad geometrica de transiciones en world_generator."""
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from world_generator import check_circuit_transition_feasibility
+
+    hoops_ok = [
+        {"id": "landmark_1", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.6, "yaw": 0.0},
+        {"id": "landmark_2", "type": "pole", "x": 10.5, "y": 1.0, "z": 1.5, "yaw": 0.1},
+    ]
+    prims_ok = [
+        {"type": "traverse", "target": "landmark_1"},
+        {"type": "orbit", "target": "landmark_2"},
+    ]
+    landing_ok = {"x": 16.0, "y": 0.5, "z": 0.05}
+    ok, reasons = check_circuit_transition_feasibility(hoops_ok, prims_ok, landing_ok)
+    assert ok is True, f"Unexpected rejection: {reasons}"
+
+    # Caso invalido: pendiente vertical excesiva entre overfly (Z=4.0) y traverse bajo (Z=1.0) muy cercano
+    hoops_steep = [
+        {"id": "landmark_1", "type": "pole", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0},
+        {"id": "landmark_2", "type": "square_gate", "x": 9.0, "y": 0.0, "z": 1.0, "yaw": 0.0},
+    ]
+    prims_steep = [
+        {"type": "overfly", "target": "landmark_1"},
+        {"type": "traverse", "target": "landmark_2"},
+    ]
+    # post_1 esta en X=6.2, Z=4.0; pre_2 esta en X=7.8, Z=1.0 -> dx=1.6m, dz=-3.0m -> slope=1.875 > 1.15
+    ok_steep, reasons_steep = check_circuit_transition_feasibility(hoops_steep, prims_steep, landing_ok)
+    assert ok_steep is False
+    assert any("excessive_slope" in r for r in reasons_steep)
+
+
+def test_real_dataset_mcap_validation():
+    """Verifica el parser nativo MCAP y el validador fisico sobre episodios reales si existen."""
+    from pathlib import Path
+    from uav_ip.validate_episode import validate_episode_directory
+
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    ep_dir = repo_root / "datasets" / "task_0001" / "episode_00"
+    if ep_dir.is_dir():
+        report = validate_episode_directory(ep_dir, update_meta=False)
+        assert report["validation_status"] == "accepted"
+        assert report["recording_status"] == "valid"
+        assert report["mission_status"] == "valid"
+        assert report["metrics"]["min_obstacle_clearance_m"] > 0.30
+
+

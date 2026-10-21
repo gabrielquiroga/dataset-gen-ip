@@ -58,11 +58,12 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 | Módulo / Script | Ubicación | Estado Actual | Observaciones y Deuda Técnica Identificada |
 | :--- | :--- | :--- | :--- |
 | **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Muestreo combinatorio sin reemplazo, firma semántica limpia, `slalom` bilateral (`left`/`right`) y soporte para `circular_gate`. |
-| **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos, alineación de `plataforma_llegada` y variación de `start_pose`. |
-| **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro y conversión base NED/ENU. |
-| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos y detección de paso de plano (*way-plane*). |
+| **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos, validación de factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`), alineación de `plataforma_llegada` y variación de `start_pose`. |
+| **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro, suscripción a `/fmu/out/vehicle_land_detected` y conversión base NED/ENU. |
+| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de ventana estrictas por primitiva (`cross_track < 0.38m` en `traverse`) y confirmación real de aterrizaje. |
 | **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Conversión consistente entre coordenadas Gazebo ENU y PX4 NED en el cálculo de rumbo. |
 | **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial. |
+| **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador físico, geométrico y temporal independiente (parser nativo MCAP + CDR sin dependencias, clearance 3D analítico contra AABB/toroide/cilindro, verificación de primitivas y reconstrucción monótona del reloj ante saltos `Timesync`). |
 | **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR 360° en marco *Horizontal FLU* ($s=0.1$, FPS 2048 determinista acelerado ~7x con kernel C SIMD), cuota acotada en `landing_pad` y *thin wrapper* en `scripts/`. |
 | **`audit_dataset.py`** | `src/uav_ip/scripts/` | **Completado** | Auditoría universal de firmas semánticas, variabilidad espacial y particionado `train` / `val` / `held_out` sin fugas. |
 | **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Completado** | Exporta poses $SE(3)$, horizonte relativo $T_{EA}$ ($T=8$), $L=10$ keyframes, 6 keypoints del UAV, *30% Tube Augmentation* de recuperación y procesamiento multiproceso (`--dataset-dir`, `--workers`). |
@@ -93,7 +94,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 ---
 
-### Hito 1.5: Corrección de Bugs Críticos, Fidelidad Matemática $SE(3)$ y Calidad de Demostraciones — [PRIORIDAD INMEDIATA PRE-CAMPAÑA]
+### Hito 1.5: Corrección de Bugs Críticos, Fidelidad Matemática $SE(3)$ y Calidad de Demostraciones — [COMPLETADO]
 
 *Objetivo: Corregir las discrepancias matemáticas y de ingeniería detectadas en la auditoría técnica antes de ejecutar la recolección masiva de vuelos (Hito 3) y el entrenamiento del modelo (Hito 4).*
 
@@ -147,7 +148,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 ##### Tarea 1.5.5: Rediseño Matemático de `bag_to_heterodata.py` acorde a *Instant Policy* ($SE(3)$, Horizonte $T=8$, Keyframes $L=10$ y 6 Keypoints) y Actualización de `visualize_dataset.py` — [x] COMPLETADO
 - **Problema Detectado:**
   1. `bag_to_heterodata.py` asigna como acción objetivo (`data['agent'].y`) la coordenada global en ENU del setpoint discreto publicado por `WaypointController` (una función escalón que apunta a metros de distancia y salta discontinuamente), contradiciendo el Apéndice H de *Instant Policy*.
-  2. `data['agent'].x` y `data['agent'].y` están en el marco global ENU mientras que `data['scene'].pos` está en el marco local del dron, y **no se guarda la orientación del dron ($R_{WE}$ / yaw)** ni el estado binario de vuelo $s_t \in \{0, 1\}$, haciendo imposible reconstruir los desplazamientos relativos en $SE(3)$ o los 6 nodos keypoint del dron.
+  2. `data['agent'].x` y `data['agent'].y` están en el marco global ENU mientras que `data['agent'].pos` está en el marco local del dron, y **no se guarda la orientación del dron ($R_{WE}$ / yaw)** ni el estado binario de vuelo $s_t \in \{0, 1\}$, haciendo imposible reconstruir los desplazamientos relativos en $SE(3)$ o los 6 nodos keypoint del dron.
 - **Acciones de Implementación:**
   1. **Re-muestreo y Estado Completo del Agente:**
      * Guardar en `data['agent']`:
@@ -172,11 +173,6 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 - **Estrategia de Resolución (*Single Source of Truth + Thin Shim*):**
   1. Mantener el código fuente completo **únicamente** dentro del módulo de Python `src/uav_ip/uav_ip/synthetic_lidar.py` y `src/uav_ip/uav_ip/visualize_dataset.py`.
   2. Reemplazar el contenido de `src/uav_ip/scripts/synthetic_lidar.py` y `src/uav_ip/scripts/visualize_dataset.py` por un *thin wrapper* (~25 líneas) que inyecte dinámicamente `src/uav_ip/` en `sys.path`, re-exporte toda la API (`from uav_ip.synthetic_lidar import *`) y ejecute `main()` si `__name__ == "__main__"`.
-  3. De este modo:
-     * `ros2 run uav_ip synthetic_lidar` funciona en ROS 2.
-     * `from uav_ip.synthetic_lidar import ...` funciona en ROS 2 y en `pytest`.
-     * `python3 src/uav_ip/scripts/synthetic_lidar.py` y `import synthetic_lidar` desde `bag_to_heterodata.py` funcionan en cualquier terminal o dentro de `~/venv_ip` sin compilar con `colcon`.
-     * Existe **una única copia del código** que mantener.
 - **Criterio de Aceptación:** `pytest` y la invocación directa desde `scripts/` y `ros2 run` pasan el 100% de las pruebas sin código duplicado.
 
 ---
@@ -206,6 +202,37 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
     $$\tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t+k}$$
     y almacenarlas en los nodos `data['aug']`, añadiendo visualización dedicada (`--show-aug` / `plot_tube_augmentation_recovery`) en `visualize_dataset.py`.
 - **Criterio de Aceptación:** Verificación matemática (`test_tube_augmentation_se3_convergence`) y gráfica (`--show-aug`) de que ante una desviación lateral o vertical respecto al centro de un aro, el flujo de acción objetivo $\tilde{T}_{EA}$ apunta convergentemente de regreso al eje del aro.
+
+---
+
+### Hito 2.5: Blindaje Pre-Campaña contra Falsos Positivos y Auditoría Física (Revisión Experta) — [EN PROGRESO: FASE 1 COMPLETADA]
+
+*Objetivo: Eliminar cualquier posibilidad de aceptar vuelos colisionados, cruces por fuera del aro, aterrizajes incompletos o grabaciones corruptas antes de lanzar la recolección masiva de demostraciones.*
+
+#### Fase 1: Validador Físico Independiente, Endurecimiento del Piloto y Factibilidad de Transiciones — [x] COMPLETADO
+- [x] **Tarea 2.5.1: Validador Independiente de Episodio (`src/uav_ip/uav_ip/validate_episode.py`):**
+  * Parser nativo MCAP + CDR de cero dependencias externas para leer `/fmu/out/vehicle_odometry`, `/fmu/out/vehicle_local_position_v1`, `/fmu/out/vehicle_land_detected`, `/fmu/out/vehicle_status_v4` y `/fmu/in/trajectory_setpoint`.
+  * Reconstrucción monótona del reloj de simulación (`reconstruct_simulation_clock`) ante recalibraciones de `time_offset` en `uxrce_dds_client` (`Timesync`).
+  * Cálculo analítico exacto de distancia libre 3D ($d_{\text{min}} \ge 0.28\text{ m}$) contra las 4 barras AABB de `square_gate`, el toroide de `circular_gate` y el cilindro de `pole`.
+  * Verificación geométrica independiente por primitiva (`traverse` con interpolación en $x_{\text{loc}}=0$, `slalom` por flanco `left`/`right`, `overfly` sobre $z \ge 3.30\text{ m}$ y `orbit` con barrido $\Delta\theta_{\text{ccw}} \ge 210^\circ$ y guiñada centrípeta).
+  * Separación explícita en `episode_meta.json` entre `pilot_exit_code`, `recording_status`, `mission_status`, `validation_status` (`"accepted"` / `"rejected"`), `rejection_reasons` y `validation_metrics`.
+- [x] **Tarea 2.5.2: Endurecimiento de Tolerancias y Confirmación de Aterrizaje (`waypoint_controller.py`, `base_pilot.py`):**
+  * Reducción del umbral de cruce `center` en `traverse` de `cross_track < 1.4m` a `cross_track < 0.38m` y `alt_err < 0.42m`.
+  * Suscripción a `/fmu/out/vehicle_land_detected` en `BasePilot` y espera activa de confirmación de toque de tierra (`landed == True` o $z_{\text{ENU}} < 0.22\text{ m}$) en `nav_state == 4`.
+- [x] **Tarea 2.5.3: Factibilidad Geométrica de Transiciones (`world_generator.py`):**
+  * Implementación de `check_circuit_transition_feasibility` verificando avance longitudinal $\Delta x \ge 1.0\text{ m}$, distancia horizontal $d_{xy} \ge 1.4\text{ m}$, pendiente máxima $|\Delta z|/d_{xy} \le 1.15$ con `traverse` ($\le 1.60$ entre postes abiertos) y ausencia de invasión de waypoints vecinos.
+
+#### Fase 2: Orquestación Resiliente con Reintentos, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
+- [ ] **Tarea 2.5.4: Integración de Validación y Reintentos con Nueva Semilla en `data_collector.py`:**
+  * Espera de *topics* activos antes de lanzar el piloto, invocación automática de `validate_episode_directory(..., update_meta=True)` al cerrar el bag y bucle de hasta `MAX_EPISODE_ATTEMPTS = 3` con semilla derivada si `validation_status != "accepted"`.
+- [ ] **Tarea 2.5.5: Filtrado Estricto y Re-muestreo Uniforme en Tiempo en `bag_to_heterodata.py`:**
+  * Ignorar episodios con `validation_status == "rejected"`, usar `reconstruct_simulation_clock` e interpolar uniformemente en el tiempo ($\Delta t = 0.10\text{ s}$, $10\text{ Hz}$, `SLERP`/interpolación angular en guiñada) en lugar de diezmado por índice fijo (`[::10]`), además de verificar ausencia de colisión en las poses perturbadas del *Tube Augmentation*.
+- [ ] **Tarea 2.5.6: Auditoría en 3 Capas (`audit_dataset.py`):**
+  * Incorporar Capa 2 (auditoría de vuelos crudos, tasas de aceptación/rechazo y métricas cinemáticas) y Capa 3 (auditoría de tensores `.pt`: finitud, formas, ortogonalidad $SO(3)$ y horizonte $T=8$), exigiendo $\ge 3$ episodios `"accepted"` por tarea antes de incluirla en los splits.
+
+#### Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [ ] PENDIENTE
+- [ ] **Tarea 2.5.7: Ejecución y Verificación Estadística del Piloto Pre-Campaña:**
+  * Ejecutar campaña piloto de 50 episodios, verificar tasa de aceptación primaria $\ge 85\%$, $100\%$ de episodios aceptados tras reintentos, $0$ colisiones y $0$ violaciones en las 3 capas de `audit_dataset.py`.
 
 ---
 

@@ -127,18 +127,24 @@ class WaypointController(BasePilot):
                 wps.append({
                     "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz],
                     "type": "pre",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx, cy, cz],
                     "type": "center",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
                 wps.append({
                     "pos": [cx + OFFSET * fwd_x, cy + OFFSET * fwd_y, cz],
                     "type": "post",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -147,18 +153,24 @@ class WaypointController(BasePilot):
                 wps.append({
                     "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz + OVER_Z],
                     "type": "pre",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx, cy, cz + OVER_Z],
                     "type": "center",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
                 wps.append({
                     "pos": [cx + OFFSET * fwd_x, cy + OFFSET * fwd_y, cz + OVER_Z],
                     "type": "post",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -171,18 +183,24 @@ class WaypointController(BasePilot):
                 wps.append({
                     "pos": [cx - OFFSET * fwd_x + right_x * LAT_OFFSET, cy - OFFSET * fwd_y + right_y * LAT_OFFSET, cz],
                     "type": "pre",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
                 wps.append({
                     "pos": [cx + right_x * LAT_OFFSET, cy + right_y * LAT_OFFSET, cz],
                     "type": "center",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
                 wps.append({
                     "pos": [cx + OFFSET * fwd_x + right_x * LAT_OFFSET, cy + OFFSET * fwd_y + right_y * LAT_OFFSET, cz],
                     "type": "post",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -229,6 +247,8 @@ class WaypointController(BasePilot):
                     wps.append({
                         "pos": [px, py, cz],
                         "type": wp_kind,
+                        "primitive": p_type,
+                        "target": target_id,
                         "yaw": centripetal_yaw,
                         "vel_ff": vel_ff_enu,
                     })
@@ -237,6 +257,8 @@ class WaypointController(BasePilot):
                 wps.append({
                     "pos": [cx + R * fwd_x - right_x * R, cy + R * fwd_y - right_y * R, cz],
                     "type": "post",
+                    "primitive": p_type,
+                    "target": target_id,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -271,6 +293,7 @@ class WaypointController(BasePilot):
             wp_info = self.waypoints_ned[self.current_wp]
             target = self.gazebo_to_ned(wp_info["pos"])
             wp_type = wp_info["type"]
+            wp_prim = wp_info.get("primitive", "traverse")
             wp_yaw = wp_info["yaw"]
 
             if wp_info.get("vel_ff") is not None:
@@ -301,15 +324,26 @@ class WaypointController(BasePilot):
             elif wp_type == "landing_hover":
                 wp_reached = (dist_xy < 0.40 and alt_err < 0.40)
             elif wp_type == "start_pose":
-                wp_reached = (dist_3d < 0.50 or (along_track > 0.0 and cross_track < 1.0 and alt_err < 0.6))
+                wp_reached = (dist_3d < 0.50 or (along_track > 0.0 and cross_track < 0.65 and alt_err < 0.50))
             elif wp_type == "pre":
-                wp_reached = (dist_3d < 0.65 or (along_track > -0.10 and cross_track < 0.8 and alt_err < 0.6))
+                if wp_prim == "traverse":
+                    wp_reached = (dist_3d < 0.50 or (along_track > -0.15 and cross_track < 0.42 and alt_err < 0.42))
+                else:
+                    wp_reached = (dist_3d < 0.60 or (along_track > -0.15 and cross_track < 0.60 and alt_err < 0.50))
             elif wp_type == "center":
-                wp_reached = (dist_3d < 0.85 or (along_track > -0.10 and cross_track < 1.4 and alt_err < 0.8))
+                # Para traverse (ventana libre +-0.75m, radio UAV 0.28m -> ventana segura +-0.47m),
+                # exigir cross_track < 0.38m y alt_err < 0.42m impide falsos cruces por fuera del marco.
+                if wp_prim == "traverse":
+                    wp_reached = ((dist_3d < 0.45 or along_track >= -0.05) and cross_track < 0.38 and alt_err < 0.42)
+                else:
+                    wp_reached = ((dist_3d < 0.65 or along_track >= -0.08) and cross_track < 0.65 and alt_err < 0.55)
             elif wp_type == "orbit_arc":
-                wp_reached = (dist_3d < 0.65)
+                wp_reached = (dist_3d < 0.60 and alt_err < 0.50)
             elif wp_type == "post":
-                wp_reached = (dist_3d < 0.85 or (along_track > 0.0 and cross_track < 1.4 and alt_err < 0.8))
+                if wp_prim == "traverse":
+                    wp_reached = (dist_3d < 0.65 or (along_track >= -0.05 and cross_track < 0.55 and alt_err < 0.55))
+                else:
+                    wp_reached = (dist_3d < 0.75 or (along_track >= -0.05 and cross_track < 0.75 and alt_err < 0.60))
 
             if wp_reached:
                 self.current_wp += 1
@@ -319,7 +353,7 @@ class WaypointController(BasePilot):
                     else "FINAL"
                 )
                 self.get_logger().info(
-                    f"Waypoint alcanzado: [{self.current_wp - 1}/{len(self.waypoints_ned) - 1}] ({wp_type}). "
+                    f"Waypoint alcanzado: [{self.current_wp - 1}/{len(self.waypoints_ned) - 1}] ({wp_type}/{wp_prim}). "
                     f"Avanzando a [{self.current_wp}] ({next_wp_type})."
                 )
         elif self.nav_state == 3:
@@ -331,7 +365,17 @@ class WaypointController(BasePilot):
             if not hasattr(self, "land_start_time"):
                 self.land_start_time = self.get_clock().now()
             elapsed = (self.get_clock().now() - self.land_start_time).nanoseconds / 1e9
-            if elapsed > 4.0:
+            curr_enu = self.ned_to_gazebo(self.current_pos_ned)
+            landed_ok = (self.landed_detected and elapsed >= 3.0) or (curr_enu[2] < 0.22 and elapsed >= 4.0)
+            if landed_ok:
+                self.get_logger().info(
+                    f"Aterrizaje confirmado (landed_detected={self.landed_detected}, z={curr_enu[2]:.2f}m, t={elapsed:.1f}s)."
+                )
+                self.nav_state = 5
+            elif elapsed >= 10.0:
+                self.get_logger().warning(
+                    f"Timeout de confirmación de aterrizaje ({elapsed:.1f}s, z={curr_enu[2]:.2f}m). Finalizando controlador."
+                )
                 self.nav_state = 5
         elif self.nav_state == 5:
             raise SystemExit(0)

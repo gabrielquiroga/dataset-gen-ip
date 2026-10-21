@@ -4,7 +4,13 @@ from typing import Optional, Sequence
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition
+from px4_msgs.msg import (
+    OffboardControlMode,
+    TrajectorySetpoint,
+    VehicleCommand,
+    VehicleLandDetected,
+    VehicleLocalPosition,
+)
 
 
 class BasePilot(Node):
@@ -28,15 +34,22 @@ class BasePilot(Node):
         self.vehicle_cmd_pub = self.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", qos)
 
         self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position_v1", self._pos_callback, qos)
+        self.create_subscription(VehicleLandDetected, "/fmu/out/vehicle_land_detected", self._land_detected_callback, qos)
 
         self.current_pos_ned = [0.0, 0.0, 0.0]
         self.px4_timestamp = 0
         self.nav_state = 0
         self.setpoint_counter = 0
+        self.landed_detected = False
+        self.ground_contact_detected = False
 
     def _pos_callback(self, msg: VehicleLocalPosition) -> None:
         self.current_pos_ned = [float(msg.x), float(msg.y), float(msg.z)]
         self.px4_timestamp = msg.timestamp
+
+    def _land_detected_callback(self, msg: VehicleLandDetected) -> None:
+        self.landed_detected = bool(msg.landed)
+        self.ground_contact_detected = bool(msg.ground_contact)
 
     @staticmethod
     def gazebo_to_ned(coord: Sequence[float]) -> list[float]:

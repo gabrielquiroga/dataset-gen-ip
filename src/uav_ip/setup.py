@@ -33,6 +33,7 @@ setup(
             'tracking_controller = uav_ip.tracking_controller:main',
             'synthetic_lidar = uav_ip.synthetic_lidar:main',
             'visualize_dataset = uav_ip.visualize_dataset:main',
+            'validate_episode = uav_ip.validate_episode:main',
         ],
     },
 )
