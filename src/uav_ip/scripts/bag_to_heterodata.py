@@ -73,7 +73,7 @@ for _candidate_site in [
     Path.home() / ".local" / "lib" / _py_ver / "site-packages",
 ]:
     if _candidate_site.is_dir() and str(_candidate_site) not in sys.path:
-        sys.path.insert(0, str(_candidate_site))
+        sys.path.append(str(_candidate_site))
 
 # Inyectar raiz del paquete uav_ip (src/uav_ip) para importar la fuente unica uav_ip.synthetic_lidar
 _pkg_root = Path(__file__).resolve().parent.parent

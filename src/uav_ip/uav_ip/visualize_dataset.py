@@ -30,7 +30,10 @@ if not has_display:
     matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+try:
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+except Exception:
+    Axes3D = None  # En Matplotlib >= 3.2 projection='3d' se registra automáticamente
 from matplotlib.animation import FuncAnimation, PillowWriter
 
 # Asegurar inclusion de ~/venv_ip y ~/.local en sys.path
@@ -40,7 +43,7 @@ for _candidate_site in [
     Path.home() / ".local" / "lib" / _py_ver / "site-packages",
 ]:
     if _candidate_site.is_dir() and str(_candidate_site) not in sys.path:
-        sys.path.insert(0, str(_candidate_site))
+        sys.path.append(str(_candidate_site))
 
 # Agregar directorio local al sys.path para importar synthetic_lidar
 script_dir = Path(__file__).resolve().parent

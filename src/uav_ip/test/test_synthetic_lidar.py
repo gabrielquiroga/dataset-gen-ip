@@ -256,8 +256,6 @@ def test_discover_dataset_episodes():
 
 def test_heterodata_load_node_types_compatibility():
     """Valida que la deteccion de nodos en HeteroData no use 'in data' directamente."""
-    from uav_ip.visualize_dataset import _to_numpy
-
     class MockNode:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
