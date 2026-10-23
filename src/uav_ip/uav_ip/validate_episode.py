@@ -29,8 +29,10 @@ Estrategia de lectura de bolsas MCAP:
 import argparse
 import json
 import math
+import os
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -56,6 +58,14 @@ from uav_ip.synthetic_lidar import (
 # ============================================================================
 # Constantes Geometricas y Umbrales de Validacion (Sincronizados con Documentacion)
 # ============================================================================
+
+VALIDATOR_VERSION: str = "1.1.0"
+
+SUPPORTED_LANDMARK_TYPES = frozenset({"gate", "square_gate", "circular_gate", "pole"})
+GATE_LANDMARK_TYPES = frozenset({"gate", "square_gate", "circular_gate"})
+POLE_LANDMARK_TYPES = frozenset({"pole"})
+SUPPORTED_PRIMITIVE_TYPES = frozenset({"traverse", "slalom", "overfly", "orbit"})
+SUPPORTED_SLALOM_SIDES = frozenset({"left", "right"})
 
 # 1. Geometria nominal de obstaculos (identica a world_generator.py y synthetic_lidar.py)
 GATE_HALF_WIDTH: float = 0.70           # Pilares izquierdo/derecho centrados en y = ±0.70 m
@@ -121,6 +131,36 @@ EXPECTED_TOPIC_SCHEMAS = {
     "/fmu/out/vehicle_status_v4": "px4_msgs/msg/VehicleStatus",
     "/fmu/in/trajectory_setpoint": "px4_msgs/msg/TrajectorySetpoint",
 }
+
+
+def get_effective_validation_parameters() -> Dict[str, Any]:
+    """Retorna un diccionario serializable con la version del validador y parametros efectivos."""
+    return {
+        "validator_version": VALIDATOR_VERSION,
+        "uav_physical_radius_xy_m": UAV_PHYSICAL_RADIUS_XY,
+        "uav_safety_margin_xy_m": UAV_SAFETY_MARGIN_XY,
+        "uav_collision_radius_xy_m": UAV_COLLISION_RADIUS_XY,
+        "collision_segment_max_step_m": COLLISION_SEGMENT_MAX_STEP_M,
+        "traverse_max_abs_y_m": TRAVERSE_MAX_ABS_Y,
+        "traverse_max_abs_z_m": TRAVERSE_MAX_ABS_Z,
+        "traverse_circ_max_r_m": TRAVERSE_CIRC_MAX_R,
+        "slalom_min_lateral_m": SLALOM_MIN_LATERAL,
+        "slalom_max_lateral_m": SLALOM_MAX_LATERAL,
+        "overfly_min_alt_m": OVERFLY_MIN_ALT_M,
+        "overfly_max_lat_m": OVERFLY_MAX_LAT_M,
+        "orbit_min_sweep_deg": ORBIT_MIN_SWEEP_DEG,
+        "orbit_max_radius_m": ORBIT_MAX_RADIUS_M,
+        "orbit_max_mean_yaw_err_deg": ORBIT_MAX_MEAN_YAW_ERR_DEG,
+        "takeoff_min_alt_m": TAKEOFF_MIN_ALT_M,
+        "min_active_ground_z_m": MIN_ACTIVE_GROUND_Z_M,
+        "max_allowed_dt_gap_s": MAX_ALLOWED_DT_GAP_S,
+        "max_allowed_step_dist_m": MAX_ALLOWED_STEP_DIST_M,
+        "landing_max_xy_err_m": LANDING_MAX_XY_ERR_M,
+        "landing_max_final_z_m": LANDING_MAX_FINAL_Z_M,
+        "landing_max_final_speed_mps": LANDING_MAX_FINAL_SPEED,
+        "landing_max_detector_age_s": LANDING_MAX_DETECTOR_AGE_S,
+    }
+
 
 
 # ============================================================================
@@ -962,21 +1002,337 @@ def reconstruct_simulation_clock(
 
 
 # ============================================================================
+# Validacion Estructural y Semantica de Configuracion (`waypoints.yaml`)
+# ============================================================================
+
+def _is_finite_number(val: Any) -> bool:
+    """Retorna True si y solo si `val` es un escalar numerico real finito (excluyendo bool)."""
+    if isinstance(val, bool) or not isinstance(val, (int, float, np.number)):
+        return False
+    return bool(math.isfinite(float(val)))
+
+
+def validate_waypoints_config(
+    waypoints_cfg: Any,
+    *,
+    allow_legacy_hoops: bool = False,
+) -> Dict[str, Any]:
+    """
+    Valida estructural y semanticamente el diccionario de configuracion `waypoints.yaml`.
+    Exige para la campana actual:
+      - Objeto raiz de tipo diccionario no vacio.
+      - Lista no vacia de landmarks con IDs presentes, no vacios y unicos.
+      - Tipos geometricos soportados (`gate`, `square_gate`, `circular_gate`, `pole`).
+      - Coordenadas (`x`, `y`, `z`) y orientacion (`yaw`) finitas.
+      - Lista no vacia de primitivas con tipos soportados (`traverse`, `slalom`, `overfly`, `orbit`).
+      - Referencias `target` a landmarks existentes y compatibilidad entre primitiva y tipo de landmark.
+      - `side` explicito y valido (`left` o `right`) en `slalom`.
+      - Plataforma de aterrizaje (`landing`) con coordenadas finitas.
+    """
+    errors: List[str] = []
+    legacy_normalized = False
+
+    if not isinstance(waypoints_cfg, dict) or len(waypoints_cfg) == 0:
+        return {
+            "valid": False,
+            "configuration_status": "invalid",
+            "errors": ["invalid_configuration:waypoints_root_must_be_non_empty_dict"],
+            "normalized_config": None,
+            "legacy_hoops_normalized": False,
+        }
+
+    # Validar start_pose si esta presente
+    if "start_pose" in waypoints_cfg and waypoints_cfg["start_pose"] is not None:
+        sp = waypoints_cfg["start_pose"]
+        if not isinstance(sp, dict):
+            errors.append("invalid_configuration:invalid_start_pose_not_dict")
+        else:
+            for coord_k in ("x", "y", "z", "yaw"):
+                if coord_k in sp and not _is_finite_number(sp[coord_k]):
+                    errors.append(f"invalid_configuration:non_finite_start_pose ({coord_k})")
+
+    # 1. Validar lista de landmarks
+    raw_lms = None
+    if "landmarks" in waypoints_cfg:
+        raw_lms = waypoints_cfg["landmarks"]
+    elif allow_legacy_hoops and "hoops" in waypoints_cfg:
+        raw_lms = waypoints_cfg["hoops"]
+        legacy_normalized = True
+
+    if not isinstance(raw_lms, list) or len(raw_lms) == 0:
+        errors.append("invalid_configuration:missing_or_empty_landmarks")
+        raw_lms = []
+
+    landmarks_list: List[Dict[str, Any]] = []
+    landmarks_map: Dict[str, Dict[str, Any]] = {}
+
+    for idx, lm in enumerate(raw_lms):
+        if not isinstance(lm, dict):
+            errors.append(f"invalid_configuration:landmark_entry_not_dict (index={idx})")
+            continue
+
+        raw_id = lm.get("id")
+        if raw_id is None and legacy_normalized and "name" in lm:
+            raw_id = lm.get("name")
+
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            errors.append(f"invalid_configuration:missing_or_empty_landmark_id (index={idx})")
+            lm_id = f"__invalid_id_{idx}__"
+        else:
+            lm_id = raw_id.strip()
+            if lm_id in landmarks_map:
+                errors.append(f"invalid_configuration:duplicate_landmark_id ({lm_id})")
+
+        raw_type = lm.get("type")
+        if raw_type is None and legacy_normalized:
+            raw_type = "gate"
+
+        if not isinstance(raw_type, str) or raw_type.strip().lower() not in SUPPORTED_LANDMARK_TYPES:
+            errors.append(f"invalid_configuration:unsupported_landmark_type ({lm_id}:{raw_type})")
+            lm_type = str(raw_type).strip().lower() if raw_type is not None else "unknown"
+        else:
+            lm_type = raw_type.strip().lower()
+
+        pose_ok = True
+        for field in ("x", "y", "z", "yaw"):
+            if field not in lm or not _is_finite_number(lm[field]):
+                errors.append(f"invalid_configuration:non_finite_landmark_pose ({lm_id}.{field})")
+                pose_ok = False
+
+        if pose_ok:
+            norm_lm = {
+                "id": lm_id,
+                "type": lm_type,
+                "x": float(lm["x"]),
+                "y": float(lm["y"]),
+                "z": float(lm["z"]),
+                "yaw": float(lm["yaw"]),
+            }
+            landmarks_list.append(norm_lm)
+            if lm_id not in landmarks_map and not lm_id.startswith("__invalid_id_"):
+                landmarks_map[lm_id] = norm_lm
+        else:
+            if lm_id not in landmarks_map and not lm_id.startswith("__invalid_id_"):
+                landmarks_map[lm_id] = {"id": lm_id, "type": lm_type, "x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
+
+    # 2. Validar lista de primitivas
+    raw_prims = None
+    if "primitives" in waypoints_cfg:
+        raw_prims = waypoints_cfg["primitives"]
+    elif legacy_normalized and landmarks_list:
+        sorted_lms = sorted(landmarks_list, key=lambda item: float(item["x"]))
+        raw_prims = [{"type": "traverse", "target": item["id"]} for item in sorted_lms]
+
+    if not isinstance(raw_prims, list) or len(raw_prims) == 0:
+        errors.append("invalid_configuration:missing_or_empty_primitives")
+        raw_prims = []
+
+    primitives_list: List[Dict[str, Any]] = []
+    for idx, prim in enumerate(raw_prims):
+        if not isinstance(prim, dict):
+            errors.append(f"invalid_configuration:primitive_entry_not_dict (index={idx})")
+            continue
+
+        raw_ptype = prim.get("type")
+        if not isinstance(raw_ptype, str) or raw_ptype.strip().lower() not in SUPPORTED_PRIMITIVE_TYPES:
+            errors.append(f"invalid_configuration:unsupported_primitive_type (index={idx}:{raw_ptype})")
+            p_type = str(raw_ptype).strip().lower() if raw_ptype is not None else "unknown"
+        else:
+            p_type = raw_ptype.strip().lower()
+
+        raw_target = prim.get("target")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            errors.append(f"invalid_configuration:missing_primitive_target (index={idx})")
+            target_id = ""
+        else:
+            target_id = raw_target.strip()
+            if target_id not in landmarks_map:
+                errors.append(f"invalid_configuration:unknown_primitive_target ({target_id})")
+            else:
+                target_lm_type = landmarks_map[target_id]["type"]
+                if p_type == "traverse" and target_lm_type not in GATE_LANDMARK_TYPES:
+                    errors.append(
+                        f"invalid_configuration:incompatible_primitive_landmark ({p_type} requires gate, got {target_lm_type} on {target_id})"
+                    )
+                elif p_type in {"slalom", "overfly", "orbit"} and target_lm_type not in POLE_LANDMARK_TYPES:
+                    errors.append(
+                        f"invalid_configuration:incompatible_primitive_landmark ({p_type} requires pole, got {target_lm_type} on {target_id})"
+                    )
+
+        norm_prim: Dict[str, Any] = {"type": p_type, "target": target_id}
+        if p_type == "slalom":
+            raw_side = prim.get("side")
+            if not isinstance(raw_side, str) or raw_side.strip().lower() not in SUPPORTED_SLALOM_SIDES:
+                errors.append(f"invalid_configuration:invalid_or_missing_slalom_side ({target_id}:{raw_side})")
+            else:
+                norm_prim["side"] = raw_side.strip().lower()
+
+        primitives_list.append(norm_prim)
+
+    # 3. Validar plataforma de aterrizaje (`landing`)
+    raw_landing = waypoints_cfg.get("landing")
+    norm_landing: Optional[Dict[str, float]] = None
+    if not isinstance(raw_landing, dict):
+        errors.append("invalid_configuration:missing_or_invalid_landing")
+    else:
+        landing_ok = True
+        for req_coord in ("x", "y"):
+            if req_coord not in raw_landing or not _is_finite_number(raw_landing[req_coord]):
+                errors.append(f"invalid_configuration:non_finite_landing_coordinate ({req_coord})")
+                landing_ok = False
+        for opt_coord in ("z", "yaw"):
+            if opt_coord in raw_landing and not _is_finite_number(raw_landing[opt_coord]):
+                errors.append(f"invalid_configuration:non_finite_landing_coordinate ({opt_coord})")
+                landing_ok = False
+        if landing_ok:
+            norm_landing = {
+                "x": float(raw_landing["x"]),
+                "y": float(raw_landing["y"]),
+                "z": float(raw_landing.get("z", 0.05)),
+            }
+
+    is_valid = len(errors) == 0
+    normalized_cfg = (
+        {
+            "landmarks": landmarks_list,
+            "primitives": primitives_list,
+            "landing": norm_landing,
+            "legacy_hoops_normalized": legacy_normalized,
+        }
+        if is_valid
+        else None
+    )
+
+    return {
+        "valid": is_valid,
+        "configuration_status": "valid" if is_valid else "invalid",
+        "errors": errors,
+        "normalized_config": normalized_cfg,
+        "legacy_hoops_normalized": legacy_normalized,
+    }
+
+
+def _infer_pilot_exit_code_from_legacy_status(
+    raw_status: Any,
+) -> Tuple[Optional[int], str, List[str]]:
+    """
+    Tabla explicita de conversion de estados historicos de `data_collector.py` cuando
+    `pilot_exit_code` no fue registrado directamente. Nunca inventa exito por defecto.
+    Retorna `(pilot_exit_code, pilot_status_source, extra_rejection_reasons)`.
+    """
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        return None, "unknown", []
+
+    st = raw_status.strip()
+    if st == "success":
+        return 0, "inferred_from_legacy_status", []
+    if st == "timeout":
+        return None, "inferred_from_legacy_status", ["pilot_timeout_status"]
+    if st.startswith("pilot_exit_"):
+        suffix = st[len("pilot_exit_"):]
+        try:
+            code = int(suffix)
+            return code, "inferred_from_legacy_status", []
+        except ValueError:
+            return None, "unknown", [f"unrecognized_pilot_status ({st})"]
+    return None, "unknown", []
+
+
+def _atomic_write_json(target_path: Path, data: Dict[str, Any]) -> None:
+    """Escribe un archivo JSON de forma atomica mediante archivo temporal en el mismo directorio y os.replace."""
+    target_path = Path(target_path)
+    parent_dir = target_path.parent
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target_path.name}.",
+        suffix=".tmp",
+        dir=str(parent_dir),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(target_path))
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _find_episode_mcap_files(bag_path: Path) -> List[Path]:
+    """Localiza todos los archivos `.mcap` asociados a un directorio de episodio o ruta directa."""
+    bag_p = Path(bag_path)
+    if bag_p.is_dir():
+        mcaps = sorted(bag_p.glob("*.mcap"))
+        if not mcaps and (bag_p / "rosbag").is_dir():
+            mcaps = sorted((bag_p / "rosbag").glob("*.mcap"))
+        return mcaps
+    elif bag_p.is_file() and bag_p.suffix == ".mcap":
+        return [bag_p]
+    return []
+
+
+def discover_episode_dirs(dataset_dir: Path) -> List[Path]:
+    """
+    Descubre todas las carpetas `task_*/episode_*` dentro de `dataset_dir`
+    sin omitir aquellas que carezcan de grabacion `.mcap`.
+    """
+    ds_dir = Path(dataset_dir).resolve()
+    if not ds_dir.is_dir():
+        return []
+    return sorted(p for p in ds_dir.glob("task_*/episode_*") if p.is_dir())
+
+
+# ============================================================================
 # Funcion Principal de Validacion de un Episodio
 # ============================================================================
 
 def validate_episode_data(
     telemetry: Dict[str, List[Dict[str, Any]]],
     waypoints_cfg: Dict[str, Any],
-    pilot_exit_code: Optional[int] = 0,
+    pilot_exit_code: Optional[int] = None,
+    *,
+    pilot_status_source: str = "explicit_argument",
+    allow_legacy_hoops: bool = False,
 ) -> Dict[str, Any]:
     """
-    Ejecuta la validacion geometrica, cinematica y de grabacion sobre datos en memoria.
+    Ejecuta la validacion de configuracion, grabacion y geometria de mision sobre datos en memoria.
+    Si falta evidencia (ej. `pilot_exit_code is None`) o la configuracion es invalida, rechaza el episodio.
     """
     rejection_reasons: List[str] = []
 
-    if pilot_exit_code is not None and int(pilot_exit_code) != 0:
+    if pilot_exit_code is None:
+        rejection_reasons.append("unknown_pilot_exit_code")
+    elif isinstance(pilot_exit_code, bool) or not isinstance(pilot_exit_code, (int, np.integer)):
+        rejection_reasons.append(f"invalid_pilot_exit_code ({pilot_exit_code})")
+    elif int(pilot_exit_code) != 0:
         rejection_reasons.append(f"pilot_non_zero_exit_code ({pilot_exit_code})")
+
+    # 0. Validar configuracion `waypoints.yaml` antes de evaluar el vuelo
+    cfg_check = validate_waypoints_config(waypoints_cfg, allow_legacy_hoops=allow_legacy_hoops)
+    if not cfg_check["valid"]:
+        rejection_reasons.extend(cfg_check["errors"])
+        return {
+            "pilot_exit_code": pilot_exit_code,
+            "pilot_status_source": pilot_status_source,
+            "configuration_status": "invalid",
+            "recording_status": "invalid",
+            "mission_status": "invalid",
+            "validation_status": "rejected",
+            "rejection_reasons": rejection_reasons,
+            "primitive_results": [],
+            "metrics": {},
+        }
+
+    norm_cfg = cfg_check["normalized_config"]
+    assert norm_cfg is not None
+    configuration_status = "valid"
 
     odom_list = telemetry.get("odometry", [])
     local_pos_list = telemetry.get("local_pos", [])
@@ -991,6 +1347,8 @@ def validate_episode_data(
         rejection_reasons.append(f"insufficient_odometry_messages ({len(odom_list)} < 30)")
         return {
             "pilot_exit_code": pilot_exit_code,
+            "pilot_status_source": pilot_status_source,
+            "configuration_status": configuration_status,
             "recording_status": "invalid",
             "mission_status": "invalid",
             "validation_status": "rejected",
@@ -1147,30 +1505,13 @@ def validate_episode_data(
     )
 
     # 4. Verificar cada primitiva y exigir orden temporal estricto de ejecucion
-    raw_lms = waypoints_cfg.get("landmarks") or waypoints_cfg.get("hoops") or []
-    landmarks_list: List[Dict[str, Any]] = []
-    for lm in raw_lms:
-        lm_c = dict(lm)
-        if "id" not in lm_c and "name" in lm_c:
-            lm_c["id"] = lm_c["name"]
-        if "type" not in lm_c:
-            lm_c["type"] = "gate"
-        landmarks_list.append(lm_c)
-
+    landmarks_list = norm_cfg["landmarks"]
     landmarks_map = {str(lm["id"]): lm for lm in landmarks_list}
-    primitives = waypoints_cfg.get("primitives") or []
-    if not primitives and landmarks_list:
-        sorted_lms = sorted(landmarks_list, key=lambda l: float(l.get("x", 0.0)))
-        primitives_sorted = [{"type": "traverse", "target": lm["id"]} for lm in sorted_lms]
-    else:
-        primitives_sorted = list(primitives)
+    primitives_sorted = norm_cfg["primitives"]
 
     primitive_results: List[Dict[str, Any]] = []
     for prim in primitives_sorted:
-        tid = str(prim.get("target", ""))
-        if tid not in landmarks_map:
-            rejection_reasons.append(f"missing_landmark_definition ({tid})")
-            continue
+        tid = str(prim["target"])
         p_res = _verify_single_primitive(pos_enu, yaw_enu, prim, landmarks_map[tid])
         primitive_results.append(p_res)
         if not p_res["passed"] and p_res["reason"]:
@@ -1198,7 +1539,7 @@ def validate_episode_data(
                 rejection_reasons.append(reason_col)
 
     # 6. Verificar aterrizaje final sincronizado en la ventana terminal del episodio
-    landing_cfg = waypoints_cfg.get("landing")
+    landing_cfg = norm_cfg["landing"]
     tail_k = min(25, N)
     final_window_pos = pos_enu[-tail_k:]
     final_window_vel = vel_enu[-tail_k:]
@@ -1229,17 +1570,14 @@ def validate_episode_data(
         if not landed_flag_confirmed:
             rejection_reasons.append("px4_land_detector_not_confirmed")
 
-    landing_xy_err = 0.0
-    if landing_cfg and "x" in landing_cfg and "y" in landing_cfg:
-        lx, ly = float(landing_cfg["x"]), float(landing_cfg["y"])
-        # Evaluar error radial horizontal en la ventana final donde realmente concluyo el vuelo
-        landing_xy_err = float(
-            np.max(np.hypot(final_window_pos[:, 0] - lx, final_window_pos[:, 1] - ly))
+    lx, ly = float(landing_cfg["x"]), float(landing_cfg["y"])
+    landing_xy_err = float(
+        np.max(np.hypot(final_window_pos[:, 0] - lx, final_window_pos[:, 1] - ly))
+    )
+    if landing_xy_err > LANDING_MAX_XY_ERR_M:
+        rejection_reasons.append(
+            f"landing_off_pad (xy_err={landing_xy_err:.3f}m > {LANDING_MAX_XY_ERR_M:.2f}m)"
         )
-        if landing_xy_err > LANDING_MAX_XY_ERR_M:
-            rejection_reasons.append(
-                f"landing_off_pad (xy_err={landing_xy_err:.3f}m > {LANDING_MAX_XY_ERR_M:.2f}m)"
-            )
 
     if final_window_max_z > LANDING_MAX_FINAL_Z_M:
         rejection_reasons.append(
@@ -1274,7 +1612,17 @@ def validate_episode_data(
         rms_jerk_mps3 = 0.0
 
     mission_status = "valid" if len(rejection_reasons) == 0 else "invalid"
-    validation_status = "accepted" if (recording_status == "valid" and mission_status == "valid") else "rejected"
+    validation_status = (
+        "accepted"
+        if (
+            configuration_status == "valid"
+            and recording_status == "valid"
+            and mission_status == "valid"
+            and pilot_exit_code == 0
+            and len(rejection_reasons) == 0
+        )
+        else "rejected"
+    )
 
     metrics = {
         "num_odom_messages": int(N),
@@ -1303,6 +1651,8 @@ def validate_episode_data(
 
     return {
         "pilot_exit_code": pilot_exit_code,
+        "pilot_status_source": pilot_status_source,
+        "configuration_status": configuration_status,
         "recording_status": recording_status,
         "mission_status": mission_status,
         "validation_status": validation_status,
@@ -1319,7 +1669,11 @@ def validate_episode_directory(
 ) -> Dict[str, Any]:
     """
     Valida un directorio de episodio completo (`datasets/task_XXXX/episode_YY`).
-    Si `update_meta=True`, persiste los campos de verificacion independiente dentro de `episode_meta.json`.
+    - No inventa exito cuando falta `episode_meta.json` o `pilot_exit_code`.
+    - Valida `waypoints.yaml` antes de evaluar la mision.
+    - Reporta `missing_bag` cuando el episodio carece de archivo `.mcap`.
+    - Si `update_meta=True`, preserva la procedencia original del piloto y escribe
+      `episode_meta.json` de manera atomica sin sobrescribir JSONs corruptos.
     """
     ep_dir = Path(ep_dir).resolve()
     wp_file = ep_dir / "waypoints.yaml"
@@ -1329,60 +1683,161 @@ def validate_episode_directory(
 
     meta_file = ep_dir / "episode_meta.json"
     existing_meta: Dict[str, Any] = {}
+    meta_corrupted = False
+    meta_corruption_reason: Optional[str] = None
+
     if meta_file.is_file():
         try:
-            with open(meta_file, "r") as f:
-                existing_meta = json.load(f)
-        except Exception:
-            pass
+            with open(meta_file, "r", encoding="utf-8") as f:
+                loaded_meta = json.load(f)
+            if not isinstance(loaded_meta, dict):
+                meta_corrupted = True
+                meta_corruption_reason = "corrupted_episode_meta_json (root_not_dict)"
+            else:
+                existing_meta = loaded_meta
+        except Exception as e:
+            meta_corrupted = True
+            meta_corruption_reason = f"corrupted_episode_meta_json ({type(e).__name__})"
 
-    if pilot_exit_code is None:
-        if "pilot_exit_code" in existing_meta:
-            pilot_exit_code = existing_meta["pilot_exit_code"]
+    # Resolver pilot_exit_code y procedencia sin defaults que fabriquen exito
+    extra_meta_reasons: List[str] = []
+    if meta_corrupted and meta_corruption_reason is not None:
+        extra_meta_reasons.append(meta_corruption_reason)
+
+    if pilot_exit_code is not None:
+        resolved_exit_code: Optional[int] = int(pilot_exit_code)
+        pilot_status_source = "explicit_argument"
+    elif not meta_corrupted and meta_file.is_file():
+        if "original_pilot_exit_code" in existing_meta and existing_meta["original_pilot_exit_code"] is not None:
+            resolved_exit_code = int(existing_meta["original_pilot_exit_code"])
+            pilot_status_source = str(existing_meta.get("pilot_status_source", "recorded_exit_code"))
+        elif "pilot_exit_code" in existing_meta and existing_meta["pilot_exit_code"] is not None:
+            resolved_exit_code = int(existing_meta["pilot_exit_code"])
+            pilot_status_source = str(existing_meta.get("pilot_status_source", "recorded_exit_code"))
         else:
-            st = str(existing_meta.get("status", "success"))
-            pilot_exit_code = 0 if st == "success" else -1
+            raw_status = existing_meta.get("original_status", existing_meta.get("status"))
+            resolved_exit_code, pilot_status_source, status_reasons = _infer_pilot_exit_code_from_legacy_status(
+                raw_status
+            )
+            extra_meta_reasons.extend(status_reasons)
+    else:
+        resolved_exit_code = None
+        pilot_status_source = "unknown"
 
+    # 1. Validar presencia y estructura de waypoints.yaml
+    wp_cfg: Any = None
+    cfg_errors: List[str] = []
     if not wp_file.is_file():
-        report = {
-            "pilot_exit_code": pilot_exit_code,
-            "recording_status": "invalid",
+        cfg_errors.append("invalid_configuration:missing_waypoints_yaml")
+    else:
+        try:
+            with open(wp_file, "r", encoding="utf-8") as f:
+                wp_cfg = yaml.safe_load(f)
+        except Exception as e:
+            cfg_errors.append(f"invalid_configuration:malformed_waypoints_yaml ({type(e).__name__})")
+
+    if not cfg_errors:
+        cfg_check = validate_waypoints_config(wp_cfg)
+        if not cfg_check["valid"]:
+            cfg_errors.extend(cfg_check["errors"])
+
+    # 2. Verificar presencia de grabacion MCAP (`missing_bag`)
+    mcap_files = _find_episode_mcap_files(ep_dir)
+    has_bag = len(mcap_files) > 0
+
+    if cfg_errors or not has_bag:
+        reasons: List[str] = list(extra_meta_reasons)
+        if resolved_exit_code is None:
+            if "unknown_pilot_exit_code" not in reasons:
+                reasons.append("unknown_pilot_exit_code")
+        elif int(resolved_exit_code) != 0:
+            reasons.append(f"pilot_non_zero_exit_code ({resolved_exit_code})")
+
+        reasons.extend(cfg_errors)
+        if not has_bag:
+            reasons.append("missing_bag")
+
+        report: Dict[str, Any] = {
+            "pilot_exit_code": resolved_exit_code,
+            "pilot_status_source": pilot_status_source,
+            "configuration_status": "invalid" if cfg_errors else "valid",
+            "recording_status": "invalid" if (not has_bag or meta_corrupted) else "not_evaluated",
             "mission_status": "invalid",
             "validation_status": "rejected",
-            "rejection_reasons": ["missing_waypoints_yaml"],
+            "rejection_reasons": reasons,
             "primitive_results": [],
             "metrics": {},
         }
     else:
         try:
-            with open(wp_file, "r") as f:
-                wp_cfg = yaml.safe_load(f) or {}
             telemetry = load_episode_telemetry(ep_dir)
-            report = validate_episode_data(telemetry, wp_cfg, pilot_exit_code=pilot_exit_code)
+            report = validate_episode_data(
+                telemetry,
+                wp_cfg,
+                pilot_exit_code=resolved_exit_code,
+                pilot_status_source=pilot_status_source,
+            )
+            if extra_meta_reasons:
+                merged_reasons = list(extra_meta_reasons) + [
+                    r for r in report["rejection_reasons"] if r not in extra_meta_reasons
+                ]
+                report["rejection_reasons"] = merged_reasons
+                report["validation_status"] = "rejected"
+                if meta_corrupted:
+                    report["recording_status"] = "invalid"
         except Exception as e:
+            reasons = list(extra_meta_reasons)
+            if resolved_exit_code is None and "unknown_pilot_exit_code" not in reasons:
+                reasons.append("unknown_pilot_exit_code")
+            elif resolved_exit_code is not None and int(resolved_exit_code) != 0:
+                reasons.append(f"pilot_non_zero_exit_code ({resolved_exit_code})")
+            reasons.append(f"corrupted_bag_or_read_error ({type(e).__name__}: {e})")
             report = {
-                "pilot_exit_code": pilot_exit_code,
+                "pilot_exit_code": resolved_exit_code,
+                "pilot_status_source": pilot_status_source,
+                "configuration_status": "valid",
                 "recording_status": "invalid",
                 "mission_status": "invalid",
                 "validation_status": "rejected",
-                "rejection_reasons": [f"corrupted_bag_or_read_error ({type(e).__name__}: {e})"],
+                "rejection_reasons": reasons,
                 "primitive_results": [],
                 "metrics": {},
             }
 
-    if update_meta and meta_file.parent.is_dir():
-        existing_meta["pilot_exit_code"] = report["pilot_exit_code"]
+    # 3. Actualizar episode_meta.json de forma atomica preservando procedencia (nunca sobrescribir JSON corrupto)
+    if update_meta and not meta_corrupted and meta_file.parent.is_dir():
+        if "status" in existing_meta and "original_status" not in existing_meta:
+            existing_meta["original_status"] = existing_meta["status"]
+        if (
+            "pilot_exit_code" in existing_meta
+            and existing_meta["pilot_exit_code"] is not None
+            and "original_pilot_exit_code" not in existing_meta
+        ):
+            existing_meta["original_pilot_exit_code"] = existing_meta["pilot_exit_code"]
+        if (
+            "rejection_reasons" in existing_meta
+            and existing_meta["rejection_reasons"]
+            and "original_rejection_reasons" not in existing_meta
+        ):
+            existing_meta["original_rejection_reasons"] = list(existing_meta["rejection_reasons"])
+
+        if existing_meta.get("pilot_exit_code") is None:
+            existing_meta["pilot_exit_code"] = report["pilot_exit_code"]
+
+        existing_meta["pilot_status_source"] = report["pilot_status_source"]
+        existing_meta["configuration_status"] = report["configuration_status"]
         existing_meta["recording_status"] = report["recording_status"]
         existing_meta["mission_status"] = report["mission_status"]
         existing_meta["validation_status"] = report["validation_status"]
         existing_meta["rejection_reasons"] = report["rejection_reasons"]
         existing_meta["validation_metrics"] = report["metrics"]
         existing_meta["primitive_validation"] = report["primitive_results"]
+        existing_meta["validator_version"] = VALIDATOR_VERSION
+        existing_meta["validation_parameters"] = get_effective_validation_parameters()
         existing_meta["status"] = (
             "success" if report["validation_status"] == "accepted" else "rejected"
         )
-        with open(meta_file, "w") as f:
-            json.dump(existing_meta, f, indent=2)
+        _atomic_write_json(meta_file, existing_meta)
 
     return report
 
@@ -1395,13 +1850,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Validador fisico, geometrico y de grabacion independiente para episodios UAV."
     )
-    parser.add_argument(
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument(
         "--episode-dir",
         type=Path,
         default=None,
         help="Ruta a un directorio de episodio individual (ej. datasets/task_0001/episode_00).",
     )
-    parser.add_argument(
+    target_group.add_argument(
         "--dataset-dir",
         type=Path,
         default=None,
@@ -1420,22 +1876,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Retorna codigo de salida != 0 si al menos un episodio es rechazado.",
+        help="Retorna codigo de salida 1 si al menos un episodio del dataset es rechazado.",
     )
     args = parser.parse_args(argv)
 
-    if args.episode_dir is None and args.dataset_dir is None:
-        parser.error("Debes especificar --episode-dir o --dataset-dir.")
-
     if args.episode_dir is not None:
-        rep = validate_episode_directory(args.episode_dir, update_meta=args.update_meta)
+        ep_path = Path(args.episode_dir)
+        if not ep_path.exists() or not ep_path.is_dir():
+            print(f"Error: el directorio de episodio no existe: {args.episode_dir}", file=sys.stderr)
+            return 2
+
+        rep = validate_episode_directory(ep_path, update_meta=args.update_meta)
         if args.json:
             print(json.dumps(rep, indent=2))
         else:
             status_tag = "ACCEPTED" if rep["validation_status"] == "accepted" else "REJECTED"
             print(f"[{status_tag}] {args.episode_dir}")
             print(
-                f"  recording={rep['recording_status']} | mission={rep['mission_status']} | "
+                f"  config={rep['configuration_status']} | recording={rep['recording_status']} | "
+                f"mission={rep['mission_status']} | "
                 f"min_clear={rep['metrics'].get('min_obstacle_clearance_m', -1.0):.3f}m | "
                 f"land_err={rep['metrics'].get('landing_xy_error_m', -1.0):.3f}m"
             )
@@ -1444,11 +1903,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if rep["validation_status"] == "accepted" else 1
 
     # Modo --dataset-dir
-    ds_dir = Path(args.dataset_dir).resolve()
-    ep_dirs = sorted([
-        p for p in ds_dir.glob("task_*/episode_*")
-        if p.is_dir() and ((p / "rosbag").is_dir() or list(p.glob("*.mcap")))
-    ])
+    ds_path = Path(args.dataset_dir)
+    if not ds_path.exists() or not ds_path.is_dir():
+        print(f"Error: el directorio de dataset no existe: {args.dataset_dir}", file=sys.stderr)
+        return 2
+
+    ds_dir = ds_path.resolve()
+    ep_dirs = discover_episode_dirs(ds_dir)
+    if len(ep_dirs) == 0:
+        print(
+            f"Error: dataset vacio (no se encontraron carpetas task_*/episode_* en {ds_dir})",
+            file=sys.stderr,
+        )
+        return 2
 
     summary_list = []
     accepted_count = 0
@@ -1500,3 +1967,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

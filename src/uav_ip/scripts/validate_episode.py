@@ -21,4 +21,4 @@ from uav_ip.validate_episode import *  # noqa: F401,F403
 from uav_ip.validate_episode import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
