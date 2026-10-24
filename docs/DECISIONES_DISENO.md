@@ -349,16 +349,18 @@ La segunda revisión (`docs/feedback/respuesta.md`) encontró que la primera imp
 
 Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semánticas (pasar por fuera de un aro, tomar el flanco equivocado de un poste) y agregan carga al simulador. En su lugar se implementó [`validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py), un **filtro conservador bajo hipótesis explícitas**. No es una certificación física de ausencia de colisiones.
 
-1. **Estados en `episode_meta.json`:**
-   * `pilot_exit_code`: código de retorno del piloto.
-   * `recording_status`: el `.mcap` tiene *magic* inicial y final y `Footer`, y no presenta:
+1. **Estados en `episode_meta.json` y contrato de procedencia (`C1 + C2`):**
+   * `pilot_exit_code` y `pilot_status_source`: código de retorno del piloto y su procedencia (`"explicit_argument"`, `"recorded_meta"`, `"inferred_from_legacy_status"` o `"unknown"`). Si falta evidencia, nunca se inventa `pilot_exit_code = 0` (`unknown_pilot_exit_code`).
+   * `configuration_status`: validación estructural y semántica de `waypoints.yaml` mediante `validate_waypoints_config()` antes de evaluar el vuelo.
+   * `recording_status`: el `.mcap` existe (`missing_bag` si falta), tiene *magic* inicial y final y `Footer`, y no presenta:
      * NaN ni cuaterniones degenerados,
      * marcos distintos de NED (`pose_frame`/`velocity_frame == 1`),
-     * retrocesos de reloj no explicados por `Timesync`,
+     * relojes ausentes o no finitos (nunca se fabrica `i * 0.01`),
+     * pasos de reloj ambiguos (Patrón B o Patrón A inconsistente con sus vecinos) ni retrocesos/duplicados,
      * huecos de más de 0,15 s ni pasos de más de 0,35 m entre muestras,
      * resets de EKF2 en vuelo.
-   * `mission_status`: despegue, primitivas en el orden declarado, distancia a obstáculos y aterrizaje.
-   * `validation_status`: `accepted` si y solo si `recording_status` y `mission_status` son `valid`.
+   * `mission_status`: despegue, primitivas en el orden declarado, distancia a obstáculos y aterrizaje en ventana temporal común.
+   * `validation_status`: `accepted` si y solo si `configuration_status == "valid"`, `recording_status == "valid"`, `mission_status == "valid"`, `pilot_exit_code == 0` y `rejection_reasons` está vacío.
 2. **Envolvente y geometría** (constantes en el módulo):
 
    | Constante | Valor |
@@ -372,28 +374,30 @@ Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semá
    * el anillo de cada `circular_gate`, restando la sagita de 0,0144 m del polígono de 16 segmentos,
    * el cilindro (r = 0,10 m, h = 3,0 m) de cada `pole`.
 
-   > **Pendiente:** el radio físico de 0,23 m no está verificado contra `x500_base/model.sdf`. Con hélices de 10″ en 500 mm entre ejes de motores, la envolvente de los discos podría rondar 0,38 m. Ver `JUSTIFICACION_REVISION_TECNICA.md` §4.2.
+   > **Pendiente (Bloque 4 — C7):** el radio físico de 0,23 m se verificará contra `x500_base/model.sdf` junto con el módulo compartido `validation_geometry.py`. Ver `JUSTIFICACION_REVISION_TECNICA.md` §4.2.
 3. **Criterios por primitiva:**
    * **`traverse`:** cruce del plano x_loc = 0 con |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada) o r ≤ 0,4056 m (puerta circular). Son la luz libre menos `UAV_COLLISION_RADIUS_XY`.
    * **`slalom`:** cruce por el flanco pedido con y_cross ∈ [0,45; 2,60] m en el marco del poste.
    * **`overfly`:** z ≥ 3,30 m sobre el poste y |y| ≤ 0,85 m.
    * **`orbit`:** barrido antihorario ≥ 240° y error medio de guiñada centrípeta ≤ 45°.
    * **Orden:** los eventos de las primitivas deben ser estrictamente crecientes en el tiempo.
-4. **Aterrizaje:**
-   * Debe haber mensajes de `VehicleLandDetected`, y el último no puede tener más de 2,0 s de antigüedad.
-   * `landed == True` en los dos últimos mensajes; `ground_contact` no alcanza.
-   * En las últimas 25 muestras (≈ 0,2 s): error XY ≤ 0,75 m, z ≤ 0,25 m y velocidad ≤ 0,25 m/s.
-5. **Reloj:**
-   * Se usa `timestamp_sample`.
-   * Solo se reparan dos patrones verificados de `Timesync`: una muestra aislada con tiempo de arranque entre muestras con tiempo UNIX, o un escalón que cierra un retraso acumulado de al menos 0,15 s.
-   * Los huecos hacia adelante se conservan y los retrocesos no explicados provocan el rechazo.
+4. **Aterrizaje en ventana temporal común (`C4`):**
+   * Se evalúa sobre la duración física `landing_window_s = 0.50 s` (`[t_end - landing_window_s, t_end]`, parámetro de ingeniería a calibrar), alineando odometría y detector mediante el reloj de recepción del bag.
+   * Odometría en toda la ventana: error XY ≤ 0,75 m, z ∈ [0,0; 0,25] m y velocidad ≤ 0,25 m/s en todas las muestras del intervalo.
+   * Detector `VehicleLandDetected`: timestamps presentes, finitos y `> 0` (timestamp ausente/cero es dato inválido, no edad cero), al menos dos mensajes distintos con `landed == True` (nunca `ground_contact`), ningún `landed == False` dentro de la ventana, vigencia continua desde el inicio de la ventana con intervalos ≤ 1,5 s y antigüedad final ≤ 1,5 s.
+5. **Reloj con diagnóstico estructurado (`C3`):**
+   * `reconstruct_simulation_clock()` devuelve un `ClockReconstructionResult` con tiempo crudo, tiempo reconstruido, máscaras de pasos reparados, retrocesos/duplicados y ambigüedad, `usable_for_validation` y motivos.
+   * El **Patrón B** se marca como ambiguo (`ambiguous_clock_step_pattern_b`) y se rechaza para campaña conservando el intervalo original $\Delta t_{\text{px4}}$, evitando comprimir entregas en ráfaga tras congelamientos de la fuente.
+   * El **Patrón A** se repara de forma condicionada preservando exactamente el intervalo entre los vecinos UNIX válidos (`raw_px4[k+1] - raw_px4[k-1]`).
+   * Los duplicados y retrocesos quedan visibles en el resultado público y provocan el rechazo.
 6. **Lectura de bags:** se prioriza `rosbags`. Si no está disponible, se usa el parser nativo MCAP/CDR (offsets verificados con un MCAP sintético y contra `rosbags` sobre un bag real).
 
 ### 16.3 Endurecimiento del Piloto y del Generador
 
-* **`waypoint_controller.py`:**
+* **`base_pilot.py` y `waypoint_controller.py`:**
   * En `traverse`, el paso por `center` exige `cross_track < 0.35 m` y `alt_err < 0.40 m`, dentro de la ventana de 0,37 × 0,42 m.
-  * El aterrizaje requiere `landed == True`, z ≤ 0,25 m y al menos 3 s; a los 10 s sin confirmación termina con código 1, que `main()` propaga.
+  * `BasePilot` registra los instantes de recepción `last_pos_recv_time` y `last_land_detected_recv_time`.
+  * En `nav_state == 4`, `WaypointController` exige frescura de posición ($\le 0,5\text{ s}$) y detector ($\le 1,5\text{ s}$), posición dentro de la plataforma ($\text{xy\_err} \le 0,75\text{ m}$), $z \le 0,25\text{ m}$ y `landed == True`, manteniendo un contador de persistencia continua (`landing_persistence_s = 3.0 s`) que se reinicia si cualquier condición deja de cumplirse; al vencer `landing_timeout_s = 10.0 s` sin confirmación termina con código `1`, que `main()` propaga al proceso.
 * **`world_generator.py`:** `check_circuit_transition_feasibility` recibe `start_pose` y comprueba, para cada transición:
   * Δx ≥ 1,0 m y d_xy ≥ 1,4 m;
   * pendiente ≤ 1,15 si interviene un `traverse` (≤ 1,60 entre postes);
@@ -403,5 +407,5 @@ Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semá
 
 ### 16.4 Alcance Actual
 
-* El validador se ejecuta **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]`). `data_collector.py` todavía usa `returncode`; la integración es la **Fase 2**.
-* Los 12 episodios locales (`task_0000`–`task_0003`) son aceptados por el validador actual. Es una muestra pequeña y **no** constituye una estimación de la tasa de éxito.
+* El validador se ejecuta **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]` o `--episode-dir <dir>`), propagando códigos de retorno `0` (aceptado), `1` (rechazo) y `2` (error de argumentos/uso). `data_collector.py` todavía usa `returncode`; la integración es la **Fase 2**.
+* Al evaluar los 12 episodios históricos locales (`task_0000`–`task_0003`) bajo el criterio estricto de reloj `C3`, los 12 superan las verificaciones de configuración, primitivas, despeje a obstáculos (`> 0.43 m`) y persistencia de aterrizaje (`C4`), pero son **rechazados** en `recording_status` por presentar 1–2 escalones de offset UNIX de `uxrce_dds_client` ($\sim 0,27\text{–}0,48\text{ s}$) clasificados como ambiguos. No se relajaron los umbrales para forzar su aceptación.

@@ -42,14 +42,19 @@ class BasePilot(Node):
         self.setpoint_counter = 0
         self.landed_detected = False
         self.ground_contact_detected = False
+        self.last_pos_recv_time = None
+        self.last_land_detected_recv_time = None
 
     def _pos_callback(self, msg: VehicleLocalPosition) -> None:
         self.current_pos_ned = [float(msg.x), float(msg.y), float(msg.z)]
         self.px4_timestamp = msg.timestamp
+        self.last_pos_recv_time = self.get_clock().now()
 
     def _land_detected_callback(self, msg: VehicleLandDetected) -> None:
         self.landed_detected = bool(msg.landed)
         self.ground_contact_detected = bool(msg.ground_contact)
+        self.last_land_detected_recv_time = self.get_clock().now()
+
 
     @staticmethod
     def gazebo_to_ned(coord: Sequence[float]) -> list[float]:

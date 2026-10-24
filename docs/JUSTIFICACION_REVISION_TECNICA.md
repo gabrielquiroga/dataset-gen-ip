@@ -19,10 +19,10 @@ Este documento registra **qué se cambió, por qué, bajo qué hipótesis y qué
 
 | Componente | Qué hace hoy | Qué **no** hace todavía |
 |---|---|---|
-| `validate_episode.py` | Valida offline los episodios grabados (CLI `scripts/validate_episode.py`) y, con `--update-meta`, escribe los resultados en `episode_meta.json`. | `data_collector.py` sigue marcando el éxito por `returncode` del piloto. La integración cierre → lectura → validación → aceptación es **Fase 2**. |
-| `waypoint_controller.py` | Tolerancias de paso por `center` dentro de la ventana segura; el aterrizaje exige `landed == True` del detector de PX4 y termina con código 1 si se vence el plazo. | No verifica la posición XY de aterrizaje ni la antigüedad del mensaje del detector; eso queda a cargo del validador. |
+| `validate_episode.py` | Valida offline la configuración (`waypoints.yaml`), grabación y misión (CLI `scripts/validate_episode.py` con códigos `0`, `1`, `2`), descubre carpetas completas de episodios (`missing_bag`), preserva la procedencia de `pilot_exit_code` y escribe `episode_meta.json` de forma atómica con `--update-meta`. | `data_collector.py` sigue marcando el éxito por `returncode` del piloto. La integración cierre → lectura → validación → aceptación es **Fase 2**. |
+| `waypoint_controller.py` / `base_pilot.py` | Tolerancias de paso por `center` dentro de la ventana segura; el aterrizaje verifica frescura de posición y detector, posición XY en plataforma, `z ≤ 0.25 m`, `landed == True` y un contador de persistencia continua (`landing_persistence_s = 3.0 s`), terminando con código `1` propagado al proceso si vence `landing_timeout_s = 10.0 s`. | El piloto sigue siendo una máquina de estados cinemática por waypoints; la validación independiente posterior al vuelo sigue siendo indispensable. |
 | `world_generator.py` | Filtro previo de transiciones (incluye el tramo `start_pose → pre_1` y la interferencia de los tramos rectos con landmarks de terceros). | No es una garantía de que el vuelo sea factible: es una heurística que descarta escenarios degenerados. |
-| Tests | 17 tests (`test_synthetic_lidar.py`, `test_validation_clock.py`), incluidos los 9 falsos positivos de `respuesta.md` §6.D y un MCAP binario sintético. | Los tests sobre bags reales se **omiten** (`pytest.skip`) si `datasets/` no está presente. |
+| Tests | 42 tests en 5 módulos (`test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py`, `test_synthetic_lidar.py`), incluidos los contratos CLI/metadatos (`C1–C2`), reloj estructurado (`C3`) y ventana temporal de aterrizaje (`C4`). | Los tests sobre bags reales se **omiten** (`pytest.skip`) si `datasets/` no está presente. |
 
 ---
 
@@ -30,40 +30,48 @@ Este documento registra **qué se cambió, por qué, bajo qué hipótesis y qué
 
 | Punto | Clasificación | Decisión | Archivo |
 |---|---|---|---|
-| Éxito = `pilot.returncode == 0` | Error real crítico | Cuatro estados separados (`pilot_exit_code`, `recording_status`, `mission_status`, `validation_status`) calculados a partir del `.mcap` y de `waypoints.yaml`. | `validate_episode.py` |
+| Éxito = `pilot.returncode == 0` | Error real crítico | Cinco estados separados (`pilot_exit_code`, `configuration_status`, `recording_status`, `mission_status`, `validation_status`) más `pilot_status_source` calculados a partir de `waypoints.yaml`, `episode_meta.json` y el `.mcap`. | `validate_episode.py` |
 | `cross_track < 1.4 m` en una puerta de ±0,65 m libres | Error real crítico | Paso por `center`: `cross_track < 0.35 m`, `alt_err < 0.40 m`. El validador exige además el cruce por el plano de la puerta dentro de `|y| ≤ 0.37 m`, `|z| ≤ 0.42 m`. | `waypoint_controller.py`, `validate_episode.py` |
-| Aterrizaje con temporizador fijo de 4 s | Debilidad real | Exige `landed == True` y `z ≤ 0.25 m` durante al menos 3 s; si pasan 10 s sin confirmación, termina con código 1 (que se propaga al proceso). | `waypoint_controller.py` |
+| Aterrizaje con temporizador fijo de 4 s | Debilidad real | Exige frescura de mensajes, posición XY en pad, `z ≤ 0.25 m` y `landed == True` con contador de persistencia continua de `3.0 s` (se reinicia si alguna condición cae); si pasan `10.0 s` sin confirmación, termina con código `1` propagado al proceso. | `base_pilot.py`, `waypoint_controller.py` |
 | Plugins de contacto de Gazebo | Problema real, solución desproporcionada | Se reemplazaron por un chequeo geométrico conservador fuera de línea (§5.1). | `validate_episode.py` |
 | Factibilidad de transiciones | Mejora preventiva | `check_circuit_transition_feasibility` (§4.7). | `world_generator.py` |
-| Saltos de reloj PX4 vs `rosbag2` | Hallazgo empírico | Solo se reparan los patrones verificados de `Timesync`; cualquier otro retroceso provoca el rechazo (§4.5). | `validate_episode.py` |
+| Saltos de reloj PX4 vs `rosbag2` | Hallazgo empírico | `reconstruct_simulation_clock()` devuelve diagnóstico estructurado (`usable_for_validation`, máscaras de reparación/retroceso/ambigüedad); el Patrón B se marca como ambiguo y se rechaza para campaña (§4.5). | `validate_episode.py` |
 | *Minimum-snap* / `B2_BSPLINE` | Desproporcionado para esta etapa | Descartado (§5.2). | — |
 | `W = 3–4` demos de contexto | Desproporcionado como requisito de recolección | Descartado como requisito; con ≥ 5 episodios aceptados por tarea se puede evaluar `W ∈ {1..4}` (§5.3). | — |
 
 ---
 
-## 4. Fase 1.1: correcciones a partir de `respuesta.md`
+## 4. Fase 1.1: correcciones a partir de `respuesta.md` y `plan_f1.md`
 
-La segunda revisión encontró que la Fase 1 dejaba pasar aceptaciones incorrectas. Cada punto se documenta abajo con la estructura de seis partes.
+La segunda revisión (`respuesta.md`) y el plan quirúrgico de cierre (`plan_f1.md`) identificaron casos donde la Fase 1 todavía permitía aceptaciones o diagnósticos silenciosos. Cada punto se documenta abajo con la estructura de seis partes.
 
-### 4.1 Confirmación de aterrizaje y código de salida (`respuesta.md` §3.1)
+### 4.1 Confirmación de aterrizaje en ventana temporal común y código de salida (`respuesta.md` §3.1, `plan_f1.md` C1/C2/C4)
 
-1. **Riesgo.** Se aceptaba un aterrizaje sin mensajes del detector, se trataba `ground_contact` como si fuera `landed`, se usaban mínimos históricos (bastaba con pasar cerca de la plataforma una vez) y el piloto podía terminar con código 0 aunque se venciera el plazo.
+1. **Riesgo.**
+   - Se aceptaba un aterrizaje sin mensajes del detector o con un único flag final, se trataba un timestamp ausente/cero como antigüedad cero (`age = 0.0`), y la ventana terminal se definía por número fijo de muestras (`25 muestras`), acoplando la duración evaluada a la frecuencia de muestreo.
+   - En el piloto (`WaypointController`), `elapsed >= 3.0` medía el tiempo desde la entrada a `AUTO_LAND`, no el tiempo continuo cumpliendo las condiciones de aterrizaje, y no se verificaba la frescura de la posición ni del detector ni el error XY al pad.
+   - En el CLI (`scripts/validate_episode.py`), no se propagaba `sys.exit(main())`, el descubrimiento por `*.mcap` ocultaba episodios sin bag, y la revalidación sin `pilot_exit_code` usaba `existing_meta.get("status", "success")` fabricando éxito por defecto.
 2. **Solución elegida.**
-   - **Validador:**
-     - Rechaza si no hay mensajes de `VehicleLandDetected` (`missing_land_detected_messages`).
-     - Rechaza si el último mensaje tiene una antigüedad de más de 2,0 s respecto de la última muestra de odometría, medida con el reloj del bag (`stale_land_detector_message`).
-     - Exige `landed == True` en los **dos últimos** mensajes del detector; `ground_contact` no alcanza.
-     - Sobre la **ventana final** (las últimas 25 muestras de odometría, ≈ 0,2 s a 125 Hz) exige error XY máximo ≤ 0,75 m (plataforma de ±1,0 m), altura máxima ≤ 0,25 m y velocidad máxima ≤ 0,25 m/s.
-   - **Piloto:**
-     - Considera el aterrizaje cumplido con `landed && z ≤ 0.25 m && t ≥ 3 s`.
-     - Si se alcanzan 10 s sin confirmación, lanza `SystemExit(1)`, y `main()` llama a `sys.exit(código)` después de `rclpy.shutdown()`.
-3. **Hipótesis necesarias.** El detector de PX4 SITL publica `landed` de forma confiable en `gz_x500`. Una ventana de 25 muestras basta para caracterizar el reposo final.
-4. **Evidencia disponible.** Los casos 1–4 de `test_validate_episode_false_positive_battery` cubren: sin detector, contacto sin `landed`, terminó fuera de la plataforma y código de salida ≠ 0. Los 12 episodios locales siguen aceptados.
+   - **CLI, descubrimiento y procedencia (`C1 + C2`):**
+     - `scripts/validate_episode.py` propaga `sys.exit(main())` con contrato de salida `0` (todos los episodios aceptados), `1` (al menos un episodio rechazado) y `2` (error de uso, argumentos mutuamente excluyentes `--episode-dir` / `--dataset-dir`, rutas inexistentes o dataset vacío).
+     - `discover_episode_dirs()` descubre todas las carpetas `task_*/episode_*` y reporta `missing_bag` si falta el `.mcap`.
+     - `validate_waypoints_config()` valida estructural y semánticamente `waypoints.yaml` antes de evaluar el vuelo (`configuration_status`).
+     - Nunca se inventa `pilot_exit_code = 0` cuando falta evidencia (`unknown_pilot_exit_code`); `pilot_status_source` distingue `"explicit_argument"`, `"recorded_meta"`, `"inferred_from_legacy_status"` y `"unknown"`, y `--update-meta` escribe `episode_meta.json` de forma atómica (`tempfile.mkstemp` + `os.fsync` + `os.replace`) sin sobrescribir JSONs corruptos.
+   - **Validador de aterrizaje en ventana temporal común (`C4`):**
+     - Sustituye "últimas 25 muestras" por una duración física parametrizable `landing_window_s = 0.50 s` (identificada como elección de ingeniería inicial a calibrar, no garantía física), alineando odometría y detector mediante el reloj de recepción del bag.
+     - Exige cobertura completa de odometría en `[t_end - landing_window_s, t_end]` con error XY máximo ≤ `0.75 m`, altura en `[0.0, 0.25] m` y velocidad máxima ≤ `0.25 m/s` en **todas** las muestras de la ventana.
+     - Exige persistencia real de `VehicleLandDetected.landed == True` (nunca `ground_contact`): timestamps presentes, finitos y `> 0` (`invalid_land_detector_timestamp` si falta o es cero), al menos 2 mensajes distintos con `landed == True` en la racha final contigua, ningún `landed == False` dentro de la ventana, mensaje `landed == True` vigente al inicio de la ventana (`t_win_start`) con intervalos entre mensajes ≤ `1.5 s` (`LANDING_MAX_DETECTOR_INTERVAL_S`) y antigüedad final ≤ `1.5 s` (`LANDING_MAX_DETECTOR_AGE_S`).
+   - **Piloto (`BasePilot` y `WaypointController`):**
+     - `BasePilot` registra `last_pos_recv_time` y `last_land_detected_recv_time` al recibir cada mensaje.
+     - En `nav_state == 4`, `WaypointController` verifica frescura (`pos_age_s ≤ 0.5 s`, `ld_age_s ≤ 1.5 s`), `xy_err ≤ 0.75 m`, `z ≤ 0.25 m` y `landed_detected == True`. Mantiene un contador de persistencia continua (`landed_persistence_start_time`) que solo avanza mientras **todas** las condiciones se cumplen y se reinicia a `None` si cualquiera deja de cumplirse. Si vence `landing_timeout_s = 10.0 s` antes de acumular `landing_persistence_s = 3.0 s`, termina con código `1` propagado al proceso.
+3. **Hipótesis necesarias.** El reloj de recepción del bag (`log_time`) refleja con fidelidad suficiente la alineación entre odometría y `VehicleLandDetected` en el mismo proceso grabador; en PX4 SITL `VehicleLandDetected` se publica a ~1 Hz una vez alcanzado el reposo, por lo que una vigencia máxima de `1.5 s` entre mensajes consecutivos cubre la tasa nominal sin aceptar mensajes obsoletos.
+4. **Evidencia disponible.**
+   - `test_validation_cli.py` (6 tests en subproceso real) y `test_validation_contract.py` (8 tests de contrato YAML, procedencia y escritura atómica).
+   - `test_landing_validation.py` (8 tests): un único `landed=True` rechazado, dos mensajes antiguos rechazados, timestamp cero/ausente rechazado como inválido, `landed=False` dentro de la ventana rechazado, `ground_contact=True` con `landed=False` rechazado, equivalencia de duración entre 50 Hz y 125 Hz, paso cercano al pad seguido de reposo afuera rechazado, y reinicio de persistencia + código de salida `1` en subproceso real de `WaypointController`.
 5. **Limitación residual.**
-   - La ventana de reposo es corta (≈ 0,2 s).
-   - "Los dos últimos mensajes" no está sincronizado muestra a muestra con la ventana de odometría: solo se exige que sean recientes.
-   - El piloto no chequea la posición XY de aterrizaje.
-6. **Condición para revisarla.** Si aparecen episodios aceptados con rebote o deriva después del contacto, alargar la ventana a ≥ 1 s y exigir `landed` en todos los mensajes del detector que caigan dentro de ella.
+   - La alineación entre odometría y detector en la ventana de aterrizaje usa el tiempo de recepción del bag (`log_time`), no el reloj del estimador.
+   - `landing_window_s = 0.50 s` y `LANDING_MAX_FINAL_Z_M = 0.25 m` son parámetros de ingeniería iniciales que deben calibrarse con la altura real del centro del modelo en reposo.
+6. **Condición para revisarla.** Durante el piloto pre-campaña (Fase 3), calibrar la altura de reposo del modelo y evaluar si `landing_window_s` debe ampliarse a `≥ 1.0 s`.
 
 ### 4.2 Envolvente del UAV y geometría de las puertas (`respuesta.md` §3.2)
 
@@ -126,22 +134,23 @@ La segunda revisión encontró que la Fase 1 dejaba pasar aceptaciones incorrect
    - Si `rosbags` falla al deserializar, se vuelve en silencio al parser nativo.
 6. **Condición para revisarla.** Si se cambia la versión de PX4/`px4_msgs`, volver a correr la comparación `rosbags` vs nativo antes de grabar.
 
-### 4.5 Reconstrucción del reloj (`respuesta.md` §3.5 y §6.C)
+### 4.5 Reconstrucción del reloj con diagnóstico estructurado (`respuesta.md` §3.5, `plan_f1.md` C3)
 
-1. **Riesgo.** La versión anterior reemplazaba por Δt_bag **cualquier** discrepancia de más de 50 ms. Eso podía borrar congelamientos reales de la fuente y "fabricar" un reloj monótono.
+1. **Riesgo.**
+   - Reemplazar automáticamente el **Patrón B** ("retraso acumulado $\ge 0.15\text{ s}$ antes, retraso pequeño $[-0.02, +0.05]\text{ s}$ después") por $\Delta t_{\text{bag}}$ confundía una actualización de offset `Timesync` con una entrega en ráfaga tras una congelación o pérdida de muestras de la fuente, borrando huecos reales de hasta $700\text{ ms}$.
+   - El **Patrón A** (muestra aislada en tiempo de arranque $< 10^6\text{ s}$ entre muestras UNIX $> 10^8\text{ s}$) reemplazaba ambos intervalos por $\Delta t_{\text{bag}}$ sin verificar si existía un hueco real entre los vecinos UNIX válidos (`raw_px4[k+1] - raw_px4[k-1]`).
+   - Cuando faltaba un reloj se fabricaba una serie sintética `i * 0.01`, y los retrocesos o duplicados se reemplazaban por `max(1e-6, dt_bag)` ocultándolos en el eje devuelto por `reconstruct_simulation_clock()`.
 2. **Solución elegida.**
-   - Se usa `timestamp_sample` (instante de integración de EKF2) en lugar de `timestamp`.
-   - Solo se reparan dos patrones verificables de `Timesync`:
-     - **(A)** una muestra aislada con tiempo de arranque (< 10⁶ s) entre muestras con tiempo UNIX (> 10⁸ s);
-     - **(B)** un escalón que cierra un retraso acumulado de al menos 0,15 s, dejando un retraso final entre −0,02 s y +0,05 s.
-   - Los huecos hacia adelante sin explicación **se conservan**, y el chequeo de 0,15 s los rechaza.
-   - Los retrocesos sin explicación se regularizan solo para que el eje temporal sea utilizable, pero se cuentan en `unexplained_clock_backsteps` y el episodio se **rechaza**.
-3. **Hipótesis necesarias.** Los patrones A y B describen el comportamiento de `uxrce_dds_client` en esta versión de PX4 SITL. Se derivaron de inspeccionar los 12 episodios, no de su código fuente.
+   - **Contrato público estructurado (`ClockReconstructionResult`):** `reconstruct_simulation_clock(ts_px4_s, ts_bag_s)` devuelve un diccionario estructurado con `raw_time_s`, `received_time_s`, `reconstructed_time_s`, `repaired_step_mask`, `backstep_or_duplicate_mask`, `ambiguous_step_mask`, `repaired_events`, intervalos máximos/mínimos originales y reconstruidos, `usable_for_validation` y `reasons`.
+   - **Retiro de la reparación automática del Patrón B:** el Patrón B se marca en `ambiguous_step_mask`, conserva intacto el intervalo original $\Delta t_{\text{px4}}$ (nunca comprime un hueco en ráfaga) y fija `usable_for_validation = False` con motivo `ambiguous_clock_step_pattern_b`.
+   - **Reparación condicionada del Patrón A:** para una muestra aislada en tiempo de arranque $k$ entre vecinos UNIX válidos $k-1$ y $k+1$, se preserva exactamente el intervalo entre vecinos válidos ($\Delta t_{k-1} + \Delta t_k = t_{\text{px4}}[k+1] - t_{\text{px4}}[k-1]$) repartiéndolo proporcionalmente a $(\Delta t_{\text{bag}}[k-1], \Delta t_{\text{bag}}[k])$. Solo se acepta como reparación válida si ambos pasos de recepción están en $(0, 0.10]\text{ s}$, la diferencia entre el span UNIX y el span de recepción es $\le 0.05\text{ s}$ y ningún subpaso supera `MAX_ALLOWED_DT_GAP_S` ($0.15\text{ s}$); de lo contrario se marca como ambiguo (`ambiguous_clock_step_pattern_a`) y se rechaza.
+   - **Visibilidad de retrocesos/duplicados y prohibición de fabricar relojes:** los pasos con $\Delta t \le 0$ no se maquillan con `1e-6` y quedan visibles tanto en `reconstructed_time_s` como en `backstep_or_duplicate_mask`. Si falta `timestamp` o `timestamp_sample_us`/`timestamp_us` (o es $\le 0$ o no finito), se rechaza inmediatamente (`missing_or_invalid_bag_timestamps` / `missing_or_invalid_px4_timestamps`) sin fabricar `i * 0.01`.
+3. **Hipótesis necesarias.** Es preferible rechazar un episodio con ambigüedad de sincronización (`uxrce_dds_client`) que aceptar en el dataset de entrenamiento una trayectoria con un hueco temporal comprimido.
 4. **Evidencia disponible.**
-   - `test_validation_clock.py` incluye los dos tests propuestos por el experto: no borrar un hueco de 700 ms y contabilizar un retroceso.
-   - Los 12 episodios locales: Δt mediano de 8,0 ms y ningún retroceso sin explicar.
-5. **Limitación residual.** Los umbrales de los patrones son empíricos y pueden no generalizar a otra máquina con más *jitter*. Un patrón nuevo de `Timesync` se rechazaría, lo que es conservador.
-6. **Condición para revisarla.** Si la tasa de rechazo por `non_monotonic_or_stalled_simulation_clock` o `telemetry_dropout_gap` es significativa en el piloto de Fase 2, inspeccionar los casos antes de ampliar los patrones.
+   - `test_validation_clock.py` (6 tests): `test_unix_delivery_backlog_does_not_erase_source_gap` (700 ms en ráfaga no se convierte en 16 ms), visibilidad de duplicados y retrocesos, preservación del intervalo entre vecinos en Patrón A, rechazo de relojes ausentes/no finitos y rechazo de extremo a extremo en `validate_episode_data()`.
+   - Al evaluar los 12 episodios históricos de `datasets/task_0000`–`task_0003` con este criterio más estricto, los 12 quedan rechazados en `recording_status` porque contienen 1–2 escalones de offset UNIX de `uxrce_dds_client` de $\sim 0.27\text{–}0.48\text{ s}$ (Patrón B o Patrón A con salto entre vecinos). No se relajaron los umbrales para forzar su aceptación.
+5. **Limitación residual.** En la configuración actual de `uxrce_dds_client` + PX4 SITL, los reajustes de offset UNIX durante el vuelo provocan rechazos conservadores bajo Patrón B porque el mensaje `VehicleOdometry` exportado no separa el reloj monotónico de PX4 del offset UNIX estimado por el puente.
+6. **Condición para revisarla.** Si en el piloto de Fase 2/3 los reajustes de `Timesync` de `uxrce_dds_client` siguen provocando rechazos frecuentes en vuelos físicamente limpios, grabar también el tópico `/fmu/out/timesync_status` para verificar analíticamente el cambio de offset antes de reparar un escalón.
 
 ### 4.6 Condiciones calculadas que antes no se exigían (`respuesta.md` §3.6)
 

@@ -214,41 +214,41 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 - [x] **Tarea 2.5.2: Tolerancias del piloto y confirmación de aterrizaje (`waypoint_controller.py`, `base_pilot.py`).**
 - [x] **Tarea 2.5.3: Factibilidad de transiciones (`world_generator.py`).**
 
-#### Fase 1.1: Correcciones por la Segunda Revisión (`docs/feedback/respuesta.md`) — [x] COMPLETADO
-- [x] **Aterrizaje:**
-  * El validador exige mensajes de `VehicleLandDetected` con una antigüedad de hasta 2 s y `landed == True` en los dos últimos (nunca solo `ground_contact`).
-  * Sobre la ventana final (25 muestras) exige error XY ≤ 0,75 m, z ≤ 0,25 m y velocidad ≤ 0,25 m/s.
-  * El piloto termina con código 1 si se vence el plazo de 10 s, y `main()` propaga ese código.
-- [x] **Envolvente única:**
+#### Fase 1.1: Correcciones por la Segunda Revisión (`docs/feedback/respuesta.md` y `docs/feedback/plan_f1.md`) — [EN PROGRESO: BLOQUES 1 Y 2 COMPLETADOS]
+- [x] **CLI, descubrimiento y contrato de configuración/procedencia (`C1 + C2`):**
+  * `scripts/validate_episode.py` propaga `sys.exit(main())` con códigos `0` (aceptado), `1` (rechazo) y `2` (error de uso/argumentos mutuamente excluyentes/rutas vacías o inexistentes).
+  * `discover_episode_dirs()` descubre todas las carpetas `task_*/episode_*` y reporta `missing_bag` cuando falta `.mcap`.
+  * `validate_waypoints_config()` valida `waypoints.yaml` antes de evaluar la misión (`configuration_status`).
+  * Preservación de procedencia de `pilot_exit_code` (`pilot_status_source`) sin inventar éxito por defecto (`unknown_pilot_exit_code`) y escritura atómica de `episode_meta.json` con `--update-meta`.
+- [x] **Reloj con diagnóstico estructurado (`C3`):**
+  * `reconstruct_simulation_clock()` devuelve un `ClockReconstructionResult` con máscaras de reparación, retroceso/duplicado y ambigüedad, `usable_for_validation` y motivos.
+  * El Patrón B se marca como ambiguo (`ambiguous_clock_step_pattern_b`) y se rechaza para campaña sin comprimir entregas en ráfaga.
+  * El Patrón A preserva el intervalo entre vecinos UNIX válidos (`raw_px4[k+1] - raw_px4[k-1]`).
+  * Se eliminó la fabricación de timestamps con `i * 0.01`; relojes ausentes o no finitos provocan rechazo.
+- [x] **Aterrizaje sobre ventana temporal común y frescura del piloto (`C4`):**
+  * Sustitución de "últimas 25 muestras" por `landing_window_s = 0.50 s` (parámetro de ingeniería inicial a calibrar), evaluando error XY ≤ 0,75 m, z ∈ [0,0; 0,25] m y velocidad ≤ 0,25 m/s en toda la ventana.
+  * Persistencia real de `VehicleLandDetected.landed == True` (nunca `ground_contact`) en toda la ventana con al menos 2 mensajes distintos, timestamps finitos `> 0` y vigencia ≤ 1,5 s.
+  * `BasePilot` registra `last_pos_recv_time` y `last_land_detected_recv_time`; `WaypointController` exige frescura, posición XY en plataforma, `z ≤ 0.25 m`, `landed == True` y un contador de persistencia continua (`landing_persistence_s = 3.0 s`) que se reinicia si alguna condición cae, saliendo con código `1` propagado al proceso al vencer `landing_timeout_s = 10.0 s`.
+- [x] **Envolvente única (pendiente consolidar en `validation_geometry.py` y medir SDF en `C7`):**
   * `UAV_COLLISION_RADIUS_XY = 0.23 + 0.05 = 0.28 m`.
   * Ventana de `traverse`: |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada), r ≤ 0,4056 m (puerta circular).
   * Piloto: `cross_track < 0.35 m`, `alt_err < 0.40 m`.
-- [x] **Colisiones entre muestras:**
+- [x] **Colisiones entre muestras (pendiente cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ en `C7`):**
   * Subdivisión de segmentos a ≤ 0,02 m.
   * Hueco temporal máximo de 0,15 s y paso espacial máximo de 0,35 m.
-  * Sagita del anillo poligonal de 16 segmentos.
-- [x] **Lectura de bags:**
+- [x] **Lectura de bags (pendiente eliminar degradación silenciosa y fijar política de odometría en `C5 + C6`):**
   * Se prioriza `rosbags`.
   * Verificación de *magic* inicial y final y `Footer` (los MCAP truncados se rechazan).
   * Offsets CDR corregidos (`vx` 56, `heading` 104, `at_rest` 23, `arming_state` 28, `nav_state` 45, `failsafe` 62).
-- [x] **Reloj:**
-  * `timestamp_sample`.
-  * Solo se reparan los patrones verificados de `Timesync`.
-  * Los huecos hacia adelante se conservan y los retrocesos no explicados provocan el rechazo.
-- [x] **Condiciones exigidas:**
+- [x] **Condiciones exigidas (pendiente secuencia temporal progresiva `start_index`/`completion_index` en `C8`):**
   * Orden temporal de las primitivas.
   * Error medio de guiñada ≤ 45° y barrido ≥ 240° en `orbit`.
   * `pose_frame`/`velocity_frame == 1` y *flags* de validez.
 - [x] **`world_generator.py`:**
   * `start_pose` se genera antes del circuito y se pasa al chequeo de factibilidad.
   * Los tramos rectos de transición se comparan contra landmarks de terceros.
-- [x] **Tests:**
-  * `test_validation_clock.py`: los tests de reloj propuestos por el experto.
-  * Batería de 9 falsos positivos (`respuesta.md` §6.D).
-  * MCAP binario sintético (offsets e integridad).
-  * Comparación `rosbags` vs parser nativo sobre un bag real.
-  * `pytest.skip` explícito si `datasets/` no existe.
-- [ ] **Pendiente antes de la campaña:** verificar `UAV_PHYSICAL_RADIUS_XY = 0.23 m` contra `x500_base/model.sdf`. La envolvente de los discos de hélice podría rondar 0,38 m (`JUSTIFICACION_REVISION_TECNICA.md` §4.2).
+- [x] **Tests modulares (`C1–C4` implementados; `C5–C9` en Bloques 3 y 4):**
+  * `test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py` y `test_synthetic_lidar.py` (42 tests en total).
 
 #### Fase 2: Integración en la Recolección, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
 - [ ] **Tarea 2.5.4: Integrar el validador en `data_collector.py`:**

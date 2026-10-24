@@ -28,11 +28,27 @@ class WaypointController(BasePilot):
     ORBIT_SPEED_FF = 1.2
     ORBIT_ARC_STEPS = 12
 
+    # Umbrales de frescura y persistencia real de aterrizaje
+    LANDING_MAX_POS_AGE_S = 0.5
+    LANDING_MAX_DETECTOR_AGE_S = 1.5
+    LANDING_PERSISTENCE_REQUIRED_S = 3.0
+    LANDING_TIMEOUT_S = 10.0
+    LANDING_MAX_Z_ENU_M = 0.25
+    LANDING_MAX_XY_ERR_M = 0.75
+
     def __init__(self):
         super().__init__("waypoint_controller")
 
         self.declare_parameter("waypoints_file", "")
+        self.declare_parameter("landing_persistence_s", self.LANDING_PERSISTENCE_REQUIRED_S)
+        self.declare_parameter("landing_timeout_s", self.LANDING_TIMEOUT_S)
         wp_file = self.get_parameter("waypoints_file").get_parameter_value().string_value
+        self.landing_persistence_s = float(
+            self.get_parameter("landing_persistence_s").get_parameter_value().double_value
+        )
+        self.landing_timeout_s = float(
+            self.get_parameter("landing_timeout_s").get_parameter_value().double_value
+        )
         if not wp_file:
             self.get_logger().fatal("Parameter 'waypoints_file' not provided.")
             raise SystemExit(1)
@@ -47,8 +63,11 @@ class WaypointController(BasePilot):
         self.current_wp = 0
         self.target_yaw = math.pi / 2.0
         self.exit_code = 0
+        self.land_start_time = None
+        self.landed_persistence_start_time = None
 
         self.timer = self.create_timer(0.02, self._control_loop)
+
 
     def _build_waypoints(self, yaml_path: Path) -> list:
         with open(yaml_path, "r") as fh:
@@ -364,26 +383,61 @@ class WaypointController(BasePilot):
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
             self.nav_state = 4
         elif self.nav_state == 4:
-            target = self.gazebo_to_ned(self.waypoints_ned[-1]["pos"])
-            if not hasattr(self, "land_start_time"):
-                self.land_start_time = self.get_clock().now()
-            elapsed = (self.get_clock().now() - self.land_start_time).nanoseconds / 1e9
+            pad_enu = self.waypoints_ned[-1]["pos"]
+            target = self.gazebo_to_ned(pad_enu)
+            now = self.get_clock().now()
+            if getattr(self, "land_start_time", None) is None:
+                self.land_start_time = now
+            elapsed = (now - self.land_start_time).nanoseconds / 1e9
             curr_enu = self.ned_to_gazebo(self.current_pos_ned)
-            landed_ok = bool(self.landed_detected and curr_enu[2] <= 0.25 and elapsed >= 3.0)
-            if landed_ok:
+            xy_err = math.hypot(curr_enu[0] - pad_enu[0], curr_enu[1] - pad_enu[1])
+
+            last_pos_t = getattr(self, "last_pos_recv_time", None)
+            last_ld_t = getattr(self, "last_land_detected_recv_time", None)
+            pos_age_s = (
+                (now - last_pos_t).nanoseconds / 1e9 if last_pos_t is not None else float("inf")
+            )
+            ld_age_s = (
+                (now - last_ld_t).nanoseconds / 1e9 if last_ld_t is not None else float("inf")
+            )
+            pos_fresh = 0.0 <= pos_age_s <= getattr(self, "LANDING_MAX_POS_AGE_S", 0.5)
+            ld_fresh = 0.0 <= ld_age_s <= getattr(self, "LANDING_MAX_DETECTOR_AGE_S", 1.5)
+
+            conditions_met = bool(
+                pos_fresh
+                and ld_fresh
+                and self.landed_detected
+                and curr_enu[2] <= getattr(self, "LANDING_MAX_Z_ENU_M", 0.25)
+                and xy_err <= getattr(self, "LANDING_MAX_XY_ERR_M", 0.75)
+            )
+            if conditions_met:
+                if getattr(self, "landed_persistence_start_time", None) is None:
+                    self.landed_persistence_start_time = now
+                persisted_s = (now - self.landed_persistence_start_time).nanoseconds / 1e9
+            else:
+                self.landed_persistence_start_time = None
+                persisted_s = 0.0
+
+            req_pers = getattr(self, "landing_persistence_s", 3.0)
+            max_timeout = getattr(self, "landing_timeout_s", 10.0)
+            if conditions_met and persisted_s >= req_pers:
                 self.get_logger().info(
-                    f"Aterrizaje confirmado por detector PX4 (landed={self.landed_detected}, z={curr_enu[2]:.2f}m, t={elapsed:.1f}s)."
+                    f"Aterrizaje confirmado por detector PX4 (landed={self.landed_detected}, "
+                    f"z={curr_enu[2]:.2f}m, xy_err={xy_err:.2f}m, persisted={persisted_s:.2f}s)."
                 )
                 self.exit_code = 0
                 self.nav_state = 5
-            elif elapsed >= 10.0:
+            elif elapsed >= max_timeout:
                 self.get_logger().error(
-                    f"Timeout de confirmación de aterrizaje sin señal landed ({elapsed:.1f}s, z={curr_enu[2]:.2f}m). Saliendo con error."
+                    f"Timeout de confirmación de aterrizaje ({elapsed:.1f}s >= {max_timeout:.1f}s, "
+                    f"landed={self.landed_detected}, pos_fresh={pos_fresh}, ld_fresh={ld_fresh}, "
+                    f"z={curr_enu[2]:.2f}m, xy_err={xy_err:.2f}m, persisted={persisted_s:.2f}s). Saliendo con error."
                 )
                 self.exit_code = 1
                 self.nav_state = 5
         elif self.nav_state == 5:
             raise SystemExit(self.exit_code)
+
 
         self.publish_offboard_mode(use_velocity=(vel_ff_ned is not None))
         if self.nav_state < 4:

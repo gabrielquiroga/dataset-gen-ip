@@ -117,10 +117,12 @@ MIN_ACTIVE_GROUND_Z_M: float = 0.15
 MAX_ALLOWED_DT_GAP_S: float = 0.15      # Hueco temporal maximo admisible entre muestras (150 ms)
 MAX_ALLOWED_STEP_DIST_M: float = 0.35   # Paso espacial maximo admisible entre muestras consecutivas (m)
 
+LANDING_WINDOW_S: float = 0.50          # Duracion de la ventana temporal final de aterrizaje (s, parametro de ingenieria)
 LANDING_MAX_XY_ERR_M: float = 0.75      # Error radial maximo en la ventana final de reposo (dentro del pad ±1.0m)
 LANDING_MAX_FINAL_Z_M: float = 0.25     # Altitud maxima en la ventana final de reposo (m)
 LANDING_MAX_FINAL_SPEED: float = 0.25   # Velocidad maxima en la ventana final de reposo (m/s)
-LANDING_MAX_DETECTOR_AGE_S: float = 2.0 # Antigüedad maxima del ultimo mensaje VehicleLandDetected (s)
+LANDING_MAX_DETECTOR_AGE_S: float = 1.5 # Antigüedad maxima del ultimo mensaje VehicleLandDetected al cierre (s)
+LANDING_MAX_DETECTOR_INTERVAL_S: float = 1.5  # Intervalo maximo admisible sin evidencia entre mensajes del detector (s)
 
 MCAP_MAGIC = b"\x89MCAP0\r\n"
 
@@ -155,11 +157,14 @@ def get_effective_validation_parameters() -> Dict[str, Any]:
         "min_active_ground_z_m": MIN_ACTIVE_GROUND_Z_M,
         "max_allowed_dt_gap_s": MAX_ALLOWED_DT_GAP_S,
         "max_allowed_step_dist_m": MAX_ALLOWED_STEP_DIST_M,
+        "landing_window_s": LANDING_WINDOW_S,
         "landing_max_xy_err_m": LANDING_MAX_XY_ERR_M,
         "landing_max_final_z_m": LANDING_MAX_FINAL_Z_M,
         "landing_max_final_speed_mps": LANDING_MAX_FINAL_SPEED,
         "landing_max_detector_age_s": LANDING_MAX_DETECTOR_AGE_S,
+        "landing_max_detector_interval_s": LANDING_MAX_DETECTOR_INTERVAL_S,
     }
+
 
 
 
@@ -909,96 +914,447 @@ def _verify_single_primitive(
         return result
 
 
-def _detect_timesync_and_clock_anomalies(
-    ts_px4_s: np.ndarray,
-    ts_bag_s: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+class ClockReconstructionResult(dict):
     """
-    Clasifica cada transicion temporal `i -> i+1` entre:
-      1. `verified_timesync_mask`: recalibracion verificable del offset `Timesync` de `uxrce_dds_client`:
-         - Patron A: muestra aislada `k` en tiempo crudo de boot (`< 1e6` s) rodeada por muestras en
-           epoca UNIX (`> 1e8` s) con `0 < dt_bag <= 0.10` s.
-         - Patron B: escalon de resincronizacion que corrige un retardo acumulado (`lag_before >= 0.15` s)
-           entre el reloj de PX4 y el reloj UNIX del host, dejando `lag_after in [-0.02, +0.05]` s
-           con `0 < dt_bag <= 0.10` s.
-      2. `unexplained_backstep_mask`: retrocesos o estancamientos (`dt_px4 <= 0`) que NO corresponden
-         al Patron A de `Timesync`.
-    Retorna `(dt_reconstructed, verified_timesync_mask, unexplained_backstep_mask)`.
+    Resultado estructurado de `reconstruct_simulation_clock()`.
+    Hereda de `dict` para serializacion directa e inspeccion por clave, y expone acceso por atributo.
     """
-    N = len(ts_px4_s)
-    if N <= 1:
-        empty_b = np.zeros(0, dtype=bool)
-        return np.zeros(0, dtype=np.float64), empty_b, empty_b
 
-    dt_px4 = np.diff(ts_px4_s)
-    dt_bag = np.diff(ts_bag_s)
-    M = len(dt_px4)
-
-    verified_timesync_mask = np.zeros(M, dtype=bool)
-
-    # Patron A: muestra aislada en tiempo de boot (< 1e6) entre muestras UNIX (> 1e8)
-    for k in range(1, N - 1):
-        if (
-            ts_px4_s[k] < 1e6
-            and ts_px4_s[k - 1] > 1e8
-            and ts_px4_s[k + 1] > 1e8
-            and 0.0 < dt_bag[k - 1] <= 0.100
-            and 0.0 < dt_bag[k] <= 0.100
-        ):
-            verified_timesync_mask[k - 1] = True
-            verified_timesync_mask[k] = True
-
-    # Patron B: escalon de resincronizacion de offset que cierra un lag_before >= 0.15s a ~0s
-    for i in range(M):
-        if verified_timesync_mask[i]:
-            continue
-        if (
-            ts_px4_s[i] > 1e8
-            and ts_px4_s[i + 1] > 1e8
-            and 0.0 < dt_bag[i] <= 0.100
-            and abs(dt_px4[i] - dt_bag[i]) > 0.050
-        ):
-            lag_before = float(ts_bag_s[i] - ts_px4_s[i])
-            lag_after = float(ts_bag_s[i + 1] - ts_px4_s[i + 1])
-            if lag_before >= 0.150 and -0.020 <= lag_after <= 0.050:
-                verified_timesync_mask[i] = True
-
-    unexplained_backstep_mask = (dt_px4 <= 0.0) & (~verified_timesync_mask)
-
-    # Reconstruir dt_sim:
-    # - Los saltos verificados de Timesync se reemplazan por dt_bag.
-    # - Los huecos hacia adelante NO explicados por Timesync (dt_px4 > 0) se conservan intactos
-    #   para que nunca se oculte una congelacion de la fuente entregada en rafaga.
-    # - Si existe un retroceso/estancamiento (dt_px4 <= 0), se sustituye por max(1e-6, dt_bag)
-    #   para garantizar que la serie devuelta sea estrictamente monotona, pero queda registrado en
-    #   `unexplained_backstep_mask` para que `validate_episode_data` rechace la grabacion.
-    safe_dt_bag = np.maximum(1e-6, dt_bag)
-    replace_mask = verified_timesync_mask | unexplained_backstep_mask
-    dt_sim = np.where(replace_mask, safe_dt_bag, dt_px4)
-    return dt_sim, verified_timesync_mask, unexplained_backstep_mask
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(f"'ClockReconstructionResult' object has no attribute '{name}'") from exc
 
 
 def reconstruct_simulation_clock(
     ts_px4_s: np.ndarray,
     ts_bag_s: np.ndarray,
-) -> Tuple[np.ndarray, int]:
+) -> ClockReconstructionResult:
     """
-    Reconstruye una serie temporal estrictamente monotona `ts_sim_rel` a partir del reloj de
-    PX4 (`ts_px4_s`) y el reloj de recepcion del bag (`ts_bag_s`), sin ocultar huecos hacia
-    adelante no explicados por `Timesync`.
-
-    Retorna `(ts_sim_rel, num_repaired_steps)`.
+    Analiza y reconstruye de forma condicionada el reloj de simulacion a partir del reloj de
+    PX4 (`ts_px4_s`) y el reloj de recepcion del bag (`ts_bag_s`):
+      - Patron A (muestra aislada en tiempo de arranque `< 1e6` s entre muestras UNIX `> 1e8` s):
+        reparacion condicionada que verifica la consistencia del intervalo entre los vecinos UNIX
+        validos (`raw_px4[k+1] - raw_px4[k-1]`) y reparte dicho intervalo proporcionalmente a
+        `dt_bag`, preservando exactamente el span entre vecinos sin borrar huecos reales.
+      - Patron B (escalon de offset UNIX entre muestras `> 1e8` s): se marca como ambiguo
+        (`ambiguous_clock_step_pattern_b`) y NO se repara automaticamente, conservando el
+        intervalo original `dt_px4` para nunca comprimir una entrega en rafaga tras congelacion.
+      - Retrocesos o duplicados (`dt <= 0`) no explicados por un Patron A valido quedan visibles
+        en `reconstructed_time_s` y en `backstep_or_duplicate_mask`, marcando `usable_for_validation=False`.
+      - Relojes ausentes, no finitos o `<= 0` provocan rechazo inmediato (`usable_for_validation=False`).
     """
-    N = len(ts_px4_s)
-    if N == 0:
-        return np.zeros(0, dtype=np.float64), 0
-    if N == 1:
-        return np.zeros(1, dtype=np.float64), 0
+    raw_px4 = np.asarray(ts_px4_s, dtype=np.float64)
+    raw_bag = np.asarray(ts_bag_s, dtype=np.float64)
 
-    dt_sim, verified_mask, backstep_mask = _detect_timesync_and_clock_anomalies(ts_px4_s, ts_bag_s)
-    num_repaired = int(np.sum(verified_mask | backstep_mask))
-    ts_sim_rel = np.concatenate([[0.0], np.cumsum(dt_sim)])
-    return ts_sim_rel, num_repaired
+    if raw_px4.ndim != 1 or raw_bag.ndim != 1 or len(raw_px4) != len(raw_bag):
+        empty_b = np.zeros(0, dtype=bool)
+        return ClockReconstructionResult(
+            raw_time_s=raw_px4,
+            received_time_s=raw_bag,
+            reconstructed_time_s=None,
+            repaired_step_mask=empty_b,
+            backstep_or_duplicate_mask=empty_b,
+            ambiguous_step_mask=empty_b,
+            repaired_events=[],
+            num_repaired_steps=0,
+            num_backsteps_or_duplicates=0,
+            num_ambiguous_steps=0,
+            max_raw_dt_s=0.0,
+            min_raw_dt_s=0.0,
+            max_reconstructed_dt_s=0.0,
+            min_reconstructed_dt_s=0.0,
+            usable_for_validation=False,
+            reasons=["clock_series_length_or_dimension_mismatch"],
+        )
+
+    N = len(raw_px4)
+    M = max(0, N - 1)
+    empty_b = np.zeros(M, dtype=bool)
+
+    reasons: List[str] = []
+    if N < 2:
+        reasons.append("insufficient_clock_samples")
+        return ClockReconstructionResult(
+            raw_time_s=raw_px4.copy(),
+            received_time_s=raw_bag.copy(),
+            reconstructed_time_s=np.zeros(N, dtype=np.float64) if N == 1 else None,
+            repaired_step_mask=empty_b,
+            backstep_or_duplicate_mask=empty_b,
+            ambiguous_step_mask=empty_b,
+            repaired_events=[],
+            num_repaired_steps=0,
+            num_backsteps_or_duplicates=0,
+            num_ambiguous_steps=0,
+            max_raw_dt_s=0.0,
+            min_raw_dt_s=0.0,
+            max_reconstructed_dt_s=0.0,
+            min_reconstructed_dt_s=0.0,
+            usable_for_validation=False,
+            reasons=reasons,
+        )
+
+    px4_valid = bool(np.all(np.isfinite(raw_px4)) and np.all(raw_px4 > 0.0))
+    bag_valid = bool(np.all(np.isfinite(raw_bag)) and np.all(raw_bag > 0.0))
+    if not px4_valid:
+        reasons.append("missing_or_non_finite_px4_clock")
+    if not bag_valid:
+        reasons.append("missing_or_non_finite_bag_clock")
+
+    if not px4_valid or not bag_valid:
+        return ClockReconstructionResult(
+            raw_time_s=raw_px4.copy(),
+            received_time_s=raw_bag.copy(),
+            reconstructed_time_s=None,
+            repaired_step_mask=empty_b,
+            backstep_or_duplicate_mask=empty_b,
+            ambiguous_step_mask=np.ones(M, dtype=bool),
+            repaired_events=[],
+            num_repaired_steps=0,
+            num_backsteps_or_duplicates=0,
+            num_ambiguous_steps=int(M),
+            max_raw_dt_s=0.0,
+            min_raw_dt_s=0.0,
+            max_reconstructed_dt_s=0.0,
+            min_reconstructed_dt_s=0.0,
+            usable_for_validation=False,
+            reasons=reasons,
+        )
+
+    dt_px4 = np.diff(raw_px4)
+    dt_bag = np.diff(raw_bag)
+    dt_reconstructed = dt_px4.copy()
+
+    repaired_step_mask = np.zeros(M, dtype=bool)
+    ambiguous_step_mask = np.zeros(M, dtype=bool)
+    repaired_events: List[Dict[str, Any]] = []
+
+    if np.any(dt_bag <= 0.0):
+        ambiguous_step_mask |= (dt_bag <= 0.0)
+        reasons.append("non_monotonic_bag_reception_clock")
+
+    # 1. Patron A: muestra aislada en tiempo de arranque (< 1e6) rodeada por muestras UNIX (> 1e8)
+    for k in range(1, N - 1):
+        if raw_px4[k] < 1e6 and raw_px4[k - 1] > 1e8 and raw_px4[k + 1] > 1e8:
+            neighbor_px4_span = float(raw_px4[k + 1] - raw_px4[k - 1])
+            dt_b0 = float(dt_bag[k - 1])
+            dt_b1 = float(dt_bag[k])
+            neighbor_bag_span = dt_b0 + dt_b1
+
+            # Preservar siempre el intervalo real entre los vecinos UNIX validos (k-1 y k+1)
+            # cuando dicho intervalo y los pasos de recepcion son positivos.
+            if neighbor_px4_span > 0.0 and dt_b0 > 0.0 and dt_b1 > 0.0:
+                w0 = dt_b0 / neighbor_bag_span
+                rep_dt0 = neighbor_px4_span * w0
+                rep_dt1 = neighbor_px4_span - rep_dt0
+                dt_reconstructed[k - 1] = rep_dt0
+                dt_reconstructed[k] = rep_dt1
+            else:
+                rep_dt0 = float(dt_px4[k - 1])
+                rep_dt1 = float(dt_px4[k])
+
+            # Solo aceptar como reparacion valida si los intervalos de recepcion son normales (<= 0.10 s),
+            # el span entre vecinos UNIX concuerda con la recepcion (|span_px4 - span_bag| <= 0.05 s)
+            # y ninguno de los subpasos reconstruidos excede MAX_ALLOWED_DT_GAP_S.
+            if (
+                neighbor_px4_span > 0.0
+                and 0.0 < dt_b0 <= 0.100
+                and 0.0 < dt_b1 <= 0.100
+                and abs(neighbor_px4_span - neighbor_bag_span) <= 0.050
+                and max(rep_dt0, rep_dt1) <= MAX_ALLOWED_DT_GAP_S
+            ):
+                repaired_step_mask[k - 1] = True
+                repaired_step_mask[k] = True
+                repaired_events.append(
+                    {
+                        "sample_index": int(k),
+                        "step_indices": [int(k - 1), int(k)],
+                        "raw_sample_time_s": float(raw_px4[k]),
+                        "neighbor_px4_times_s": [float(raw_px4[k - 1]), float(raw_px4[k + 1])],
+                        "neighbor_px4_span_s": round(neighbor_px4_span, 6),
+                        "original_px4_dts_s": [float(dt_px4[k - 1]), float(dt_px4[k])],
+                        "neighbor_bag_dts_s": [round(dt_b0, 6), round(dt_b1, 6)],
+                        "repaired_dts_s": [round(rep_dt0, 6), round(rep_dt1, 6)],
+                        "method": "pattern_a_proportional_neighbor_span",
+                    }
+                )
+            else:
+                ambiguous_step_mask[k - 1] = True
+                ambiguous_step_mask[k] = True
+                if "ambiguous_clock_step_pattern_a" not in reasons:
+                    reasons.append("ambiguous_clock_step_pattern_a")
+
+    # 2. Patron B: escalon de offset UNIX entre muestras consecutivas > 1e8 s.
+    # No se repara automaticamente porque una entrega en rafaga tras congelacion de la fuente
+    # produce la misma firma ("lag grande antes, lag pequeno despues"). Se conserva dt_px4[i]
+    # y se marca como ambiguo para rechazar en campana.
+    for i in range(M):
+        if repaired_step_mask[i] or ambiguous_step_mask[i]:
+            continue
+        if (
+            raw_px4[i] > 1e8
+            and raw_px4[i + 1] > 1e8
+            and 0.0 < dt_bag[i] <= 0.100
+            and abs(dt_px4[i] - dt_bag[i]) > 0.050
+        ):
+            lag_before = float(raw_bag[i] - raw_px4[i])
+            lag_after = float(raw_bag[i + 1] - raw_px4[i + 1])
+            if lag_before >= 0.150 and -0.020 <= lag_after <= 0.050:
+                ambiguous_step_mask[i] = True
+                if "ambiguous_clock_step_pattern_b" not in reasons:
+                    reasons.append("ambiguous_clock_step_pattern_b")
+
+    # 3. Retrocesos o duplicados quedan visibles en `reconstructed_time_s` y en su mascara
+    backstep_or_duplicate_mask = dt_reconstructed <= 0.0
+    if np.any(backstep_or_duplicate_mask):
+        reasons.append("clock_backstep_or_duplicate_timestamp")
+
+    reconstructed_time_s = np.concatenate([[0.0], np.cumsum(dt_reconstructed)])
+    max_raw_dt_s = float(np.max(dt_px4))
+    min_raw_dt_s = float(np.min(dt_px4))
+    max_reconstructed_dt_s = float(np.max(dt_reconstructed))
+    min_reconstructed_dt_s = float(np.min(dt_reconstructed))
+
+    if max_reconstructed_dt_s > MAX_ALLOWED_DT_GAP_S:
+        reasons.append("telemetry_dropout_gap")
+
+    usable_for_validation = bool(
+        len(reasons) == 0
+        and not np.any(ambiguous_step_mask)
+        and not np.any(backstep_or_duplicate_mask)
+        and min_reconstructed_dt_s > 0.0
+        and max_reconstructed_dt_s <= MAX_ALLOWED_DT_GAP_S
+    )
+
+    return ClockReconstructionResult(
+        raw_time_s=raw_px4.copy(),
+        received_time_s=raw_bag.copy(),
+        reconstructed_time_s=reconstructed_time_s,
+        repaired_step_mask=repaired_step_mask,
+        backstep_or_duplicate_mask=backstep_or_duplicate_mask,
+        ambiguous_step_mask=ambiguous_step_mask,
+        repaired_events=repaired_events,
+        num_repaired_steps=int(np.sum(repaired_step_mask)),
+        num_backsteps_or_duplicates=int(np.sum(backstep_or_duplicate_mask)),
+        num_ambiguous_steps=int(np.sum(ambiguous_step_mask)),
+        max_raw_dt_s=max_raw_dt_s,
+        min_raw_dt_s=min_raw_dt_s,
+        max_reconstructed_dt_s=max_reconstructed_dt_s,
+        min_reconstructed_dt_s=min_reconstructed_dt_s,
+        usable_for_validation=usable_for_validation,
+        reasons=reasons,
+    )
+
+
+def _validate_landing_window(
+    pos_enu: np.ndarray,
+    vel_enu: np.ndarray,
+    ts_bag_raw_s: np.ndarray,
+    land_list: List[Dict[str, Any]],
+    landing_cfg: Dict[str, Any],
+    *,
+    landing_window_s: float = LANDING_WINDOW_S,
+) -> Dict[str, Any]:
+    """
+    Evalua el aterrizaje final sobre una ventana temporal comun `[t_end - landing_window_s, t_end]`
+    usando el tiempo de recepcion (`ts_bag_raw_s` y `land_detected.timestamp`) para alinear ambos topicos:
+      1. Cobertura temporal completa de odometria durante `landing_window_s` sin huecos `> MAX_ALLOWED_DT_GAP_S`.
+      2. Posicion XY dentro del pad, velocidad bajo `LANDING_MAX_FINAL_SPEED` y altura compatible
+         con reposo (`0 <= z <= LANDING_MAX_FINAL_Z_M`) en TODAS las muestras de la ventana.
+      3. Persistencia real de `VehicleLandDetected.landed == True` (nunca `ground_contact`):
+         - Todos los timestamps del detector presentes, finitos y estrictamente positivos (`> 0`).
+         - Al menos 2 mensajes distintos con `landed == True` en la racha final contigua.
+         - Ningun mensaje con `landed == False` dentro de `[t_win_start, t_end]`.
+         - Vigencia continua durante toda la ventana `[t_win_start, t_end]` con mensaje activo al
+           inicio de la ventana y sin intervalos sin evidencia mayores a `LANDING_MAX_DETECTOR_INTERVAL_S`,
+           ni antiguedad final mayor a `LANDING_MAX_DETECTOR_AGE_S`.
+    """
+    reasons: List[str] = []
+    N = len(pos_enu)
+    lx, ly = float(landing_cfg["x"]), float(landing_cfg["y"])
+
+    if (
+        N < 2
+        or landing_window_s <= 0.0
+        or not np.all(np.isfinite(ts_bag_raw_s))
+        or np.any(ts_bag_raw_s <= 0.0)
+    ):
+        reasons.append("landing_window_unavailable_invalid_clock")
+        final_pos = pos_enu[-1] if N > 0 else np.zeros(3, dtype=np.float64)
+        final_speed = float(np.linalg.norm(vel_enu[-1])) if N > 0 else 0.0
+        xy_err = float(math.hypot(float(final_pos[0]) - lx, float(final_pos[1]) - ly)) if N > 0 else -1.0
+        return {
+            "reasons": reasons,
+            "landed_detector_confirmed": False,
+            "landing_xy_error_m": xy_err,
+            "final_window_max_z_m": float(final_pos[2]) if N > 0 else -1.0,
+            "final_window_max_speed_mps": final_speed,
+            "final_altitude_m": float(final_pos[2]) if N > 0 else -1.0,
+            "final_speed_mps": final_speed,
+            "window_sample_count": 0,
+            "window_duration_s": 0.0,
+        }
+
+    t_end = float(ts_bag_raw_s[-1])
+    t_start_ep = float(ts_bag_raw_s[0])
+    t_win_start = t_end - float(landing_window_s)
+
+    if (t_end - t_start_ep) + 1e-6 < float(landing_window_s):
+        reasons.append(
+            f"insufficient_landing_window_coverage (episode_span={t_end - t_start_ep:.3f}s < {landing_window_s:.2f}s)"
+        )
+
+    win_indices = np.where(ts_bag_raw_s >= t_win_start - 1e-9)[0]
+    if len(win_indices) < 2:
+        reasons.append(f"insufficient_odometry_in_landing_window (samples={len(win_indices)})")
+        win_indices = np.arange(max(0, N - 2), N)
+    else:
+        first_win_idx = int(win_indices[0])
+        if first_win_idx > 0:
+            gap_at_win_start = float(ts_bag_raw_s[first_win_idx] - t_win_start)
+            prev_gap = float(ts_bag_raw_s[first_win_idx] - ts_bag_raw_s[first_win_idx - 1])
+            if gap_at_win_start > MAX_ALLOWED_DT_GAP_S or prev_gap > MAX_ALLOWED_DT_GAP_S:
+                reasons.append(
+                    f"insufficient_landing_window_coverage (start_gap={max(gap_at_win_start, prev_gap):.3f}s)"
+                )
+        elif (float(ts_bag_raw_s[0]) - t_win_start) > 1e-6:
+            reasons.append("insufficient_landing_window_coverage (missing_samples_at_window_start)")
+
+        win_dts = np.diff(ts_bag_raw_s[win_indices])
+        if len(win_dts) > 0 and float(np.max(win_dts)) > MAX_ALLOWED_DT_GAP_S:
+            reasons.append(
+                f"insufficient_landing_window_coverage (max_win_dt={float(np.max(win_dts)):.3f}s > {MAX_ALLOWED_DT_GAP_S:.2f}s)"
+            )
+
+    final_window_pos = pos_enu[win_indices]
+    final_window_vel = vel_enu[win_indices]
+    final_pos = pos_enu[-1]
+    final_speed = float(np.linalg.norm(vel_enu[-1]))
+    final_window_max_z = float(np.max(final_window_pos[:, 2]))
+    final_window_min_z = float(np.min(final_window_pos[:, 2]))
+    final_window_max_speed = float(np.max(np.linalg.norm(final_window_vel, axis=1)))
+    landing_xy_err = float(
+        np.max(np.hypot(final_window_pos[:, 0] - lx, final_window_pos[:, 1] - ly))
+    )
+
+    # Evaluar detector de aterrizaje en la misma ventana temporal [t_win_start, t_end]
+    landed_flag_confirmed = False
+    if not land_list:
+        reasons.append("missing_land_detected_messages")
+    else:
+        ld_times_s: List[float] = []
+        ld_flags: List[bool] = []
+        invalid_ld_ts = False
+        for msg in land_list:
+            if not isinstance(msg, dict):
+                invalid_ld_ts = True
+                break
+            raw_ld_ts = msg.get("timestamp")
+            if not _is_finite_number(raw_ld_ts) or float(raw_ld_ts) <= 0.0:
+                invalid_ld_ts = True
+                break
+            ld_times_s.append(float(raw_ld_ts) * 1e-9)
+            # Nunca usar ground_contact como sustituto de landed
+            ld_flags.append(bool(msg.get("landed", False)))
+
+        if invalid_ld_ts:
+            reasons.append("invalid_land_detector_timestamp")
+        else:
+            # Verificar orden temporal no decreciente
+            non_decreasing = all(
+                ld_times_s[k + 1] >= ld_times_s[k] for k in range(len(ld_times_s) - 1)
+            )
+            if not non_decreasing:
+                reasons.append("non_monotonic_land_detector_timestamps")
+            else:
+                last_ld_ts_s = ld_times_s[-1]
+                ld_age_s = t_end - last_ld_ts_s
+                if ld_age_s > LANDING_MAX_DETECTOR_AGE_S or last_ld_ts_s < t_win_start - 1e-6:
+                    reasons.append(
+                        f"stale_land_detector_message (age={ld_age_s:.2f}s > {LANDING_MAX_DETECTOR_AGE_S:.2f}s)"
+                    )
+
+                # Si existe algun mensaje con landed=False dentro de [t_win_start, t_end], invalida persistencia
+                false_in_window = any(
+                    (t_win_start - 1e-6 <= t_m <= t_end + 1e-6) and (not flag)
+                    for t_m, flag in zip(ld_times_s, ld_flags)
+                )
+
+                # Extraer la racha final contigua de mensajes con landed == True
+                true_run_times: List[float] = []
+                for t_m, flag in zip(reversed(ld_times_s), reversed(ld_flags)):
+                    if flag:
+                        true_run_times.append(t_m)
+                    else:
+                        break
+                true_run_times.reverse()
+
+                # Exigir al menos 2 mensajes distintos con landed == True
+                distinct_true_Count = len(true_run_times) >= 2 and (
+                    true_run_times[-1] > true_run_times[0] + 1e-9
+                )
+
+                if not false_in_window and distinct_true_Count:
+                    # Para cubrir toda la ventana [t_win_start, t_end] mediante regla explicita de vigencia:
+                    # 1. Debe existir un mensaje landed=True en o antes de t_win_start (vigente al entrar a la ventana)
+                    #    cuya edad en t_win_start no supere LANDING_MAX_DETECTOR_INTERVAL_S.
+                    # 2. Ningun intervalo entre mensajes consecutivos de la racha que cubren la ventana
+                    #    debe superar LANDING_MAX_DETECTOR_INTERVAL_S.
+                    # 3. La edad del ultimo mensaje en t_end no debe superar LANDING_MAX_DETECTOR_AGE_S.
+                    prior_or_at_start_indices = [
+                        idx for idx, t_m in enumerate(true_run_times) if t_m <= t_win_start + 1e-6
+                    ]
+                    if prior_or_at_start_indices:
+                        anchor_idx = prior_or_at_start_indices[-1]
+                        anchor_age_at_win_start = max(0.0, t_win_start - true_run_times[anchor_idx])
+                        relevant_times = true_run_times[anchor_idx:]
+                        max_internal_gap = (
+                            max(
+                                relevant_times[k + 1] - relevant_times[k]
+                                for k in range(len(relevant_times) - 1)
+                            )
+                            if len(relevant_times) >= 2
+                            else 0.0
+                        )
+                        end_age = max(0.0, t_end - relevant_times[-1])
+                        if (
+                            anchor_age_at_win_start <= LANDING_MAX_DETECTOR_INTERVAL_S
+                            and max_internal_gap <= LANDING_MAX_DETECTOR_INTERVAL_S
+                            and end_age <= LANDING_MAX_DETECTOR_AGE_S
+                            and relevant_times[-1] >= t_win_start - 1e-6
+                        ):
+                            landed_flag_confirmed = True
+
+                if not landed_flag_confirmed:
+                    reasons.append("px4_land_detector_not_confirmed")
+
+    if landing_xy_err > LANDING_MAX_XY_ERR_M:
+        reasons.append(
+            f"landing_off_pad (xy_err={landing_xy_err:.3f}m > {LANDING_MAX_XY_ERR_M:.2f}m)"
+        )
+
+    if final_window_max_z > LANDING_MAX_FINAL_Z_M or final_window_min_z < -0.10:
+        reasons.append(
+            f"landing_incomplete_altitude (final_window_max_z={final_window_max_z:.3f}m > {LANDING_MAX_FINAL_Z_M:.2f}m)"
+        )
+
+    if final_window_max_speed > LANDING_MAX_FINAL_SPEED:
+        reasons.append(
+            f"landing_not_at_rest (final_window_max_speed={final_window_max_speed:.3f}m/s > {LANDING_MAX_FINAL_SPEED:.2f}m/s)"
+        )
+
+    return {
+        "reasons": reasons,
+        "landed_detector_confirmed": landed_flag_confirmed,
+        "landing_xy_error_m": landing_xy_err,
+        "final_window_max_z_m": final_window_max_z,
+        "final_window_max_speed_mps": final_window_max_speed,
+        "final_altitude_m": float(final_pos[2]),
+        "final_speed_mps": final_speed,
+        "window_sample_count": int(len(win_indices)),
+        "window_duration_s": float(ts_bag_raw_s[win_indices[-1]] - ts_bag_raw_s[win_indices[0]]),
+    }
 
 
 # ============================================================================
@@ -1300,10 +1656,12 @@ def validate_episode_data(
     *,
     pilot_status_source: str = "explicit_argument",
     allow_legacy_hoops: bool = False,
+    landing_window_s: float = LANDING_WINDOW_S,
 ) -> Dict[str, Any]:
     """
     Ejecuta la validacion de configuracion, grabacion y geometria de mision sobre datos en memoria.
-    Si falta evidencia (ej. `pilot_exit_code is None`) o la configuracion es invalida, rechaza el episodio.
+    Si falta evidencia (ej. `pilot_exit_code is None`, relojes ausentes) o la configuracion es invalida,
+    rechaza el episodio sin fabricar valores por defecto.
     """
     rejection_reasons: List[str] = []
 
@@ -1358,22 +1716,38 @@ def validate_episode_data(
         }
 
     # 1. Extraer series temporales y validar marcos (NED), flags de validez, NaNs y cuaterniones
+    # Nunca fabricar timestamps ausentes con `i * 0.01` ni sustituir un reloj ausente por el otro.
     N = len(odom_list)
     pos_enu = np.zeros((N, 3), dtype=np.float64)
     vel_enu = np.zeros((N, 3), dtype=np.float64)
     yaw_enu = np.zeros(N, dtype=np.float64)
-    ts_px4_raw_s = np.zeros(N, dtype=np.float64)
-    ts_bag_raw_s = np.zeros(N, dtype=np.float64)
+    ts_px4_raw_s = np.full(N, np.nan, dtype=np.float64)
+    ts_bag_raw_s = np.full(N, np.nan, dtype=np.float64)
     reset_counters = np.zeros(N, dtype=np.int64)
     nan_count = 0
     invalid_frame_count = 0
+    missing_px4_ts_count = 0
+    missing_bag_ts_count = 0
 
     for i, item in enumerate(odom_list):
         # Preferir timestamp_sample_us (instante real de integracion EKF2) sobre timestamp_us
-        t_us = item.get("timestamp_sample_us") or item.get("timestamp_us", 0)
-        t_bag_ns = item.get("timestamp", 0)
-        ts_bag_raw_s[i] = (float(t_bag_ns) * 1e-9) if t_bag_ns > 0 else (float(i) * 0.01)
-        ts_px4_raw_s[i] = (float(t_us) * 1e-6) if t_us > 0 else ts_bag_raw_s[i]
+        raw_t_sample = item.get("timestamp_sample_us")
+        if _is_finite_number(raw_t_sample) and float(raw_t_sample) > 0.0:
+            raw_t_us = float(raw_t_sample)
+        else:
+            raw_t_pub = item.get("timestamp_us")
+            raw_t_us = float(raw_t_pub) if (_is_finite_number(raw_t_pub) and float(raw_t_pub) > 0.0) else np.nan
+
+        if math.isfinite(raw_t_us) and raw_t_us > 0.0:
+            ts_px4_raw_s[i] = raw_t_us * 1e-6
+        else:
+            missing_px4_ts_count += 1
+
+        raw_t_bag = item.get("timestamp")
+        if _is_finite_number(raw_t_bag) and float(raw_t_bag) > 0.0:
+            ts_bag_raw_s[i] = float(raw_t_bag) * 1e-9
+        else:
+            missing_bag_ts_count += 1
 
         if not using_local_pos:
             pose_frame = int(item.get("pose_frame", 1))
@@ -1427,35 +1801,58 @@ def validate_episode_data(
         rejection_reasons.append(f"corrupted_nan_or_invalid_quaternion_samples ({nan_count})")
     if invalid_frame_count > 0:
         rejection_reasons.append(f"invalid_or_non_ned_coordinate_frame ({invalid_frame_count})")
+    if missing_px4_ts_count > 0:
+        rejection_reasons.append(f"missing_or_invalid_px4_timestamps ({missing_px4_ts_count})")
+    if missing_bag_ts_count > 0:
+        rejection_reasons.append(f"missing_or_invalid_bag_timestamps ({missing_bag_ts_count})")
 
-    # 2. Reconstruccion y verificacion estricta de continuidad temporal del reloj
-    dt_sim, verified_ts_mask, unexplained_backstep_mask = _detect_timesync_and_clock_anomalies(
-        ts_px4_raw_s, ts_bag_raw_s
-    )
-    ts_sim_s = np.concatenate([[0.0], np.cumsum(dt_sim)])
-    timesync_offset_jumps = int(np.sum(verified_ts_mask))
-    unexplained_backsteps = int(np.sum(unexplained_backstep_mask))
-
-    pos_dt = dt_sim[dt_sim > 0]
-    duration_s = float(ts_sim_s[-1] - ts_sim_s[0]) if N > 1 else 0.0
-    dt_median_ms = float(np.median(pos_dt) * 1000.0) if len(pos_dt) > 0 else 0.0
-    dt_p95_ms = float(np.percentile(pos_dt, 95) * 1000.0) if len(pos_dt) > 0 else 0.0
-    max_dt_gap_s = float(np.max(dt_sim)) if len(dt_sim) > 0 else 0.0
-    min_dt_s = float(np.min(dt_sim)) if len(dt_sim) > 0 else 0.0
+    # 2. Reconstruccion condicionada y verificacion estricta del reloj
+    clock_res = reconstruct_simulation_clock(ts_px4_raw_s, ts_bag_raw_s)
+    ts_sim_s = clock_res["reconstructed_time_s"]
+    timesync_offset_jumps = int(clock_res["num_repaired_steps"])
+    unexplained_backsteps = int(clock_res["num_backsteps_or_duplicates"])
+    ambiguous_clock_steps = int(clock_res["num_ambiguous_steps"])
 
     seg_lengths = np.linalg.norm(np.diff(pos_enu, axis=0), axis=1)
     max_step_dist_m = float(np.max(seg_lengths)) if len(seg_lengths) > 0 else 0.0
 
-    if duration_s < 3.0:
-        rejection_reasons.append(f"flight_duration_too_short ({duration_s:.2f}s < 3.0s)")
-    if unexplained_backsteps > 0 or min_dt_s <= 0.0:
-        rejection_reasons.append(
-            f"non_monotonic_or_stalled_simulation_clock (unexplained_backsteps={unexplained_backsteps}, min_dt={min_dt_s:.4f}s)"
-        )
-    if max_dt_gap_s > MAX_ALLOWED_DT_GAP_S:
-        rejection_reasons.append(
-            f"telemetry_dropout_gap (max_dt_gap={max_dt_gap_s:.3f}s > {MAX_ALLOWED_DT_GAP_S:.2f}s)"
-        )
+    if ts_sim_s is not None and len(ts_sim_s) > 1:
+        dt_sim = np.diff(ts_sim_s)
+        pos_dt = dt_sim[dt_sim > 0]
+        duration_s = float(ts_sim_s[-1] - ts_sim_s[0])
+        dt_median_ms = float(np.median(pos_dt) * 1000.0) if len(pos_dt) > 0 else 0.0
+        dt_p95_ms = float(np.percentile(pos_dt, 95) * 1000.0) if len(pos_dt) > 0 else 0.0
+        max_dt_gap_s = float(clock_res["max_reconstructed_dt_s"])
+        min_dt_s = float(clock_res["min_reconstructed_dt_s"])
+
+        if "ambiguous_clock_step_pattern_b" in clock_res["reasons"]:
+            rejection_reasons.append(
+                f"ambiguous_clock_step_pattern_b (ambiguous_steps={ambiguous_clock_steps}, max_dt={max_dt_gap_s:.3f}s)"
+            )
+        if "ambiguous_clock_step_pattern_a" in clock_res["reasons"]:
+            rejection_reasons.append(
+                f"ambiguous_clock_step_pattern_a (ambiguous_steps={ambiguous_clock_steps}, max_dt={max_dt_gap_s:.3f}s)"
+            )
+        if "non_monotonic_bag_reception_clock" in clock_res["reasons"]:
+            rejection_reasons.append("non_monotonic_bag_reception_clock")
+
+        if duration_s < 3.0:
+            rejection_reasons.append(f"flight_duration_too_short ({duration_s:.2f}s < 3.0s)")
+        if unexplained_backsteps > 0 or min_dt_s <= 0.0:
+            rejection_reasons.append(
+                f"non_monotonic_or_stalled_simulation_clock (unexplained_backsteps={unexplained_backsteps}, min_dt={min_dt_s:.4f}s)"
+            )
+        if max_dt_gap_s > MAX_ALLOWED_DT_GAP_S:
+            rejection_reasons.append(
+                f"telemetry_dropout_gap (max_dt_gap={max_dt_gap_s:.3f}s > {MAX_ALLOWED_DT_GAP_S:.2f}s)"
+            )
+    else:
+        duration_s = 0.0
+        dt_median_ms = 0.0
+        dt_p95_ms = 0.0
+        max_dt_gap_s = -1.0
+        min_dt_s = -1.0
+
     if max_step_dist_m > MAX_ALLOWED_STEP_DIST_M:
         rejection_reasons.append(
             f"excessive_spatial_step_between_samples (max_step={max_step_dist_m:.3f}m > {MAX_ALLOWED_STEP_DIST_M:.2f}m)"
@@ -1493,6 +1890,9 @@ def validate_episode_data(
                 "insufficient_",
                 "corrupted_",
                 "invalid_or_non_ned_",
+                "missing_or_invalid_px4_timestamps",
+                "missing_or_invalid_bag_timestamps",
+                "ambiguous_clock_",
                 "flight_duration_",
                 "non_monotonic_",
                 "telemetry_dropout_",
@@ -1501,6 +1901,7 @@ def validate_episode_data(
             ))
             for r in rejection_reasons
         )
+        or not bool(clock_res["usable_for_validation"])
         else "valid"
     )
 
@@ -1538,56 +1939,19 @@ def validate_episode_data(
             if not any(r.startswith(f"collision_with_{lm['id']}") for r in rejection_reasons):
                 rejection_reasons.append(reason_col)
 
-    # 6. Verificar aterrizaje final sincronizado en la ventana terminal del episodio
+    # 6. Verificar aterrizaje final sincronizado en la ventana temporal comun `[t_end - landing_window_s, t_end]`
     landing_cfg = norm_cfg["landing"]
-    tail_k = min(25, N)
-    final_window_pos = pos_enu[-tail_k:]
-    final_window_vel = vel_enu[-tail_k:]
-    final_pos = pos_enu[-1]
-    final_window_max_z = float(np.max(final_window_pos[:, 2]))
-    final_window_max_speed = float(np.max(np.linalg.norm(final_window_vel, axis=1)))
-    final_speed = float(np.linalg.norm(vel_enu[-1]))
-
-    if not land_list:
-        rejection_reasons.append("missing_land_detected_messages")
-        landed_flag_confirmed = False
-    else:
-        last_ld_ts_s = float(land_list[-1].get("timestamp", 0)) * 1e-9
-        ld_age_s = abs(float(ts_bag_raw_s[-1]) - last_ld_ts_s) if last_ld_ts_s > 0 else 0.0
-        if ld_age_s > LANDING_MAX_DETECTOR_AGE_S:
-            rejection_reasons.append(
-                f"stale_land_detector_message (age={ld_age_s:.2f}s > {LANDING_MAX_DETECTOR_AGE_S:.2f}s)"
-            )
-        # Exigir explicitamente `landed == True` (etapa 3 de VehicleLandDetected, nunca solo `ground_contact`)
-        # con persistencia en las muestras finales del detector
-        if len(land_list) >= 2:
-            landed_flag_confirmed = bool(land_list[-1].get("landed", False)) and bool(
-                land_list[-2].get("landed", False)
-            )
-        else:
-            landed_flag_confirmed = bool(land_list[-1].get("landed", False))
-
-        if not landed_flag_confirmed:
-            rejection_reasons.append("px4_land_detector_not_confirmed")
-
-    lx, ly = float(landing_cfg["x"]), float(landing_cfg["y"])
-    landing_xy_err = float(
-        np.max(np.hypot(final_window_pos[:, 0] - lx, final_window_pos[:, 1] - ly))
+    landing_res = _validate_landing_window(
+        pos_enu,
+        vel_enu,
+        ts_bag_raw_s,
+        land_list,
+        landing_cfg,
+        landing_window_s=landing_window_s,
     )
-    if landing_xy_err > LANDING_MAX_XY_ERR_M:
-        rejection_reasons.append(
-            f"landing_off_pad (xy_err={landing_xy_err:.3f}m > {LANDING_MAX_XY_ERR_M:.2f}m)"
-        )
-
-    if final_window_max_z > LANDING_MAX_FINAL_Z_M:
-        rejection_reasons.append(
-            f"landing_incomplete_altitude (final_window_max_z={final_window_max_z:.3f}m > {LANDING_MAX_FINAL_Z_M:.2f}m)"
-        )
-
-    if final_window_max_speed > LANDING_MAX_FINAL_SPEED:
-        rejection_reasons.append(
-            f"landing_not_at_rest (final_window_max_speed={final_window_max_speed:.3f}m/s > {LANDING_MAX_FINAL_SPEED:.2f}m/s)"
-        )
+    rejection_reasons.extend(landing_res["reasons"])
+    landed_flag_confirmed = bool(landing_res["landed_detector_confirmed"])
+    landing_xy_err = float(landing_res["landing_xy_error_m"])
 
     # 7. Calcular metricas continuas de calidad del piloto experto
     path_length_m = float(np.sum(seg_lengths))
@@ -1596,17 +1960,21 @@ def validate_episode_data(
     max_speed_mps = float(np.max(speeds))
 
     # Estimar aceleracion y jerk suavizados sobre submuestreo a ~10 Hz para evitar ruido de cuantizacion
-    step_10hz = max(1, int(round(100.0 / max(1.0, dt_median_ms)))) if dt_median_ms > 0 else 5
-    vel_sub = vel_enu[::step_10hz]
-    ts_sub = ts_sim_s[::step_10hz]
-    if len(ts_sub) >= 4:
-        dt_sub = np.maximum(1e-3, np.diff(ts_sub))[:, None]
-        acc_sub = np.diff(vel_sub, axis=0) / dt_sub
-        acc_norms = np.linalg.norm(acc_sub, axis=1)
-        max_acc_mps2 = float(np.percentile(acc_norms, 98))
-        dt_sub2 = np.maximum(1e-3, np.diff(ts_sub[1:]))[:, None]
-        jerk_sub = np.diff(acc_sub, axis=0) / dt_sub2
-        rms_jerk_mps3 = float(np.sqrt(np.mean(np.sum(jerk_sub * jerk_sub, axis=1))))
+    if ts_sim_s is not None and dt_median_ms > 0.0:
+        step_10hz = max(1, int(round(100.0 / max(1.0, dt_median_ms))))
+        vel_sub = vel_enu[::step_10hz]
+        ts_sub = ts_sim_s[::step_10hz]
+        if len(ts_sub) >= 4:
+            dt_sub = np.maximum(1e-3, np.diff(ts_sub))[:, None]
+            acc_sub = np.diff(vel_sub, axis=0) / dt_sub
+            acc_norms = np.linalg.norm(acc_sub, axis=1)
+            max_acc_mps2 = float(np.percentile(acc_norms, 98))
+            dt_sub2 = np.maximum(1e-3, np.diff(ts_sub[1:]))[:, None]
+            jerk_sub = np.diff(acc_sub, axis=0) / dt_sub2
+            rms_jerk_mps3 = float(np.sqrt(np.mean(np.sum(jerk_sub * jerk_sub, axis=1))))
+        else:
+            max_acc_mps2 = 0.0
+            rms_jerk_mps3 = 0.0
     else:
         max_acc_mps2 = 0.0
         rms_jerk_mps3 = 0.0
@@ -1633,6 +2001,8 @@ def validate_episode_data(
         "max_step_dist_m": round(max_step_dist_m, 4),
         "timesync_offset_jumps": int(timesync_offset_jumps),
         "unexplained_clock_backsteps": int(unexplained_backsteps),
+        "ambiguous_clock_steps": int(ambiguous_clock_steps),
+        "clock_usable_for_validation": bool(clock_res["usable_for_validation"]),
         "in_flight_estimator_resets": int(in_flight_resets),
         "path_length_m": round(path_length_m, 3),
         "max_altitude_m": round(max_alt_m, 3),
@@ -1644,9 +2014,12 @@ def validate_episode_data(
             min_global_clearance if math.isfinite(min_global_clearance) else -1.0, 4
         ),
         "landing_xy_error_m": round(landing_xy_err, 4),
-        "final_altitude_m": round(float(final_pos[2]), 4),
-        "final_speed_mps": round(final_speed, 4),
+        "final_altitude_m": round(float(landing_res["final_altitude_m"]), 4),
+        "final_speed_mps": round(float(landing_res["final_speed_mps"]), 4),
         "landed_detector_confirmed": bool(landed_flag_confirmed),
+        "landing_window_s": round(float(landing_window_s), 3),
+        "landing_window_sample_count": int(landing_res["window_sample_count"]),
+        "landing_window_duration_s": round(float(landing_res["window_duration_s"]), 4),
     }
 
     return {

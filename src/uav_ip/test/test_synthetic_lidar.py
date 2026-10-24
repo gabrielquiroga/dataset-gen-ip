@@ -326,10 +326,26 @@ def _make_synthetic_telemetry(pos_enu_arr: np.ndarray, yaw_enu_arr: np.ndarray, 
             "reset_counter": 0,
         })
     last_t_us = int(round((100.0 + (N - 1) * dt_s) * 1e6))
-    return {
-        "odometry": odom,
-        "local_pos": [],
-        "land_detected": [
+    # Emitir secuencia temporal de VehicleLandDetected (~5 Hz): False en vuelo, True en el reposo final
+    step_ld = max(1, int(round(0.20 / dt_s)))
+    rest_start_idx = max(0, N - max(2, int(round(1.0 / dt_s))))
+    land_seq = []
+    for idx in range(0, N, step_ld):
+        t_us_ld = int(round((100.0 + idx * dt_s) * 1e6))
+        is_landed = bool(idx >= rest_start_idx)
+        land_seq.append(
+            {
+                "timestamp": t_us_ld * 1000,
+                "timestamp_us": t_us_ld,
+                "landed": is_landed,
+                "ground_contact": is_landed,
+                "maybe_landed": is_landed,
+                "freefall": False,
+                "at_rest": is_landed,
+            }
+        )
+    if not land_seq or land_seq[-1]["timestamp_us"] != last_t_us:
+        land_seq.append(
             {
                 "timestamp": last_t_us * 1000,
                 "timestamp_us": last_t_us,
@@ -339,7 +355,11 @@ def _make_synthetic_telemetry(pos_enu_arr: np.ndarray, yaw_enu_arr: np.ndarray, 
                 "freefall": False,
                 "at_rest": True,
             }
-        ],
+        )
+    return {
+        "odometry": odom,
+        "local_pos": [],
+        "land_detected": land_seq,
         "vehicle_status": [
             {
                 "timestamp": last_t_us * 1000,
@@ -445,8 +465,11 @@ def test_validate_episode_physical_geometry_and_failure_modes():
     ts_bag = np.linspace(1700000000.0, 1700000010.0, 200)
     ts_px4 = ts_bag.copy()
     ts_px4[85] = 62.10  # Muestra aislada con timestamp crudo de boot PX4 sin offset UNIX (salto de bajada y subida)
-    ts_reconstructed, jumps = reconstruct_simulation_clock(ts_px4, ts_bag)
-    assert jumps == 2
+    clock_res = reconstruct_simulation_clock(ts_px4, ts_bag)
+    ts_reconstructed = clock_res["reconstructed_time_s"]
+    assert clock_res["num_repaired_steps"] == 2
+    assert clock_res["usable_for_validation"] is True
+    assert ts_reconstructed is not None
     assert np.all(np.diff(ts_reconstructed) > 0)
     assert np.allclose(ts_reconstructed, ts_bag - ts_bag[0], atol=1e-6)
 
@@ -495,8 +518,9 @@ def test_validate_episode_false_positive_battery(tmp_path):
 
     # Caso 2: Contacto (ground_contact=True) sin landed=True
     tel_contact_only = _make_synthetic_telemetry(pos_valid, yaw_valid, dt_s=0.05)
-    tel_contact_only["land_detected"][0]["landed"] = False
-    tel_contact_only["land_detected"][0]["ground_contact"] = True
+    for msg in tel_contact_only["land_detected"]:
+        msg["landed"] = False
+        msg["ground_contact"] = True
     res_2 = validate_episode_data(tel_contact_only, waypoints_cfg, pilot_exit_code=0)
     assert res_2["validation_status"] == "rejected"
     assert any("px4_land_detector_not_confirmed" in r for r in res_2["rejection_reasons"])
@@ -820,10 +844,15 @@ def test_real_dataset_mcap_validation():
         pytest.skip("Episodio local datasets/task_0001/episode_00 no disponible en este entorno")
 
     report = validate_episode_directory(ep_dir, update_meta=False)
-    assert report["validation_status"] == "accepted"
-    assert report["recording_status"] == "valid"
-    assert report["mission_status"] == "valid"
+    assert report["configuration_status"] == "valid"
+    assert all(p["passed"] for p in report["primitive_results"])
     assert report["metrics"]["min_obstacle_clearance_m"] > 0.30
+    assert report["metrics"]["landed_detector_confirmed"] is True
+    # Bajo C3, el escalon de offset UNIX tipo Patron B (~0.27 s) del bag historico se marca
+    # como ambiguo y rechaza la grabacion para aceptacion de campana.
+    assert report["recording_status"] == "invalid"
+    assert report["validation_status"] == "rejected"
+    assert any(r.startswith("ambiguous_clock_step_pattern_b") for r in report["rejection_reasons"])
 
     # Comparar el lector mantenido (rosbags) contra el parser nativo CDR (_parse_mcap_native)
     mcap_path = ep_dir / "rosbag" / "rosbag_0.mcap"
