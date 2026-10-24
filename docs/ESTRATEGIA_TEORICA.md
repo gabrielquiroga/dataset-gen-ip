@@ -115,31 +115,57 @@ Cada primitiva emite una secuencia discreta de waypoints locales relativos al ma
 ## 7. Análisis Combinatorio y Protocolo de Partición Held-Out
 
 ### 7.1 Espacio de Firmas Semánticas Únicas
-En una configuración canónica de pasillo 1D con 3 landmarks consecutivos ($L_1, L_2, L_3$):
-* Cada landmark puede ser de tipo `gate` o `pole` ($2^3 = 8$ distribuciones de objetos).
-* Si es `gate`, la primitiva física factible en avance monótono es `traverse` (1 opción).
-* Si es `pole`, la primitiva puede ser `overfly`, `slalom` u `orbit` (3 opciones).
+En el pipeline de Instant Policy, cada hito del pasillo se define a partir del **catálogo de acciones atómicas factibles en avance monótono (+X)** implementado en `task_generator.py`:
 
-El número exacto de combinaciones semánticas únicas se calcula descomponiendo por cantidad de postes presentes:
-$$\text{Total Firmas} = \binom{3}{0} \cdot 3^0 + \binom{3}{1} \cdot 3^1 + \binom{3}{2} \cdot 3^2 + \binom{3}{3} \cdot 3^3 = 1 + 9 + 27 + 27 = 64\text{ tareas únicas}$$
+| Acción Atómica | Tipo de Landmark | Primitiva | Parámetros Semánticos |
+| :--- | :--- | :--- | :--- |
+| $a_1$ | `gate` (cuadrada) | `traverse` | `{}` |
+| $a_2$ | `pole` | `overfly` | `{}` |
+| $a_3$ | `pole` | `slalom` | `{"side": "left"}` |
+| $a_4$ | `pole` | `slalom` | `{"side": "right"}` |
+| $a_5$ | `pole` | `orbit` | `{}` |
+| *(Opcional)* $a_6$ | `circular_gate` | `traverse` | `{}` |
 
-Una **Firma Semántica** se formaliza como la tupla inmutable:
-$$\mathcal{S} = [(\text{tipo}_1, \text{prim}_1), (\text{tipo}_2, \text{prim}_2), (\text{tipo}_3, \text{prim}_3)]$$
+El catálogo estándar comprende **$K = 5$ acciones atómicas base** (o **$K = 6$** cuando se habilita `--include-circular-gates` para generalización geométrica).
+
+Una **Firma Semántica** canónica formaliza unívocamente la secuencia de acciones y la lógica de vuelo:
+$$\mathcal{S} = [(\text{tipo}_1, \text{prim}_1, \text{params}_1); \dots; (\text{tipo}_N, \text{prim}_N, \text{params}_N)] \mid \text{logic:A1\_DIRECT}$$
+
+#### A. Caso Canónico de Longitud Fija ($N = 3$ landmarks)
+Para un circuito estándar de 3 landmarks consecutivos ($L_1, L_2, L_3$):
+* **Catálogo base ($K = 5$ acciones):**
+  $$\text{Total Firmas}_{N=3} = 5^3 = 125\text{ tareas únicas}$$
+* **Con puertas circulares ($K = 6$ acciones):**
+  $$\text{Total Firmas}_{N=3} = 6^3 = 216\text{ tareas únicas}$$
+
+#### B. Catálogo Multi-Longitud Balanceado ($N \in [2, 5]$ landmarks)
+Para entrenar y evaluar políticas que generalicen sobre tareas de diferente horizonte temporal, `task_generator.py` (`get_balanced_multilength_catalog`) genera el catálogo combinatorio exhaustivo sobre el rango $N \in [2, 5]$:
+$$\text{Total Firmas} = \sum_{N=2}^{5} K^N$$
+
+* **Para el catálogo base ($K = 5$):**
+  $$\text{Total Firmas} = 5^2 + 5^3 + 5^4 + 5^5 = 25 + 125 + 625 + 3\,125 = 3\,900\text{ tareas únicas}$$
+* **Con puertas circulares ($K = 6$):**
+  $$\text{Total Firmas} = 6^2 + 6^3 + 6^4 + 6^5 = 36 + 216 + 1\,296 + 7\,776 = 9\,324\text{ tareas únicas}$$
 
 ### 7.2 El Riesgo de la Paradoja del Cumpleaños (Muestreo con Reemplazo)
-Si un generador procedimental sortea aleatoriamente las primitivas de cada tarea con reemplazo:
-* Con $n = 15$ tareas generadas, la probabilidad de que al menos dos tareas compartan la misma firma semántica es de:
-  $$P(\text{colisión}) \approx 1 - e^{-\frac{15 \cdot 14}{2 \cdot 64}} \approx 80.6\%$$
-* Con $n = 20$ tareas, $P(\text{colisión}) \ge 96.0\%$.
+Si un generador procedimental sortea aleatoriamente las acciones de cada tarea con reemplazo dentro del espacio canónico ($M = 125$ firmas para $N=3$):
+* Con $n = 15$ tareas generadas, la probabilidad de colisión semántica es:
+  $$P(\text{colisión}) \approx 1 - e^{-\frac{15 \cdot 14}{2 \cdot 125}} = 1 - e^{-0.84} \approx 56.8\%$$
+* Con $n = 20$ tareas:
+  $$P(\text{colisión}) \approx 1 - e^{-\frac{20 \cdot 19}{2 \cdot 125}} = 1 - e^{-1.52} \approx 78.1\%$$
+* Con $n = 30$ tareas:
+  $$P(\text{colisión}) \ge 96.9\%$$
+
+Incluso con un espacio extendido de 125 combinaciones, el muestreo independiente con reemplazo garantiza casi con certeza la generación de tareas duplicadas, lo que provocaría fugas de datos (*data leakage*) entre las particiones de entrenamiento y evaluación.
 
 ### 7.3 Decisión Metodológica: Muestreo sin Reemplazo y Partición Formal
-1. **Muestreo sin Reemplazo:** Las $N_{\text{tasks}}$ tareas a recolectar deben extraerse **sin repetición** del conjunto discreto de las 64 firmas válidas.
+1. **Muestreo Determinista sin Reemplazo:** Las $N_{\text{tasks}}$ tareas a recolectar se extraen **estrictamente sin repetición** mediante indexación sobre una permutación pseudoaleatoria fija (`--shuffle-seed` y `--task-index` en `task_generator.py`) del catálogo combinatorio exhaustivo.
 2. **Partición Estricta Held-Out:**
-   Para evaluar formalmente la generalización *in-context*, el catálogo de firmas se divide a priori:
-   * **Entrenamiento (Train Tasks):** $\approx 70\%$ de las firmas (ej. 45 tareas).
-   * **Validación (Val Tasks):** $\approx 15\%$ de las firmas (ej. 10 tareas en poses 3D nuevas).
-   * **Generalización Fuera de Distribución (Held-Out Tasks):** $\approx 15\%$ de las firmas (ej. 9 combinaciones de primitivas **estrictamente nunca vistas durante el entrenamiento**).
-   * *Regla inviolable:* Ninguna firma del conjunto Held-Out puede haber formado parte del entrenamiento bajo ningún conjunto de poses 3D.
+   Para evaluar formalmente la generalización *in-context*, el catálogo de firmas semánticas únicas se divide de forma mutuamente excluyente mediante `audit_dataset.py`:
+   * **Entrenamiento (Train Tasks):** $\approx 70\%$ de las firmas únicas.
+   * **Validación (Val Tasks):** $\approx 15\%$ de las firmas (evaluadas en mundos con poses 3D y variaciones métricas nuevas).
+   * **Generalización Fuera de Distribución (Held-Out Tasks):** $\approx 15\%$ de las firmas (secuencias combinatorias de primitivas **estrictamente nunca vistas durante el entrenamiento**).
+   * *Regla inviolable:* Ninguna firma semántica del conjunto Held-Out puede haber formado parte del entrenamiento bajo ningún conjunto de poses 3D.
 
 ---
 
