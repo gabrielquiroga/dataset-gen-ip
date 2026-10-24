@@ -7,6 +7,13 @@ import yaml
 import rclpy
 from px4_msgs.msg import VehicleCommand
 from uav_ip.base_pilot import BasePilot
+from uav_ip.validation_geometry import (
+    LANDING_MAX_XY_ERR_M as GEOM_LANDING_MAX_XY_ERR_M,
+    PILOT_TRAVERSE_CIRC_MAX_R,
+    PILOT_TRAVERSE_SQUARE_MAX_Y,
+    PILOT_TRAVERSE_SQUARE_MAX_Z,
+    is_traverse_center_reached,
+)
 
 
 class WaypointController(BasePilot):
@@ -34,7 +41,10 @@ class WaypointController(BasePilot):
     LANDING_PERSISTENCE_REQUIRED_S = 3.0
     LANDING_TIMEOUT_S = 10.0
     LANDING_MAX_Z_ENU_M = 0.25
-    LANDING_MAX_XY_ERR_M = 0.75
+    LANDING_MAX_XY_ERR_M = GEOM_LANDING_MAX_XY_ERR_M
+    TRAVERSE_SQUARE_MAX_Y = PILOT_TRAVERSE_SQUARE_MAX_Y
+    TRAVERSE_SQUARE_MAX_Z = PILOT_TRAVERSE_SQUARE_MAX_Z
+    TRAVERSE_CIRC_MAX_R = PILOT_TRAVERSE_CIRC_MAX_R
 
     def __init__(self):
         super().__init__("waypoint_controller")
@@ -131,6 +141,7 @@ class WaypointController(BasePilot):
                 continue
 
             lm = landmarks_map[target_id]
+            lm_type = str(lm.get("type", "square_gate")).lower()
             cx, cy, cz = float(lm["x"]), float(lm["y"]), float(lm["z"])
             yaw = float(lm.get("yaw", 0.0))
             fwd_x = math.cos(yaw)
@@ -150,6 +161,7 @@ class WaypointController(BasePilot):
                     "type": "pre",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -158,6 +170,7 @@ class WaypointController(BasePilot):
                     "type": "center",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
@@ -166,6 +179,7 @@ class WaypointController(BasePilot):
                     "type": "post",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -348,15 +362,37 @@ class WaypointController(BasePilot):
                 wp_reached = (dist_3d < 0.50 or (along_track > 0.0 and cross_track < 0.65 and alt_err < 0.50))
             elif wp_type == "pre":
                 if wp_prim == "traverse":
-                    wp_reached = (dist_3d < 0.50 or (along_track > -0.15 and cross_track < 0.35 and alt_err < 0.38))
+                    lm_type = str(wp_info.get("landmark_type", "square_gate")).lower()
+                    if "circ" in lm_type or "torus" in lm_type:
+                        wp_reached = (
+                            dist_3d < 0.50
+                            or (along_track > -0.15 and math.hypot(cross_track, alt_err) <= self.TRAVERSE_CIRC_MAX_R)
+                        )
+                    else:
+                        wp_reached = (
+                            dist_3d < 0.50
+                            or (
+                                along_track > -0.15
+                                and cross_track <= self.TRAVERSE_SQUARE_MAX_Y
+                                and alt_err <= self.TRAVERSE_SQUARE_MAX_Z
+                            )
+                        )
                 else:
                     wp_reached = (dist_3d < 0.60 or (along_track > -0.15 and cross_track < 0.60 and alt_err < 0.50))
             elif wp_type == "center":
-                # Para traverse en square_gate (semiancho libre horizontal +-0.65m, vertical +-0.70m,
-                # envolvente UAV 0.28m -> ventana libre de colision +-0.37m x +-0.42m),
-                # exigir cross_track < 0.35m y alt_err < 0.40m mantiene el avance dentro de la ventana segura.
+                # Para traverse, distinguir ventana rectangular (square_gate: |y| <= 0.33m, |z| <= 0.38m)
+                # y ventana radial (circular_gate: r <= 0.3656m) derivadas de validation_geometry.py.
                 if wp_prim == "traverse":
-                    wp_reached = ((dist_3d < 0.45 or along_track >= -0.05) and cross_track < 0.35 and alt_err < 0.40)
+                    wp_reached = is_traverse_center_reached(
+                        along_track=along_track,
+                        cross_track=cross_track,
+                        alt_err=alt_err,
+                        dist_3d=dist_3d,
+                        landmark_type=str(wp_info.get("landmark_type", "square_gate")),
+                        square_max_y=self.TRAVERSE_SQUARE_MAX_Y,
+                        square_max_z=self.TRAVERSE_SQUARE_MAX_Z,
+                        circ_max_r=self.TRAVERSE_CIRC_MAX_R,
+                    )
                 else:
                     wp_reached = ((dist_3d < 0.65 or along_track >= -0.08) and cross_track < 0.65 and alt_err < 0.55)
             elif wp_type == "orbit_arc":

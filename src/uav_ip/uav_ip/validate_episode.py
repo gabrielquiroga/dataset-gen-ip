@@ -33,6 +33,7 @@ import os
 import struct
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -54,6 +55,51 @@ from uav_ip.synthetic_lidar import (
     px4_odometry_to_gazebo_enu,
     yaw_ned_to_gazebo_enu,
 )
+from uav_ip.validation_geometry import (
+    CIRCULAR_GATE_CLEAR_RADIUS,
+    CIRCULAR_MAJOR_RADIUS,
+    CIRCULAR_NUM_SEGMENTS,
+    CIRCULAR_POLY_SAGITTA,
+    CIRCULAR_TUBE_RADIUS,
+    COLLISION_SEGMENT_MAX_STEP_M,
+    DISCRETIZATION_MARGIN_M,
+    GATE_BAR_THICKNESS,
+    GATE_HALF_HEIGHT,
+    GATE_HALF_WIDTH,
+    LANDING_MAX_XY_ERR_M,
+    LANDING_PAD_HALF_SIZE,
+    ORBIT_MAX_MEAN_YAW_ERR_DEG,
+    ORBIT_MAX_RADIUS_M,
+    ORBIT_MIN_SWEEP_DEG,
+    OVERFLY_MAX_LAT_M,
+    OVERFLY_MIN_ALT_M,
+    PILOT_BUFFER_M,
+    PILOT_TRAVERSE_CIRC_MAX_R,
+    PILOT_TRAVERSE_SQUARE_MAX_Y,
+    PILOT_TRAVERSE_SQUARE_MAX_Z,
+    POLE_HEIGHT,
+    POLE_RADIUS,
+    PROTECTED_VOLUME_MODEL,
+    PROTECTED_VOLUME_REFERENCE,
+    SLALOM_MAX_LATERAL,
+    SLALOM_MIN_LATERAL,
+    SQUARE_GATE_CLEAR_HALF_Y,
+    SQUARE_GATE_CLEAR_HALF_Z,
+    TRAVERSE_CIRC_MAX_R,
+    TRAVERSE_MAX_ABS_Y,
+    TRAVERSE_MAX_ABS_Z,
+    UAV_COLLISION_RADIUS_XY,
+    UAV_PHYSICAL_RADIUS_XY,
+    UAV_SAFE_POLE_CENTER_DIST,
+    UAV_SAFETY_MARGIN_XY,
+    X500_FULL_ROTOR_TIP_RADIUS_M,
+    X500_SDF_MEASUREMENT,
+    compute_landmark_clearance,
+    derive_validation_tolerances,
+    points_to_aabb_distance as _points_to_aabb_distance,
+    subdivide_trajectory_segments as _subdivide_trajectory_segments,
+    world_to_landmark_local as _world_to_landmark_local,
+)
 
 # ============================================================================
 # Constantes Geometricas y Umbrales de Validacion (Sincronizados con Documentacion)
@@ -67,58 +113,13 @@ POLE_LANDMARK_TYPES = frozenset({"pole"})
 SUPPORTED_PRIMITIVE_TYPES = frozenset({"traverse", "slalom", "overfly", "orbit"})
 SUPPORTED_SLALOM_SIDES = frozenset({"left", "right"})
 
-# 1. Geometria nominal de obstaculos (identica a world_generator.py y synthetic_lidar.py)
-GATE_HALF_WIDTH: float = 0.70           # Pilares izquierdo/derecho centrados en y = ±0.70 m
-GATE_HALF_HEIGHT: float = 0.75          # Vigas superior/inferior centradas en z = ±0.75 m
-GATE_BAR_THICKNESS: float = 0.10        # Espesor de las 4 barras (semiespesor = 0.05 m)
-SQUARE_GATE_CLEAR_HALF_Y: float = GATE_HALF_WIDTH - 0.5 * GATE_BAR_THICKNESS   # 0.65 m (luz libre horizontal: 1.30 m)
-SQUARE_GATE_CLEAR_HALF_Z: float = GATE_HALF_HEIGHT - 0.5 * GATE_BAR_THICKNESS  # 0.70 m (luz libre vertical: 1.40 m)
-
-CIRCULAR_MAJOR_RADIUS: float = 0.75     # Radio mayor del anillo circular (m)
-CIRCULAR_TUBE_RADIUS: float = 0.05      # Radio de cada cilindro del anillo (m)
-CIRCULAR_NUM_SEGMENTS: int = 16         # Segmentos cilindricos en world_generator.py
-# Correccion conservadora por cuerda poligonal de 16 segmentos: R * (1 - cos(pi/16)) ≈ 0.0144 m
-CIRCULAR_POLY_SAGITTA: float = CIRCULAR_MAJOR_RADIUS * (1.0 - math.cos(math.pi / CIRCULAR_NUM_SEGMENTS))
-CIRCULAR_GATE_CLEAR_RADIUS: float = CIRCULAR_MAJOR_RADIUS - CIRCULAR_POLY_SAGITTA - CIRCULAR_TUBE_RADIUS  # ~0.6856 m
-
-POLE_RADIUS: float = 0.10               # Radio del poste cilindrico vertical (m)
-POLE_HEIGHT: float = 3.00               # Altura total del poste apoyado en z=0 (m)
-LANDING_PAD_HALF_SIZE: float = 1.00     # Plataforma cuadrada de 2.0m x 2.0m
-
-# 2. Envolvente geometrica del cuadricoptero gz_x500
-UAV_PHYSICAL_RADIUS_XY: float = 0.23    # Radio fisico de estructura/brazos proyectado (m)
-UAV_SAFETY_MARGIN_XY: float = 0.05      # Margen adicional de seguridad geometrica (m)
-UAV_COLLISION_RADIUS_XY: float = UAV_PHYSICAL_RADIUS_XY + UAV_SAFETY_MARGIN_XY  # 0.28 m
-UAV_SAFE_POLE_CENTER_DIST: float = POLE_RADIUS + UAV_COLLISION_RADIUS_XY        # 0.38 m
-
-# Subdivisión espacial maxima para evaluar colisiones sobre segmentos entre muestras
-COLLISION_SEGMENT_MAX_STEP_M: float = 0.02
-
-# 3. Criterios de exito por primitiva derivados de la abertura libre menos UAV_COLLISION_RADIUS_XY
-TRAVERSE_MAX_ABS_Y: float = round(SQUARE_GATE_CLEAR_HALF_Y - UAV_COLLISION_RADIUS_XY, 4)      # 0.37 m
-TRAVERSE_MAX_ABS_Z: float = round(SQUARE_GATE_CLEAR_HALF_Z - UAV_COLLISION_RADIUS_XY, 4)      # 0.42 m
-TRAVERSE_CIRC_MAX_R: float = round(CIRCULAR_GATE_CLEAR_RADIUS - UAV_COLLISION_RADIUS_XY, 4)   # 0.4056 m
-
-SLALOM_MIN_LATERAL: float = UAV_SAFE_POLE_CENTER_DIST + 0.07  # 0.45 m
-SLALOM_MAX_LATERAL: float = 2.60                              # 2.60 m
-
-OVERFLY_MIN_ALT_M: float = POLE_HEIGHT + 0.30                 # 3.30 m
-OVERFLY_MAX_LAT_M: float = 0.85                               # 0.85 m
-
-# En orbit (arco nominal 270° a R=1.5m con esfera de aceptacion final 0.60m -> ~23.6°):
-# exigimos >= 240.0° de barrido antihorario acumulado y error medio de yaw centripeto <= 45.0°
-ORBIT_MIN_SWEEP_DEG: float = 240.0
-ORBIT_MAX_RADIUS_M: float = 3.20
-ORBIT_MAX_MEAN_YAW_ERR_DEG: float = 45.0
-
-# 4. Criterios de despegue, continuidad temporal y ventana sincronizada de aterrizaje
+# Criterios de despegue, continuidad temporal y ventana sincronizada de aterrizaje
 TAKEOFF_MIN_ALT_M: float = 0.95
 MIN_ACTIVE_GROUND_Z_M: float = 0.15
 MAX_ALLOWED_DT_GAP_S: float = 0.15      # Hueco temporal maximo admisible entre muestras (150 ms)
 MAX_ALLOWED_STEP_DIST_M: float = 0.35   # Paso espacial maximo admisible entre muestras consecutivas (m)
 
 LANDING_WINDOW_S: float = 0.50          # Duracion de la ventana temporal final de aterrizaje (s, parametro de ingenieria)
-LANDING_MAX_XY_ERR_M: float = 0.75      # Error radial maximo en la ventana final de reposo (dentro del pad ±1.0m)
 LANDING_MAX_FINAL_Z_M: float = 0.25     # Altitud maxima en la ventana final de reposo (m)
 LANDING_MAX_FINAL_SPEED: float = 0.25   # Velocidad maxima en la ventana final de reposo (m/s)
 LANDING_MAX_DETECTOR_AGE_S: float = 1.5 # Antigüedad maxima del ultimo mensaje VehicleLandDetected al cierre (s)
@@ -134,19 +135,80 @@ EXPECTED_TOPIC_SCHEMAS = {
     "/fmu/in/trajectory_setpoint": "px4_msgs/msg/TrajectorySetpoint",
 }
 
+EXPECTED_SCHEMA_REQUIRED_TOKENS: Dict[str, Tuple[str, ...]] = {
+    "px4_msgs/msg/VehicleOdometry": (
+        "uint64 timestamp",
+        "uint64 timestamp_sample",
+        "uint8 pose_frame",
+        "float32[3] position",
+        "float32[4] q",
+        "uint8 velocity_frame",
+        "float32[3] velocity",
+        "uint8 reset_counter",
+    ),
+    "px4_msgs/msg/VehicleLocalPosition": (
+        "uint64 timestamp",
+        "uint64 timestamp_sample",
+        "bool xy_valid",
+        "bool z_valid",
+        "float32 x",
+        "float32 y",
+        "float32 z",
+        "uint8 xy_reset_counter",
+        "uint8 z_reset_counter",
+        "uint8 vxy_reset_counter",
+        "uint8 vz_reset_counter",
+        "float32 heading",
+    ),
+    "px4_msgs/msg/VehicleLandDetected": (
+        "uint64 timestamp",
+        "bool freefall",
+        "bool ground_contact",
+        "bool maybe_landed",
+        "bool landed",
+        "bool at_rest",
+    ),
+    "px4_msgs/msg/VehicleStatus": (
+        "uint64 timestamp",
+        "uint8 arming_state",
+        "uint8 nav_state",
+        "bool failsafe",
+    ),
+    "px4_msgs/msg/TrajectorySetpoint": (
+        "uint64 timestamp",
+        "float32[3] position",
+        "float32[3] velocity",
+        "float32 yaw",
+        "float32 yawspeed",
+    ),
+}
+
 
 def get_effective_validation_parameters() -> Dict[str, Any]:
     """Retorna un diccionario serializable con la version del validador y parametros efectivos."""
+    tols = derive_validation_tolerances(
+        uav_physical_radius_m=UAV_PHYSICAL_RADIUS_XY,
+        uav_safety_margin_m=UAV_SAFETY_MARGIN_XY,
+        pilot_buffer_m=PILOT_BUFFER_M,
+    )
     return {
         "validator_version": VALIDATOR_VERSION,
-        "uav_physical_radius_xy_m": UAV_PHYSICAL_RADIUS_XY,
-        "uav_safety_margin_xy_m": UAV_SAFETY_MARGIN_XY,
-        "uav_collision_radius_xy_m": UAV_COLLISION_RADIUS_XY,
+        "protected_volume_model": PROTECTED_VOLUME_MODEL,
+        "protected_volume_reference": PROTECTED_VOLUME_REFERENCE,
+        "x500_sdf_commit": X500_SDF_MEASUREMENT["px4_git_commit"],
+        "x500_full_rotor_tip_radius_xy_m": X500_FULL_ROTOR_TIP_RADIUS_M,
+        "uav_physical_radius_xy_m": tols["uav_physical_radius_xy_m"],
+        "uav_safety_margin_xy_m": tols["uav_safety_margin_xy_m"],
+        "uav_collision_radius_xy_m": tols["uav_collision_radius_xy_m"],
         "collision_segment_max_step_m": COLLISION_SEGMENT_MAX_STEP_M,
-        "traverse_max_abs_y_m": TRAVERSE_MAX_ABS_Y,
-        "traverse_max_abs_z_m": TRAVERSE_MAX_ABS_Z,
-        "traverse_circ_max_r_m": TRAVERSE_CIRC_MAX_R,
-        "slalom_min_lateral_m": SLALOM_MIN_LATERAL,
+        "discretization_margin_m": DISCRETIZATION_MARGIN_M,
+        "traverse_max_abs_y_m": tols["traverse_max_abs_y_m"],
+        "traverse_max_abs_z_m": tols["traverse_max_abs_z_m"],
+        "traverse_circ_max_r_m": tols["traverse_circ_max_r_m"],
+        "pilot_traverse_square_max_y_m": tols["pilot_traverse_square_max_y_m"],
+        "pilot_traverse_square_max_z_m": tols["pilot_traverse_square_max_z_m"],
+        "pilot_traverse_circ_max_r_m": tols["pilot_traverse_circ_max_r_m"],
+        "slalom_min_lateral_m": tols["slalom_min_lateral_m"],
         "slalom_max_lateral_m": SLALOM_MAX_LATERAL,
         "overfly_min_alt_m": OVERFLY_MIN_ALT_M,
         "overfly_max_lat_m": OVERFLY_MAX_LAT_M,
@@ -158,7 +220,7 @@ def get_effective_validation_parameters() -> Dict[str, Any]:
         "max_allowed_dt_gap_s": MAX_ALLOWED_DT_GAP_S,
         "max_allowed_step_dist_m": MAX_ALLOWED_STEP_DIST_M,
         "landing_window_s": LANDING_WINDOW_S,
-        "landing_max_xy_err_m": LANDING_MAX_XY_ERR_M,
+        "landing_max_xy_err_m": tols["landing_max_xy_err_m"],
         "landing_max_final_z_m": LANDING_MAX_FINAL_Z_M,
         "landing_max_final_speed_mps": LANDING_MAX_FINAL_SPEED,
         "landing_max_detector_age_s": LANDING_MAX_DETECTOR_AGE_S,
@@ -166,28 +228,103 @@ def get_effective_validation_parameters() -> Dict[str, Any]:
     }
 
 
-
-
 # ============================================================================
 # Verificacion de Integridad MCAP y Lectura de Telemetria (rosbags + Fallback CDR)
 # ============================================================================
 
-def _read_mcap_str(buf: bytes, offset: int) -> Tuple[str, int]:
-    if offset + 4 > len(buf):
+class TelemetryBundle(dict):
+    """Diccionario de telemetria con metadatos del lector (`reader_info`) adjuntos."""
+
+    def __init__(self, *args: Any, reader_info: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.reader_info: Dict[str, Any] = reader_info or {}
+
+
+def _read_mcap_str(buf: bytes, offset: int, limit: Optional[int] = None) -> Tuple[str, int]:
+    bound = len(buf) if limit is None else min(len(buf), limit)
+    if offset + 4 > bound:
         raise ValueError("Truncated MCAP string length")
     length = struct.unpack_from("<I", buf, offset)[0]
     end = offset + 4 + length
-    if end > len(buf):
+    if end > bound:
         raise ValueError("Truncated MCAP string payload")
     return buf[offset + 4:end].decode("utf-8", errors="replace"), end
 
 
+def _read_mcap_bytes(buf: bytes, offset: int, limit: Optional[int] = None) -> Tuple[bytes, int]:
+    bound = len(buf) if limit is None else min(len(buf), limit)
+    if offset + 4 > bound:
+        raise ValueError("Truncated MCAP byte-array length")
+    length = struct.unpack_from("<I", buf, offset)[0]
+    end = offset + 4 + length
+    if end > bound:
+        raise ValueError("Truncated MCAP byte-array payload")
+    return buf[offset + 4:end], end
+
+
+def _verify_mcap_record_stream(buf: bytes, start: int, stop: int, mcap_name: str) -> None:
+    """
+    Recorre el flujo completo de registros MCAP entre `start` y `stop`, verificando:
+      - Que cada cabecera y cuerpo de registro quepa íntegramente en `[start, stop]`.
+      - En registros `Chunk` (`op = 0x06`), que su longitud interna sea consistente y,
+        cuando `compression == ""` y `uncompressed_crc != 0`, que el CRC32 de los
+        registros coincida exactamente con `zlib.crc32`.
+      - Que el flujo alcance exactamente `stop` sin bytes huérfanos ni truncamiento intermedio.
+    """
+    o = start
+    while o < stop:
+        if o + 9 > stop:
+            raise ValueError(f"truncated_mcap_record_header ({mcap_name} at offset {o})")
+        op = buf[o]
+        rlen = struct.unpack_from("<Q", buf, o + 1)[0]
+        rec_start = o + 9
+        rec_end = rec_start + rlen
+        if rec_end > stop:
+            raise ValueError(
+                f"truncated_mcap_record_body ({mcap_name} op=0x{op:02x} at offset {o}: {rec_end} > {stop})"
+            )
+
+        if op == 0x06:  # Chunk record
+            if rlen < 36:
+                raise ValueError(f"corrupted_mcap_chunk_header_too_short ({mcap_name} at offset {o})")
+            uncompressed_size = struct.unpack_from("<Q", buf, rec_start + 16)[0]
+            uncompressed_crc = struct.unpack_from("<I", buf, rec_start + 24)[0]
+            comp, p = _read_mcap_str(buf, rec_start + 28, limit=rec_end)
+            if p + 8 > rec_end:
+                raise ValueError(f"truncated_mcap_chunk_records_len ({mcap_name} at offset {o})")
+            clen = struct.unpack_from("<Q", buf, p)[0]
+            chunk_data_start = p + 8
+            chunk_data_end = chunk_data_start + clen
+            if chunk_data_end != rec_end:
+                raise ValueError(
+                    f"corrupted_mcap_chunk_records_bounds ({mcap_name} at offset {o}: {chunk_data_end} != {rec_end})"
+                )
+            if comp == "":
+                if uncompressed_size != clen:
+                    raise ValueError(
+                        f"corrupted_mcap_chunk_uncompressed_size ({mcap_name} at offset {o}: {uncompressed_size} != {clen})"
+                    )
+                chunk_bytes = buf[chunk_data_start:chunk_data_end]
+                if uncompressed_crc != 0:
+                    computed_crc = zlib.crc32(chunk_bytes) & 0xFFFFFFFF
+                    if computed_crc != uncompressed_crc:
+                        raise ValueError(
+                            f"corrupted_mcap_chunk_crc32 ({mcap_name} at offset {o}: "
+                            f"expected 0x{uncompressed_crc:08x}, got 0x{computed_crc:08x})"
+                        )
+                _verify_mcap_record_stream(buf, chunk_data_start, chunk_data_end, mcap_name)
+
+        o = rec_end
+
+
 def verify_mcap_integrity(mcap_path: Path) -> bytes:
     """
-    Verifica que el archivo `.mcap` no este vacio ni truncado:
+    Verifica que el archivo `.mcap` no este vacio, truncado ni corrupto a mitad de archivo:
       1. Comienza y termina con los 8 bytes magicos `\\x89MCAP0\\r\\n`.
       2. Contiene el registro `Footer` (`opcode = 0x02`, `record_len = 20`) inmediatamente
-         antes del magic final.
+         antes del magic final y verifica `summary_crc` si está presente (`!= 0`).
+      3. Recorre la totalidad del flujo de registros de principio a fin y valida tamaños y
+         `uncompressed_crc` (`zlib.crc32`) en todos los chunks no comprimidos.
     Retorna los bytes del archivo o lanza `ValueError` si el archivo esta truncado/corrupto.
     """
     if not mcap_path.is_file():
@@ -205,23 +342,63 @@ def verify_mcap_integrity(mcap_path: Path) -> bytes:
     footer_len = struct.unpack_from("<Q", buf, footer_pos + 1)[0]
     if footer_op != 0x02 or footer_len != 20:
         raise ValueError(f"corrupted_mcap_footer_record ({mcap_path.name})")
+
+    summary_start, summary_offset_start, summary_crc = struct.unpack_from("<QQI", buf, footer_pos + 9)
+    if summary_crc != 0 and summary_start != 0:
+        if summary_start < 8 or summary_start > footer_pos:
+            raise ValueError(f"corrupted_mcap_summary_start ({mcap_path.name})")
+        summary_region = buf[summary_start : footer_pos + 9 + 16]
+        calc_sum_crc = zlib.crc32(summary_region) & 0xFFFFFFFF
+        if calc_sum_crc != summary_crc:
+            raise ValueError(
+                f"corrupted_mcap_summary_crc32 ({mcap_path.name}: expected 0x{summary_crc:08x}, got 0x{calc_sum_crc:08x})"
+            )
+
+    _verify_mcap_record_stream(buf, 8, len(buf) - 8, mcap_path.name)
     return buf
 
 
-def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+def _verify_schema_definition_compatibility(schema_name: str, schema_encoding: str, schema_data: bytes) -> None:
+    """
+    Si el registro Schema del MCAP incluye el texto de definicion del mensaje (`ros2msg`/`ros2idl`),
+    verifica que contenga los campos requeridos por el layout CDR utilizado por el validador.
+    """
+    req_tokens = EXPECTED_SCHEMA_REQUIRED_TOKENS.get(schema_name)
+    if not req_tokens:
+        return
+    if schema_encoding and schema_encoding not in ("ros2msg", "ros2idl", "cdr", ""):
+        raise ValueError(f"unsupported_schema_encoding ({schema_name}: {schema_encoding})")
+    if not schema_data:
+        return
+    text = schema_data.decode("utf-8", errors="replace")
+    normalized = " ".join(text.split())
+    for tok in req_tokens:
+        if tok not in normalized:
+            raise ValueError(
+                f"incompatible_schema_definition ({schema_name} missing required field '{tok}')"
+            )
+
+
+def _parse_mcap_native(
+    mcap_path: Path,
+    buf: Optional[bytes] = None,
+) -> Optional[Tuple[Dict[str, List[Dict[str, Any]]], List[str]]]:
     """
     Deserializador nativo MCAP + CDR (little-endian XCDR1) verificado contra las definiciones
     de `src/px4_msgs/msg/*.msg`:
-      - Valida integridad estructural del archivo MCAP y de cada registro/chunk (rechaza truncados).
-      - Verifica el nombre del esquema (`px4_msgs/msg/...`) y `encoding == 'cdr'` de cada canal.
-      - Verifica el encabezado de encapsulamiento CDR little-endian (`0x00, 0x01`).
-      - Si encuentra chunks comprimidos (zstd/lz4), retorna `None` para delegar a `rosbags`.
+      - Valida integridad estructural del archivo MCAP y de cada registro/chunk (rechaza truncados y CRCs inválidos).
+      - Exige que todo canal de telemetría relevante tenga un `Schema` válido y compatible con `EXPECTED_TOPIC_SCHEMAS`.
+      - Verifica `encoding == 'cdr'` y el encabezado de encapsulamiento CDR little-endian (`0x00, 0x01`).
+      - Extrae todos los contadores de reset de `VehicleLocalPosition` (`xy_reset_counter`, `z_reset_counter`,
+        `vxy_reset_counter`, `vz_reset_counter`, `heading_reset_counter`).
+      - Si encuentra chunks comprimidos (zstd/lz4), retorna `None` para que el llamador lo rechace si no hay `rosbags`.
     """
     if buf is None:
         buf = verify_mcap_integrity(mcap_path)
 
-    schemas: Dict[int, Tuple[str, str]] = {}
-    channels: Dict[int, Tuple[str, str, str]] = {}
+    schemas: Dict[int, Tuple[str, str, bytes]] = {}
+    channels: Dict[int, Tuple[str, str, str, int]] = {}
+    verified_schemas: set[str] = set()
     telemetry: Dict[str, List[Dict[str, Any]]] = {
         "odometry": [],
         "local_pos": [],
@@ -245,32 +422,52 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                 raise ValueError(f"truncated_mcap_record_body at offset {o} (expected {rec_end} <= {stop})")
 
             if op == 0x03:  # Schema record
+                if rlen < 10:
+                    raise ValueError("corrupted_mcap_schema_record_too_short")
                 sid = struct.unpack_from("<H", b, rec_start)[0]
-                sname, next_p = _read_mcap_str(b, rec_start + 2)
-                senc, _ = _read_mcap_str(b, next_p)
-                schemas[sid] = (sname, senc)
+                sname, next_p = _read_mcap_str(b, rec_start + 2, limit=rec_end)
+                senc, next_p = _read_mcap_str(b, next_p, limit=rec_end)
+                sdata, _ = _read_mcap_bytes(b, next_p, limit=rec_end)
+                _verify_schema_definition_compatibility(sname, senc, sdata)
+                schemas[sid] = (sname, senc, sdata)
 
             elif op == 0x04:  # Channel record
+                if rlen < 12:
+                    raise ValueError("corrupted_mcap_channel_record_too_short")
                 cid, sid = struct.unpack_from("<HH", b, rec_start)
-                topic, next_p = _read_mcap_str(b, rec_start + 4)
-                msg_enc, _ = _read_mcap_str(b, next_p)
-                sname = schemas.get(sid, ("", ""))[0]
-                channels[cid] = (topic, sname, msg_enc)
+                topic, next_p = _read_mcap_str(b, rec_start + 4, limit=rec_end)
+                msg_enc, _ = _read_mcap_str(b, next_p, limit=rec_end)
+                if topic in EXPECTED_TOPIC_SCHEMAS:
+                    if sid == 0 or sid not in schemas:
+                        raise ValueError(f"missing_schema_for_channel ({topic}, schema_id={sid})")
+                    sname, senc, sdata = schemas[sid]
+                    expected_schema = EXPECTED_TOPIC_SCHEMAS[topic]
+                    if sname != expected_schema:
+                        raise ValueError(f"schema_mismatch_for_{topic} ({sname!r} != {expected_schema!r})")
+                    if msg_enc != "cdr":
+                        raise ValueError(f"unsupported_message_encoding ({topic}: {msg_enc!r})")
+                    _verify_schema_definition_compatibility(sname, senc, sdata)
+                    verified_schemas.add(sname)
+                else:
+                    sname = schemas.get(sid, ("", "", b""))[0]
+                channels[cid] = (topic, sname, msg_enc, sid)
 
             elif op == 0x05:  # Message record
                 if rlen < 22:
                     raise ValueError("corrupted_mcap_message_record_too_short")
                 cid = struct.unpack_from("<H", b, rec_start)[0]
+                if cid not in channels:
+                    raise ValueError(f"unknown_mcap_channel_id ({cid})")
                 log_time = struct.unpack_from("<Q", b, rec_start + 6)[0]
                 raw = b[rec_start + 22:rec_end]
-                topic, sname, msg_enc = channels.get(cid, ("", "", ""))
+                topic, sname, msg_enc, sid = channels[cid]
 
                 if topic in EXPECTED_TOPIC_SCHEMAS:
                     expected_schema = EXPECTED_TOPIC_SCHEMAS[topic]
-                    if sname and sname != expected_schema:
-                        raise ValueError(f"schema_mismatch_for_{topic} ({sname} != {expected_schema})")
-                    if msg_enc and msg_enc != "cdr":
-                        raise ValueError(f"unsupported_message_encoding ({msg_enc})")
+                    if sname != expected_schema:
+                        raise ValueError(f"schema_mismatch_for_{topic} ({sname!r} != {expected_schema!r})")
+                    if msg_enc != "cdr":
+                        raise ValueError(f"unsupported_message_encoding ({msg_enc!r})")
                     if len(raw) < 4 or raw[0] != 0x00 or raw[1] != 0x01:
                         raise ValueError(f"unsupported_or_corrupted_cdr_header on {topic}")
 
@@ -310,6 +507,7 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                     # 72..80: delta_vxy, 80: vxy_reset_counter, 81..84: pad, 84..88: delta_vz, 88: vz_reset_counter, 89..92: pad
                     # 92..104: ax, ay, az (3x float32)
                     # 104..108: heading (float32)
+                    # 108..120: heading_var, unaided_heading, delta_heading (3x float32), 120: heading_reset_counter (uint8)
                     if len(raw) < 108:
                         raise ValueError(f"truncated_cdr_payload_vehicle_local_position ({len(raw)} < 108)")
                     ts_us, ts_sample_us = struct.unpack_from("<QQ", raw, 4)
@@ -318,9 +516,13 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                     v_xy_valid = bool(raw[22])
                     v_z_valid = bool(raw[23])
                     x, y, z = struct.unpack_from("<fff", raw, 24)
+                    xy_reset_counter = int(raw[44])
+                    z_reset_counter = int(raw[52])
                     vx, vy, vz = struct.unpack_from("<fff", raw, 56)
+                    vxy_reset_counter = int(raw[80])
+                    vz_reset_counter = int(raw[88])
                     heading = float(struct.unpack_from("<f", raw, 104)[0])
-                    telemetry["local_pos"].append({
+                    lp_entry: Dict[str, Any] = {
                         "timestamp": int(log_time),
                         "timestamp_us": int(ts_us),
                         "timestamp_sample_us": int(ts_sample_us),
@@ -335,12 +537,16 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                         "z_valid": z_valid,
                         "v_xy_valid": v_xy_valid,
                         "v_z_valid": v_z_valid,
-                    })
+                        "xy_reset_counter": xy_reset_counter,
+                        "z_reset_counter": z_reset_counter,
+                        "vxy_reset_counter": vxy_reset_counter,
+                        "vz_reset_counter": vz_reset_counter,
+                    }
+                    if len(raw) >= 121:
+                        lp_entry["heading_reset_counter"] = int(raw[120])
+                    telemetry["local_pos"].append(lp_entry)
 
                 elif topic == "/fmu/out/vehicle_land_detected":
-                    # Layout CDR exacto segun src/px4_msgs/msg/VehicleLandDetected.msg:
-                    # 4..12: timestamp (uint64)
-                    # 12..24: 12 bools (12=freefall, 13=ground_contact, 14=maybe_landed, 15=landed, ..., 23=at_rest)
                     if len(raw) < 24:
                         raise ValueError(f"truncated_cdr_payload_vehicle_land_detected ({len(raw)} < 24)")
                     ts_us = struct.unpack_from("<Q", raw, 4)[0]
@@ -357,14 +563,6 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                     })
 
                 elif topic == "/fmu/out/vehicle_status_v4":
-                    # Layout CDR exacto segun src/px4_msgs/msg/VehicleStatus.msg:
-                    # 4..28: timestamp, armed_time, takeoff_time (3x uint64)
-                    # 28..31: arming_state, latest_arming_reason, latest_disarming_reason (3x uint8)
-                    # 31..36: pad (5 bytes para alinear uint64 a data_pos=32)
-                    # 36..44: nav_state_timestamp (uint64)
-                    # 44: nav_state_user_intention (uint8)
-                    # 45: nav_state (uint8)
-                    # ... 62: failsafe (bool)
                     if len(raw) < 63:
                         raise ValueError(f"truncated_cdr_payload_vehicle_status ({len(raw)} < 63)")
                     ts_us = struct.unpack_from("<Q", raw, 4)[0]
@@ -396,7 +594,7 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
                     })
 
             elif op == 0x06:  # Chunk record
-                comp, p = _read_mcap_str(b, rec_start + 28)
+                comp, p = _read_mcap_str(b, rec_start + 28, limit=rec_end)
                 clen = struct.unpack_from("<Q", b, p)[0]
                 if p + 8 + clen > rec_end:
                     raise ValueError("truncated_mcap_chunk_records")
@@ -411,15 +609,19 @@ def _parse_mcap_native(mcap_path: Path, buf: Optional[bytes] = None) -> Optional
     _walk_records(buf, 8, len(buf) - 8)
     if compressed_chunk_found:
         return None
-    return telemetry
+    return telemetry, sorted(verified_schemas)
 
 
-def _parse_with_rosbags(mcaps: List[Path]) -> Dict[str, List[Dict[str, Any]]]:
+def _parse_with_rosbags(mcaps: List[Path]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str], str]:
     """Lee una lista de archivos `.mcap` utilizando la biblioteca mantenida `rosbags`."""
+    import rosbags
     from rosbags.highlevel import AnyReader
     from rosbags.typesys import Stores, get_typestore
 
     typestore = get_typestore(getattr(Stores, "ROS2_JAZZY", Stores.LATEST))
+    # Si el archivo MCAP incluye definiciones de tipos custom (ej. px4_msgs), registrarlas en el typestore
+    from rosbags.typesys import get_types_from_msg
+
     merged: Dict[str, List[Dict[str, Any]]] = {
         "odometry": [],
         "local_pos": [],
@@ -427,7 +629,17 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Dict[str, List[Dict[str, Any]]]:
         "vehicle_status": [],
         "setpoints": [],
     }
+    verified_schemas: set[str] = set()
     with AnyReader(mcaps, default_typestore=typestore) as reader:
+        for conn in reader.connections:
+            if conn.topic in EXPECTED_TOPIC_SCHEMAS:
+                expected_schema = EXPECTED_TOPIC_SCHEMAS[conn.topic]
+                if conn.msgtype != expected_schema:
+                    raise ValueError(f"schema_mismatch_for_{conn.topic} ({conn.msgtype!r} != {expected_schema!r})")
+                verified_schemas.add(conn.msgtype)
+            if conn.msgdef and getattr(conn.msgdef, "data", None) and conn.msgtype not in typestore.types:
+                typestore.register(get_types_from_msg(conn.msgdef.data, conn.msgtype))
+
         for connection, timestamp, rawdata in reader.messages():
             topic = connection.topic
             msg = reader.deserialize(rawdata, connection.msgtype)
@@ -446,7 +658,7 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Dict[str, List[Dict[str, Any]]]:
                     "quality": int(getattr(msg, "quality", 0)),
                 })
             elif topic == "/fmu/out/vehicle_local_position_v1":
-                merged["local_pos"].append({
+                lp_item: Dict[str, Any] = {
                     "timestamp": int(timestamp),
                     "timestamp_us": int(getattr(msg, "timestamp", 0)),
                     "timestamp_sample_us": int(getattr(msg, "timestamp_sample", getattr(msg, "timestamp", 0))),
@@ -461,7 +673,17 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Dict[str, List[Dict[str, Any]]]:
                     "z_valid": bool(getattr(msg, "z_valid", True)),
                     "v_xy_valid": bool(getattr(msg, "v_xy_valid", True)),
                     "v_z_valid": bool(getattr(msg, "v_z_valid", True)),
-                })
+                }
+                for rc_field in (
+                    "xy_reset_counter",
+                    "z_reset_counter",
+                    "vxy_reset_counter",
+                    "vz_reset_counter",
+                    "heading_reset_counter",
+                ):
+                    if hasattr(msg, rc_field):
+                        lp_item[rc_field] = int(getattr(msg, rc_field))
+                merged["local_pos"].append(lp_item)
             elif topic == "/fmu/out/vehicle_land_detected":
                 merged["land_detected"].append({
                     "timestamp": int(timestamp),
@@ -489,16 +711,32 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Dict[str, List[Dict[str, Any]]]:
                     "yaw": float(getattr(msg, "yaw", 0.0)),
                     "yawspeed": float(getattr(msg, "yawspeed", float("nan"))),
                 })
-    return merged
+    rb_ver = str(getattr(rosbags, "__version__", "unknown"))
+    return merged, sorted(verified_schemas), rb_ver
 
 
-def load_episode_telemetry(bag_path: Path) -> Dict[str, List[Dict[str, Any]]]:
+def load_episode_telemetry(
+    bag_path: Path,
+    *,
+    backend: str = "auto",
+) -> TelemetryBundle:
     """
     Carga la telemetria completa de un episodio desde un directorio `rosbag/` o archivo `.mcap`.
-    1. Verifica siempre la integridad estructural de todos los archivos `.mcap` (magic + Footer).
-    2. Prioriza `rosbags` cuando esta disponible en el entorno Python activo.
-    3. Utiliza `_parse_mcap_native` como fallback verificado si `rosbags` no esta instalado.
+    1. Verifica siempre la integridad estructural completa de todos los archivos `.mcap`
+       (header magic, trailer magic, Footer record, flujo completo de registros y CRC32 de chunks).
+    2. Política sin degradación silenciosa (`C5`):
+       - Si `backend == 'rosbags'`, exige que `rosbags` esté instalado (si falta, lanza
+         `RuntimeError('missing_reader_dependency:rosbags')`) y propaga cualquier fallo de
+         deserialización sin caer a `_parse_mcap_native`.
+       - Si `backend == 'auto'` y `rosbags` está instalado, usa `rosbags` y NUNCA captura
+         excepciones para caer silenciosamente a `_parse_mcap_native`: cualquier fallo de
+         `rosbags` se propaga como `ValueError('rosbags_deserialization_error: ...')`.
+       - Solo cuando `backend == 'native'` o cuando `backend == 'auto'` y `rosbags` no está
+         instalado (`ImportError`) se utiliza `_parse_mcap_native` con verificación de esquema/CRC.
     """
+    if backend not in ("auto", "rosbags", "native"):
+        raise ValueError(f"unsupported_telemetry_backend ({backend})")
+
     bag_p = Path(bag_path)
     if bag_p.is_dir():
         mcaps = sorted(bag_p.glob("*.mcap"))
@@ -516,22 +754,38 @@ def load_episode_telemetry(bag_path: Path) -> Dict[str, List[Dict[str, Any]]]:
     for mp in mcaps:
         raw_buffers[mp] = verify_mcap_integrity(mp)
 
-    # 1. Intentar con `rosbags` como lector primario mantenido
-    try:
-        import rosbags.highlevel  # noqa: F401
-        has_rosbags = True
-    except ImportError:
-        has_rosbags = False
+    integrity_checks = [
+        "header_magic",
+        "footer_record",
+        "trailer_magic",
+        "record_stream_bounds",
+        "uncompressed_chunk_crc32",
+    ]
 
-    if has_rosbags:
+    if backend in ("auto", "rosbags"):
         try:
-            return _parse_with_rosbags(mcaps)
-        except Exception:
-            # Si rosbags falla por falta de registro de tipos custom de px4_msgs en su typestore
-            # por defecto, delegar al parser nativo CDR con validacion estricta de esquema.
-            pass
+            import rosbags.highlevel  # noqa: F401
+            has_rosbags = True
+        except ImportError as exc:
+            has_rosbags = False
+            if backend == "rosbags":
+                raise RuntimeError("missing_reader_dependency:rosbags") from exc
 
-    # 2. Fallback al lector nativo MCAP + CDR con validacion de esquema y longitud
+        if has_rosbags:
+            try:
+                merged_rb, schemas_rb, rb_ver = _parse_with_rosbags(mcaps)
+            except Exception as exc:
+                raise ValueError(f"rosbags_deserialization_error ({type(exc).__name__}: {exc})") from exc
+            r_info = {
+                "backend": "rosbags",
+                "backend_version": rb_ver,
+                "integrity_checks": integrity_checks,
+                "schema_revision": "ros2_msgdef_xcdr1",
+                "schemas_verified": schemas_rb,
+            }
+            return TelemetryBundle(merged_rb, reader_info=r_info)
+
+    # Lector nativo MCAP + CDR con verificación de esquema, CRC32 y longitud de payload
     merged: Dict[str, List[Dict[str, Any]]] = {
         "odometry": [],
         "local_pos": [],
@@ -539,137 +793,50 @@ def load_episode_telemetry(bag_path: Path) -> Dict[str, List[Dict[str, Any]]]:
         "vehicle_status": [],
         "setpoints": [],
     }
+    all_schemas: set[str] = set()
     for mp in mcaps:
         res = _parse_mcap_native(mp, buf=raw_buffers[mp])
         if res is None:
             raise RuntimeError(
-                f"El archivo {mp} contiene chunks comprimidos y `rosbags` no pudo deserializarlo."
+                f"compressed_mcap_requires_rosbags ({mp.name} contiene chunks comprimidos y rosbags no está instalado)"
             )
+        tel_part, schemas_part = res
+        all_schemas.update(schemas_part)
         for k in merged:
-            merged[k].extend(res[k])
-    return merged
+            merged[k].extend(tel_part[k])
+
+    r_info = {
+        "backend": "native_cdr",
+        "backend_version": VALIDATOR_VERSION,
+        "integrity_checks": integrity_checks,
+        "schema_revision": "px4_msgs_xcdr1_little_endian",
+        "schemas_verified": sorted(all_schemas),
+    }
+    return TelemetryBundle(merged, reader_info=r_info)
 
 
 # ============================================================================
-# Geometria Analitica de Distancia a Obstaculos (con Subdivisión de Segmentos)
+# Geometria Analitica de Distancia a Obstaculos (con Cota Inferior de Discretizacion)
 # ============================================================================
-
-def _world_to_landmark_local(
-    pos_enu: np.ndarray,
-    lm_x: float,
-    lm_y: float,
-    lm_z: float,
-    lm_yaw: float,
-) -> np.ndarray:
-    """
-    Transforma puntos `pos_enu` (N, 3) en Gazebo ENU al marco local FLU del landmark:
-      +x_loc: direccion de avance / normal del landmark (cos(yaw), sin(yaw))
-      +y_loc: flanco izquierdo del landmark (-sin(yaw), cos(yaw))
-      +z_loc: vertical hacia arriba (z - lm_z)
-    """
-    dx = pos_enu[:, 0] - float(lm_x)
-    dy = pos_enu[:, 1] - float(lm_y)
-    dz = pos_enu[:, 2] - float(lm_z)
-    c = math.cos(float(lm_yaw))
-    s = math.sin(float(lm_yaw))
-    x_loc = dx * c + dy * s
-    y_loc = -dx * s + dy * c
-    return np.column_stack([x_loc, y_loc, dz])
-
-
-def _points_to_aabb_distance(
-    pts_local: np.ndarray,
-    box_center: Tuple[float, float, float],
-    box_size: Tuple[float, float, float],
-) -> np.ndarray:
-    """Calcula la distancia euclidea desde N puntos (N, 3) a una caja 3D alineada."""
-    c = np.asarray(box_center, dtype=np.float64)
-    half = 0.5 * np.asarray(box_size, dtype=np.float64)
-    excess = np.maximum(0.0, np.abs(pts_local - c) - half)
-    return np.linalg.norm(excess, axis=1)
-
-
-def _subdivide_trajectory_segments(
-    pos_enu: np.ndarray,
-    max_step_m: float = COLLISION_SEGMENT_MAX_STEP_M,
-) -> np.ndarray:
-    """
-    Subdivide linealmente todo segmento entre muestras consecutivas cuya longitud supere
-    `max_step_m` (default: 0.02 m) para evitar que un obstaculo delgado quede oculto
-    entre dos muestras discretas.
-    """
-    if len(pos_enu) <= 1 or max_step_m <= 0.0:
-        return pos_enu
-
-    diffs = np.diff(pos_enu, axis=0)
-    seg_lens = np.linalg.norm(diffs, axis=1)
-    if np.all(seg_lens <= max_step_m):
-        return pos_enu
-
-    chunks: List[np.ndarray] = []
-    for i in range(len(diffs)):
-        L = float(seg_lens[i])
-        if L <= max_step_m:
-            chunks.append(pos_enu[i:i + 1])
-        else:
-            n_sub = int(math.ceil(L / max_step_m))
-            alphas = np.linspace(0.0, 1.0, n_sub, endpoint=False, dtype=np.float64)[:, None]
-            seg_pts = pos_enu[i] + alphas * diffs[i]
-            chunks.append(seg_pts)
-    chunks.append(pos_enu[-1:])
-    return np.vstack(chunks)
-
 
 def compute_min_distance_to_landmark(
     pos_enu: np.ndarray,
     landmark: Dict[str, Any],
     max_step_m: float = COLLISION_SEGMENT_MAX_STEP_M,
+    *,
+    return_lower_bound: bool = False,
 ) -> float:
     """
-    Calcula la distancia minima euclidea (en metros) desde la trayectoria poligonal 3D
-    subdividida a paso `<= max_step_m` hasta la superficie solida de un landmark
-    ('gate'/'square_gate', 'circular_gate', o 'pole').
+    Calcula la distancia mínima euclídea (en metros) desde la trayectoria poligonal 3D
+    subdividida a paso `<= max_step_m` hasta la superficie sólida de un landmark
+    ('gate'/'square_gate', 'circular_gate' con sus 16 cilindros finitos reales, o 'pole').
+    Si `return_lower_bound=True`, retorna la cota inferior conservadora de discretización
+    `max(0.0, d_sampled - max_step_m / 2.0)`.
     """
-    if len(pos_enu) == 0:
-        return float("inf")
-
-    pts_dense = _subdivide_trajectory_segments(pos_enu, max_step_m=max_step_m)
-    lm_type = str(landmark.get("type", "gate")).lower()
-    cx = float(landmark["x"])
-    cy = float(landmark["y"])
-    cz = float(landmark.get("z", 1.5))
-    yaw = float(landmark.get("yaw", 0.0))
-
-    if "pole" in lm_type or "cyl" in lm_type:
-        # Poste cilindrico vertical en (cx, cy), z in [0, POLE_HEIGHT], radio POLE_RADIUS
-        r_xy = np.hypot(pts_dense[:, 0] - cx, pts_dense[:, 1] - cy)
-        d_rad = np.maximum(0.0, r_xy - POLE_RADIUS)
-        d_z_top = np.maximum(0.0, pts_dense[:, 2] - POLE_HEIGHT)
-        d_z_bot = np.maximum(0.0, 0.0 - pts_dense[:, 2])
-        d_z = np.maximum(d_z_top, d_z_bot)
-        dists = np.hypot(d_rad, d_z)
-        return float(np.min(dists))
-
-    pts_loc = _world_to_landmark_local(pts_dense, cx, cy, cz, yaw)
-
-    if "circ" in lm_type or "torus" in lm_type:
-        # Anillo circular poligonal de 16 segmentos: descontamos CIRCULAR_POLY_SAGITTA
-        # del radio libre del toroide ideal como cota inferior conservadora.
-        r_yz = np.hypot(pts_loc[:, 1], pts_loc[:, 2])
-        d_tube_center = np.hypot(r_yz - CIRCULAR_MAJOR_RADIUS, pts_loc[:, 0])
-        dists = np.maximum(0.0, d_tube_center - CIRCULAR_TUBE_RADIUS - CIRCULAR_POLY_SAGITTA)
-        return float(np.min(dists))
-
-    # Puerta cuadrada: 4 barras identicas a world_generator._create_gate_element()
-    bars = [
-        ((0.0, 0.0, 0.75), (0.10, 1.50, 0.10)),
-        ((0.0, 0.0, -0.75), (0.10, 1.50, 0.10)),
-        ((0.0, 0.70, 0.0), (0.10, 0.10, 1.40)),
-        ((0.0, -0.70, 0.0), (0.10, 0.10, 1.40)),
-    ]
-    bar_dists = [_points_to_aabb_distance(pts_loc, b_c, b_s) for b_c, b_s in bars]
-    min_per_step = np.minimum.reduce(bar_dists)
-    return float(np.min(min_per_step))
+    clearance = compute_landmark_clearance(pos_enu, landmark, max_step_m=max_step_m)
+    if return_lower_bound:
+        return float(clearance["lower_bound_distance_m"])
+    return float(clearance["sampled_min_distance_m"])
 
 
 def _verify_single_primitive(
@@ -677,11 +844,19 @@ def _verify_single_primitive(
     yaw_enu: np.ndarray,
     prim: Dict[str, Any],
     landmark: Dict[str, Any],
+    *,
+    start_from_index: int = 0,
+    ts_sim_s: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
-    Verifica geometricamente una primitiva individual sobre la trayectoria medida.
-    Retorna un diccionario con `passed` (bool), `reason` (Optional[str]), `event_index` (Optional[int])
-    y metricas especificas de la maniobra.
+    Verifica geometricamente una primitiva individual sobre la trayectoria medida
+    buscando su ejecucion a partir de `start_from_index` (inclusive).
+    Retorna un diccionario con:
+      - `passed` (bool), `reason` (Optional[str])
+      - `start_index`, `event_index`, `completion_index` (Optional[int], indices globales)
+      - `start_time_s`, `event_time_s`, `completion_time_s` (Optional[float])
+      - `min_surface_clearance_sampled_m`, `discretization_margin_m`, `min_surface_clearance_m` (cota inferior)
+      - metricas especificas de la maniobra.
     """
     p_type = str(prim.get("type", "traverse")).lower()
     target_id = str(prim.get("target", landmark.get("id", "unknown")))
@@ -691,59 +866,93 @@ def _verify_single_primitive(
     cz = float(landmark.get("z", 1.5))
     lm_yaw = float(landmark.get("yaw", 0.0))
 
-    pts_loc = _world_to_landmark_local(pos_enu, cx, cy, cz, lm_yaw)
-    x_loc = pts_loc[:, 0]
-    y_loc = pts_loc[:, 1]
-    z_loc = pts_loc[:, 2]
-    dist_xy = np.hypot(x_loc, y_loc)
-    min_surf_dist = compute_min_distance_to_landmark(pos_enu, landmark)
+    N_total = len(pos_enu)
+    start_idx_clamped = max(0, min(int(start_from_index), N_total))
+
+    clearance_info = compute_landmark_clearance(
+        pos_enu, landmark, max_step_m=COLLISION_SEGMENT_MAX_STEP_M
+    )
+    sampled_surf_dist = float(clearance_info["sampled_min_distance_m"])
+    disc_margin = float(clearance_info["discretization_margin_m"])
+    lower_bound_surf_dist = float(clearance_info["lower_bound_distance_m"])
+
+    def _idx_to_time(idx_val: Optional[int]) -> Optional[float]:
+        if idx_val is None or ts_sim_s is None or idx_val < 0 or idx_val >= len(ts_sim_s):
+            return None
+        t_v = float(ts_sim_s[idx_val])
+        return round(t_v, 4) if math.isfinite(t_v) else None
 
     result: Dict[str, Any] = {
         "target": target_id,
         "primitive": p_type,
         "landmark_type": lm_type,
-        "min_surface_clearance_m": round(min_surf_dist, 4),
+        "search_start_index": int(start_idx_clamped),
+        "min_surface_clearance_sampled_m": round(sampled_surf_dist, 4),
+        "discretization_margin_m": round(disc_margin, 4),
+        "min_surface_clearance_m": round(lower_bound_surf_dist, 4),
+        "start_index": None,
         "event_index": None,
+        "completion_index": None,
+        "start_time_s": None,
+        "event_time_s": None,
+        "completion_time_s": None,
         "passed": False,
         "reason": None,
     }
 
-    # 1. Comprobar colision directa contra la estructura del landmark
-    if min_surf_dist < UAV_COLLISION_RADIUS_XY:
+    # 1. Comprobar colision contra la estructura del landmark usando la cota inferior conservadora
+    # d_inferior = max(0, d_muestreada - h/2) < UAV_COLLISION_RADIUS_XY
+    if lower_bound_surf_dist < UAV_COLLISION_RADIUS_XY:
         result["reason"] = (
-            f"collision_with_{target_id} (min_clearance={min_surf_dist:.3f}m < {UAV_COLLISION_RADIUS_XY:.2f}m)"
+            f"collision_with_{target_id} "
+            f"(lower_bound_clearance={lower_bound_surf_dist:.4f}m [sampled={sampled_surf_dist:.4f}m, h/2={disc_margin:.3f}m] "
+            f"< {UAV_COLLISION_RADIUS_XY:.2f}m)"
         )
         return result
 
-    # 2. Evaluar segun el tipo de primitiva
+    if N_total - start_idx_clamped < 2:
+        result["reason"] = f"{p_type}_{target_id}_no_samples_after_previous_primitive"
+        return result
+
+    pts_loc = _world_to_landmark_local(pos_enu, cx, cy, cz, lm_yaw)
+    x_loc = pts_loc[:, 0]
+    y_loc = pts_loc[:, 1]
+    z_loc = pts_loc[:, 2]
+    dist_xy = np.hypot(x_loc, y_loc)
+
+    # Recorte progresivo a partir de `start_idx_clamped`
+    x_sub = x_loc[start_idx_clamped:]
+    y_sub = y_loc[start_idx_clamped:]
+    z_sub = z_loc[start_idx_clamped:]
+    dist_xy_sub = dist_xy[start_idx_clamped:]
+
+    # 2. Evaluar segun el tipo de primitiva en la ventana [start_idx_clamped:]
     if p_type == "traverse":
-        # Buscar cruces del plano x_loc = 0 en direccion +x_loc dentro de la vecindad del aro
-        cross_candidates = np.where(
-            (x_loc[:-1] <= 0.0) & (x_loc[1:] > 0.0) & (dist_xy[:-1] < 2.5)
+        cross_rel = np.where(
+            (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (dist_xy_sub[:-1] < 2.5)
         )[0]
-        if len(cross_candidates) == 0:
+        if len(cross_rel) == 0:
             result["reason"] = f"traverse_{target_id}_no_plane_crossing"
             return result
 
-        # Elegir el cruce mas cercano al centro del aro
-        best_cross = None
-        best_idx = int(cross_candidates[0])
-        best_err = float("inf")
-        for idx in cross_candidates:
-            dx_step = float(x_loc[idx + 1] - x_loc[idx])
-            alpha = float(-x_loc[idx] / dx_step) if abs(dx_step) > 1e-9 else 0.5
-            alpha = max(0.0, min(1.0, alpha))
-            y_c = float(y_loc[idx] + alpha * (y_loc[idx + 1] - y_loc[idx]))
-            z_c = float(z_loc[idx] + alpha * (z_loc[idx + 1] - z_loc[idx]))
-            r_c = math.hypot(y_c, z_c)
-            if r_c < best_err:
-                best_err = r_c
-                best_cross = (y_c, z_c, r_c)
-                best_idx = int(idx)
+        # Tomar el primer cruce cronologico a partir de `start_from_index`
+        idx = int(start_idx_clamped + int(cross_rel[0]))
+        dx_step = float(x_loc[idx + 1] - x_loc[idx])
+        alpha = float(-x_loc[idx] / dx_step) if abs(dx_step) > 1e-9 else 0.5
+        alpha = max(0.0, min(1.0, alpha))
+        y_c = float(y_loc[idx] + alpha * (y_loc[idx + 1] - y_loc[idx]))
+        z_c = float(z_loc[idx] + alpha * (z_loc[idx + 1] - z_loc[idx]))
+        r_c = math.hypot(y_c, z_c)
 
-        assert best_cross is not None
-        y_c, z_c, r_c = best_cross
-        result["event_index"] = best_idx
+        start_i = idx
+        event_i = idx
+        comp_i = min(N_total - 1, idx + 1)
+        result["start_index"] = start_i
+        result["event_index"] = event_i
+        result["completion_index"] = comp_i
+        result["start_time_s"] = _idx_to_time(start_i)
+        result["event_time_s"] = _idx_to_time(event_i)
+        result["completion_time_s"] = _idx_to_time(comp_i)
         result["cross_y_m"] = round(y_c, 4)
         result["cross_z_m"] = round(z_c, 4)
         result["cross_radial_err_m"] = round(r_c, 4)
@@ -751,7 +960,7 @@ def _verify_single_primitive(
         if "circ" in lm_type or "torus" in lm_type:
             if r_c > TRAVERSE_CIRC_MAX_R:
                 result["reason"] = (
-                    f"traverse_{target_id}_outside_circular_aperture (r={r_c:.3f}m > {TRAVERSE_CIRC_MAX_R:.3f}m)"
+                    f"traverse_{target_id}_outside_circular_aperture (r={r_c:.3f}m > {TRAVERSE_CIRC_MAX_R:.4f}m)"
                 )
                 return result
         else:
@@ -779,22 +988,28 @@ def _verify_single_primitive(
             )
             return result
 
-        # Verificar que el dron pasa de antes del poste (x_loc <= 0) a despues (x_loc > 0)
-        cross_indices = np.where(
-            (x_loc[:-1] <= 0.0) & (x_loc[1:] > 0.0) & (np.abs(y_loc[:-1]) <= SLALOM_MAX_LATERAL + 0.5)
+        cross_rel = np.where(
+            (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (np.abs(y_sub[:-1]) <= SLALOM_MAX_LATERAL + 0.5)
         )[0]
-        if len(cross_indices) == 0:
+        if len(cross_rel) == 0:
             result["reason"] = f"slalom_{target_id}_no_longitudinal_pass"
             return result
 
-        idx = int(cross_indices[0])
+        idx = int(start_idx_clamped + int(cross_rel[0]))
         dx_step = float(x_loc[idx + 1] - x_loc[idx])
         alpha = float(-x_loc[idx] / dx_step) if abs(dx_step) > 1e-9 else 0.5
         y_c = float(y_loc[idx] + alpha * (y_loc[idx + 1] - y_loc[idx]))
-        result["event_index"] = idx
+        start_i = idx
+        event_i = idx
+        comp_i = min(N_total - 1, idx + 1)
+        result["start_index"] = start_i
+        result["event_index"] = event_i
+        result["completion_index"] = comp_i
+        result["start_time_s"] = _idx_to_time(start_i)
+        result["event_time_s"] = _idx_to_time(event_i)
+        result["completion_time_s"] = _idx_to_time(comp_i)
         result["cross_y_m"] = round(y_c, 4)
 
-        # En el marco local FLU del landmark: +y_loc es IZQUIERDA ('left'), -y_loc es DERECHA ('right')
         if side == "left":
             if not (SLALOM_MIN_LATERAL <= y_c <= SLALOM_MAX_LATERAL):
                 result["reason"] = (
@@ -814,23 +1029,32 @@ def _verify_single_primitive(
         return result
 
     elif p_type == "overfly":
-        # Verificar cruce longitudinal sobre la huella del poste y cota superior
-        cross_indices = np.where((x_loc[:-1] <= 0.0) & (x_loc[1:] > 0.0) & ( np.abs(y_loc[:-1]) <= OVERFLY_MAX_LAT_M + 1.0 ))[0]
-        if len(cross_indices) == 0:
+        cross_rel = np.where(
+            (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (np.abs(y_sub[:-1]) <= OVERFLY_MAX_LAT_M + 1.0)
+        )[0]
+        if len(cross_rel) == 0:
             result["reason"] = f"overfly_{target_id}_no_longitudinal_pass"
             return result
 
-        idx = int(cross_indices[0])
+        idx = int(start_idx_clamped + int(cross_rel[0]))
         dx_step = float(x_loc[idx + 1] - x_loc[idx])
         alpha = float(-x_loc[idx] / dx_step) if abs(dx_step) > 1e-9 else 0.5
         y_c = float(y_loc[idx] + alpha * (y_loc[idx + 1] - y_loc[idx]))
         z_world_c = float(pos_enu[idx, 2] + alpha * (pos_enu[idx + 1, 2] - pos_enu[idx, 2]))
 
-        # Ademas verificar todos los puntos dentro del cilindro vertical de radio 0.50m sobre el poste
-        over_mask = dist_xy <= 0.50
-        min_z_over = float(np.min(pos_enu[over_mask, 2])) if np.any(over_mask) else z_world_c
+        over_mask_sub = dist_xy_sub <= 0.50
+        pos_sub = pos_enu[start_idx_clamped:]
+        min_z_over = float(np.min(pos_sub[over_mask_sub, 2])) if np.any(over_mask_sub) else z_world_c
 
-        result["event_index"] = idx
+        start_i = idx
+        event_i = idx
+        comp_i = min(N_total - 1, idx + 1)
+        result["start_index"] = start_i
+        result["event_index"] = event_i
+        result["completion_index"] = comp_i
+        result["start_time_s"] = _idx_to_time(start_i)
+        result["event_time_s"] = _idx_to_time(event_i)
+        result["completion_time_s"] = _idx_to_time(comp_i)
         result["cross_y_m"] = round(y_c, 4)
         result["cross_z_world_m"] = round(z_world_c, 4)
         result["min_z_over_pole_m"] = round(min_z_over, 4)
@@ -861,27 +1085,49 @@ def _verify_single_primitive(
             )
             return result
 
-        near_indices = np.where(dist_xy <= ORBIT_MAX_RADIUS_M)[0]
-        if len(near_indices) < 10:
+        near_rel = np.where(dist_xy_sub <= ORBIT_MAX_RADIUS_M)[0]
+        if len(near_rel) < 10:
             result["reason"] = f"orbit_{target_id}_never_entered_orbit_radius"
             return result
 
-        # Tomar el segmento contiguo principal dentro de ORBIT_MAX_RADIUS_M
+        near_indices = near_rel + start_idx_clamped
         splits = np.where(np.diff(near_indices) > 5)[0]
-        segments = np.split(near_indices, splits + 1)
-        main_seg = max(segments, key=len)
-        result["event_index"] = int(main_seg[len(main_seg) // 2])
+        segments = [seg for seg in np.split(near_indices, splits + 1) if len(seg) >= 10]
+        if not segments:
+            result["reason"] = f"orbit_{target_id}_never_entered_orbit_radius"
+            return result
 
+        # Elegir el primer segmento contiguo significativo a partir de start_from_index
+        main_seg = segments[0]
         angles = np.unwrap(np.arctan2(y_loc[main_seg], x_loc[main_seg]))
-        # Progreso angular monotono maximo en sentido antihorario (de -pi a +pi/2 = +270 deg)
         running_min = np.minimum.accumulate(angles)
-        ccw_progression_deg = math.degrees(float(np.max(angles - running_min)))
+        ccw_prog_deg_arr = np.degrees(angles - running_min)
+        ccw_progression_deg = float(np.max(ccw_prog_deg_arr))
         max_span_deg = math.degrees(float(np.max(angles) - np.min(angles)))
         mean_r = float(np.mean(dist_xy[main_seg]))
 
-        # Error de orientacion centripeta durante el arco orbital (excluyendo cola de salida)
-        arc_mask = dist_xy[main_seg] <= 2.2
-        arc_seg = main_seg[arc_mask] if np.any(arc_mask) else main_seg
+        start_i = int(main_seg[0])
+        reached_rel = np.where(ccw_prog_deg_arr >= ORBIT_MIN_SWEEP_DEG)[0]
+        if len(reached_rel) > 0:
+            reach_k = int(reached_rel[0])
+            comp_i = int(main_seg[reach_k])
+            event_i = int(main_seg[reach_k // 2])
+            active_arc_seg = main_seg[: reach_k + 1]
+        else:
+            comp_i = int(main_seg[-1])
+            event_i = int(main_seg[len(main_seg) // 2])
+            active_arc_seg = main_seg
+
+        result["start_index"] = start_i
+        result["event_index"] = event_i
+        result["completion_index"] = comp_i
+        result["start_time_s"] = _idx_to_time(start_i)
+        result["event_time_s"] = _idx_to_time(event_i)
+        result["completion_time_s"] = _idx_to_time(comp_i)
+
+        # Error de orientacion centripeta durante el barrido orbital activo
+        arc_mask = dist_xy[active_arc_seg] <= 2.2
+        arc_seg = active_arc_seg[arc_mask] if np.any(arc_mask) else active_arc_seg
         desired_yaw = np.arctan2(cy - pos_enu[arc_seg, 1], cx - pos_enu[arc_seg, 0])
         yaw_seg = yaw_enu[arc_seg].reshape(-1)
         yaw_diff = np.arctan2(np.sin(yaw_seg - desired_yaw), np.cos(yaw_seg - desired_yaw))
@@ -1660,10 +1906,17 @@ def validate_episode_data(
 ) -> Dict[str, Any]:
     """
     Ejecuta la validacion de configuracion, grabacion y geometria de mision sobre datos en memoria.
-    Si falta evidencia (ej. `pilot_exit_code is None`, relojes ausentes) o la configuracion es invalida,
-    rechaza el episodio sin fabricar valores por defecto.
+    Si falta evidencia (ej. `pilot_exit_code is None`, `VehicleOdometry` ausente, relojes ausentes)
+    o la configuracion es invalida, rechaza el episodio sin fabricar valores por defecto.
     """
     rejection_reasons: List[str] = []
+    reader_info: Dict[str, Any] = (
+        dict(getattr(telemetry, "reader_info", {}))
+        if hasattr(telemetry, "reader_info")
+        else dict(telemetry.get("_reader_info", {}))
+        if isinstance(telemetry, dict) and isinstance(telemetry.get("_reader_info"), dict)
+        else {"backend": "in_memory_dict"}
+    )
 
     if pilot_exit_code is None:
         rejection_reasons.append("unknown_pilot_exit_code")
@@ -1679,6 +1932,7 @@ def validate_episode_data(
         return {
             "pilot_exit_code": pilot_exit_code,
             "pilot_status_source": pilot_status_source,
+            "reader_info": reader_info,
             "configuration_status": "invalid",
             "recording_status": "invalid",
             "mission_status": "invalid",
@@ -1696,23 +1950,38 @@ def validate_episode_data(
     local_pos_list = telemetry.get("local_pos", [])
     land_list = telemetry.get("land_detected", [])
 
+    # Politica de odometria (C6): VehicleOdometry es obligatorio para aceptacion de campana.
+    # Si falta VehicleOdometry pero existe VehicleLocalPosition, se rechaza el episodio con
+    # `missing_required_vehicle_odometry` y solo se usa `local_pos` con fines de diagnostico.
     using_local_pos = False
-    if not odom_list and local_pos_list:
-        odom_list = local_pos_list
-        using_local_pos = True
+    telemetry_source = "vehicle_odometry"
+    if not odom_list:
+        rejection_reasons.append("missing_required_vehicle_odometry")
+        if local_pos_list:
+            odom_list = local_pos_list
+            using_local_pos = True
+            telemetry_source = "vehicle_local_position_diagnostic"
+        else:
+            telemetry_source = "missing"
 
     if len(odom_list) < 30:
         rejection_reasons.append(f"insufficient_odometry_messages ({len(odom_list)} < 30)")
         return {
             "pilot_exit_code": pilot_exit_code,
             "pilot_status_source": pilot_status_source,
+            "reader_info": reader_info,
             "configuration_status": configuration_status,
             "recording_status": "invalid",
             "mission_status": "invalid",
             "validation_status": "rejected",
             "rejection_reasons": rejection_reasons,
             "primitive_results": [],
-            "metrics": {"num_odom_messages": len(odom_list)},
+            "metrics": {
+                "num_odom_messages": len(odom_list),
+                "telemetry_source": telemetry_source,
+                "estimator_resets_verified": False,
+                "in_flight_estimator_resets": None,
+            },
         }
 
     # 1. Extraer series temporales y validar marcos (NED), flags de validez, NaNs y cuaterniones
@@ -1724,6 +1993,11 @@ def validate_episode_data(
     ts_px4_raw_s = np.full(N, np.nan, dtype=np.float64)
     ts_bag_raw_s = np.full(N, np.nan, dtype=np.float64)
     reset_counters = np.zeros(N, dtype=np.int64)
+    local_pos_rc_fields = ("xy_reset_counter", "z_reset_counter", "vxy_reset_counter", "vz_reset_counter")
+    local_pos_rc_matrix = np.zeros((N, len(local_pos_rc_fields)), dtype=np.int64)
+    local_pos_heading_rc = np.zeros(N, dtype=np.int64)
+    local_pos_all_rc_present = True
+    local_pos_heading_rc_present = True
     nan_count = 0
     invalid_frame_count = 0
     missing_px4_ts_count = 0
@@ -1782,6 +2056,17 @@ def validate_episode_data(
                 or not bool(item.get("v_z_valid", True))
             ):
                 invalid_frame_count += 1
+
+            for col_idx, rc_name in enumerate(local_pos_rc_fields):
+                if rc_name in item and _is_finite_number(item[rc_name]):
+                    local_pos_rc_matrix[i, col_idx] = int(item[rc_name])
+                else:
+                    local_pos_all_rc_present = False
+
+            if "heading_reset_counter" in item and _is_finite_number(item["heading_reset_counter"]):
+                local_pos_heading_rc[i] = int(item["heading_reset_counter"])
+            else:
+                local_pos_heading_rc_present = False
 
             p_ned = [item["x"], item["y"], item["z"]]
             v_ned = [item.get("vx", 0.0), item.get("vy", 0.0), item.get("vz", 0.0)]
@@ -1858,19 +2143,45 @@ def validate_episode_data(
             f"excessive_spatial_step_between_samples (max_step={max_step_dist_m:.3f}m > {MAX_ALLOWED_STEP_DIST_M:.2f}m)"
         )
 
-    # 3. Ventana de vuelo activo y chequeo de resets del estimador EKF2 en vuelo
+    # 3. Ventana de vuelo activo y chequeo de resets del estimador EKF2 en vuelo (C6)
     airborne_indices = np.where(pos_enu[:, 2] >= 0.45)[0]
     max_alt_m = float(np.max(pos_enu[:, 2]))
+    in_flight_resets: Optional[int] = 0
+    estimator_resets_verified: bool = True
+
     if max_alt_m < TAKEOFF_MIN_ALT_M or len(airborne_indices) < 10:
         rejection_reasons.append(f"takeoff_failed (max_alt={max_alt_m:.2f}m < {TAKEOFF_MIN_ALT_M:.2f}m)")
-        in_flight_resets = 0
+        if using_local_pos and not local_pos_all_rc_present:
+            in_flight_resets = None
+            estimator_resets_verified = False
+            rejection_reasons.append("unverified_local_position_reset_counters")
     else:
         i_takeoff = int(airborne_indices[0])
         i_touchdown = int(airborne_indices[-1])
-        rc_flight = reset_counters[i_takeoff:i_touchdown + 1]
-        in_flight_resets = int(np.sum(np.diff(rc_flight) != 0)) if len(rc_flight) > 1 else 0
-        if in_flight_resets > 0:
-            rejection_reasons.append(f"ekf2_estimator_reset_in_flight (resets={in_flight_resets})")
+        if not using_local_pos:
+            rc_flight = reset_counters[i_takeoff:i_touchdown + 1]
+            in_flight_resets = int(np.sum(np.diff(rc_flight) != 0)) if len(rc_flight) > 1 else 0
+            estimator_resets_verified = True
+            if in_flight_resets > 0:
+                rejection_reasons.append(f"ekf2_estimator_reset_in_flight (resets={in_flight_resets})")
+        else:
+            if local_pos_all_rc_present:
+                rc_mat_flight = local_pos_rc_matrix[i_takeoff:i_touchdown + 1]
+                resets_4 = int(np.sum(np.diff(rc_mat_flight, axis=0) != 0)) if len(rc_mat_flight) > 1 else 0
+                resets_hdg = (
+                    int(np.sum(np.diff(local_pos_heading_rc[i_takeoff:i_touchdown + 1]) != 0))
+                    if (local_pos_heading_rc_present and (i_touchdown > i_takeoff))
+                    else 0
+                )
+                in_flight_resets = resets_4 + resets_hdg
+                estimator_resets_verified = True
+                if in_flight_resets > 0:
+                    rejection_reasons.append(f"ekf2_estimator_reset_in_flight (resets={in_flight_resets})")
+            else:
+                # Nunca reportar 0 resets si los contadores de local_pos no fueron verificados
+                in_flight_resets = None
+                estimator_resets_verified = False
+                rejection_reasons.append("unverified_local_position_reset_counters")
 
         # Verificar que entre el fin del ascenso inicial y el inicio del descenso final no haya impacto contra el suelo
         cruise_indices = np.where(pos_enu[:, 2] >= 1.0)[0]
@@ -1887,6 +2198,8 @@ def validate_episode_data(
         "invalid"
         if any(
             r.startswith((
+                "missing_required_vehicle_odometry",
+                "unverified_local_position_reset_counters",
                 "insufficient_",
                 "corrupted_",
                 "invalid_or_non_ned_",
@@ -1905,37 +2218,98 @@ def validate_episode_data(
         else "valid"
     )
 
-    # 4. Verificar cada primitiva y exigir orden temporal estricto de ejecucion
+    # 4. Verificar cada primitiva progresivamente y exigir orden temporal estricto (C9)
     landmarks_list = norm_cfg["landmarks"]
     landmarks_map = {str(lm["id"]): lm for lm in landmarks_list}
     primitives_sorted = norm_cfg["primitives"]
 
     primitive_results: List[Dict[str, Any]] = []
-    for prim in primitives_sorted:
+    prev_completion_idx: int = 0
+    prev_target_label: Optional[str] = None
+
+    for k, prim in enumerate(primitives_sorted):
         tid = str(prim["target"])
-        p_res = _verify_single_primitive(pos_enu, yaw_enu, prim, landmarks_map[tid])
+        lm_obj = landmarks_map[tid]
+
+        # Busqueda progresiva a partir de `prev_completion_idx`
+        p_res = _verify_single_primitive(
+            pos_enu,
+            yaw_enu,
+            prim,
+            lm_obj,
+            start_from_index=prev_completion_idx,
+            ts_sim_s=ts_sim_s,
+        )
+
+        # Comprobar si esta primitiva fue ejecutada prematuramente ANTES de que terminara la anterior
+        if k > 0 and prev_completion_idx > 0:
+            early_res = _verify_single_primitive(
+                pos_enu,
+                yaw_enu,
+                prim,
+                lm_obj,
+                start_from_index=0,
+                ts_sim_s=ts_sim_s,
+            )
+            early_start = early_res.get("start_index")
+            if early_start is not None and int(early_start) < prev_completion_idx:
+                order_msg = (
+                    f"primitive_order_violation "
+                    f"({prev_target_label}_completion@{prev_completion_idx} > {tid}_start@{early_start})"
+                )
+                p_res["premature_start_index"] = int(early_start)
+                p_res["passed"] = False
+                if p_res.get("reason") is None:
+                    p_res["reason"] = order_msg
+                if order_msg not in rejection_reasons:
+                    rejection_reasons.append(order_msg)
+
         primitive_results.append(p_res)
         if not p_res["passed"] and p_res["reason"]:
-            rejection_reasons.append(str(p_res["reason"]))
+            if str(p_res["reason"]) not in rejection_reasons:
+                rejection_reasons.append(str(p_res["reason"]))
 
-    # Verificar que los eventos de las primitivas ocurran en orden temporal estrictamente creciente
+        if p_res.get("completion_index") is not None:
+            prev_completion_idx = int(p_res["completion_index"])
+            prev_target_label = tid
+        elif prev_target_label is None:
+            prev_target_label = tid
+
+    # Verificacion adicional por pares de que start_index[k] >= completion_index[k-1] y event_index creciente
     for k in range(1, len(primitive_results)):
         prev_res = primitive_results[k - 1]
         curr_res = primitive_results[k]
+        comp_prev = prev_res.get("completion_index")
+        start_curr = curr_res.get("start_index")
         idx_prev = prev_res.get("event_index")
         idx_curr = curr_res.get("event_index")
-        if idx_prev is not None and idx_curr is not None and int(idx_curr) <= int(idx_prev):
-            rejection_reasons.append(
-                f"primitive_order_violation ({prev_res['target']}@{idx_prev} >= {curr_res['target']}@{idx_curr})"
+        if comp_prev is not None and start_curr is not None and int(start_curr) < int(comp_prev):
+            msg = (
+                f"primitive_order_violation "
+                f"({prev_res['target']}_completion@{comp_prev} > {curr_res['target']}_start@{start_curr})"
             )
+            if msg not in rejection_reasons:
+                rejection_reasons.append(msg)
+        elif idx_prev is not None and idx_curr is not None and int(idx_curr) <= int(idx_prev):
+            msg = f"primitive_order_violation ({prev_res['target']}@{idx_prev} >= {curr_res['target']}@{idx_curr})"
+            if msg not in rejection_reasons:
+                rejection_reasons.append(msg)
 
-    # 5. Verificar colision global (con subdivision de segmentos) contra CUALQUIER landmark del mundo
-    min_global_clearance = float("inf")
+    # 5. Verificar colision global usando la cota inferior de discretizacion contra CUALQUIER landmark del mundo (C8)
+    min_global_sampled_clearance = float("inf")
+    min_global_lower_bound_clearance = float("inf")
     for lm in landmarks_list:
-        d_lm = compute_min_distance_to_landmark(pos_enu, lm)
-        min_global_clearance = min(min_global_clearance, d_lm)
-        if d_lm < UAV_COLLISION_RADIUS_XY:
-            reason_col = f"collision_with_{lm['id']} (min_clearance={d_lm:.3f}m < {UAV_COLLISION_RADIUS_XY:.2f}m)"
+        c_lm = compute_landmark_clearance(pos_enu, lm, max_step_m=COLLISION_SEGMENT_MAX_STEP_M)
+        d_sampled = float(c_lm["sampled_min_distance_m"])
+        d_lower = float(c_lm["lower_bound_distance_m"])
+        min_global_sampled_clearance = min(min_global_sampled_clearance, d_sampled)
+        min_global_lower_bound_clearance = min(min_global_lower_bound_clearance, d_lower)
+        if d_lower < UAV_COLLISION_RADIUS_XY:
+            reason_col = (
+                f"collision_with_{lm['id']} "
+                f"(lower_bound_clearance={d_lower:.4f}m [sampled={d_sampled:.4f}m, h/2={DISCRETIZATION_MARGIN_M:.3f}m] "
+                f"< {UAV_COLLISION_RADIUS_XY:.2f}m)"
+            )
             if not any(r.startswith(f"collision_with_{lm['id']}") for r in rejection_reasons):
                 rejection_reasons.append(reason_col)
 
@@ -1979,7 +2353,31 @@ def validate_episode_data(
         max_acc_mps2 = 0.0
         rms_jerk_mps3 = 0.0
 
-    mission_status = "valid" if len(rejection_reasons) == 0 else "invalid"
+    mission_reasons = [
+        r
+        for r in rejection_reasons
+        if not r.startswith((
+            "unknown_pilot_exit_code",
+            "invalid_pilot_exit_code",
+            "pilot_non_zero_exit_code",
+            "pilot_timeout_status",
+            "unrecognized_pilot_status",
+            "missing_required_vehicle_odometry",
+            "unverified_local_position_reset_counters",
+            "insufficient_odometry_messages",
+            "corrupted_",
+            "invalid_or_non_ned_",
+            "missing_or_invalid_px4_timestamps",
+            "missing_or_invalid_bag_timestamps",
+            "ambiguous_clock_",
+            "flight_duration_",
+            "non_monotonic_",
+            "telemetry_dropout_",
+            "excessive_spatial_step_",
+            "ekf2_estimator_reset_",
+        ))
+    ]
+    mission_status = "valid" if len(mission_reasons) == 0 else "invalid"
     validation_status = (
         "accepted"
         if (
@@ -1993,6 +2391,7 @@ def validate_episode_data(
     )
 
     metrics = {
+        "telemetry_source": telemetry_source,
         "num_odom_messages": int(N),
         "duration_s": round(duration_s, 3),
         "dt_median_ms": round(dt_median_ms, 3),
@@ -2003,15 +2402,23 @@ def validate_episode_data(
         "unexplained_clock_backsteps": int(unexplained_backsteps),
         "ambiguous_clock_steps": int(ambiguous_clock_steps),
         "clock_usable_for_validation": bool(clock_res["usable_for_validation"]),
-        "in_flight_estimator_resets": int(in_flight_resets),
+        "estimator_resets_verified": bool(estimator_resets_verified),
+        "in_flight_estimator_resets": (
+            int(in_flight_resets) if in_flight_resets is not None else None
+        ),
         "path_length_m": round(path_length_m, 3),
         "max_altitude_m": round(max_alt_m, 3),
         "mean_speed_mps": round(mean_speed_mps, 3),
         "max_speed_mps": round(max_speed_mps, 3),
         "p98_acc_mps2": round(max_acc_mps2, 3),
         "rms_jerk_mps3": round(rms_jerk_mps3, 3),
+        "min_obstacle_clearance_sampled_m": round(
+            min_global_sampled_clearance if math.isfinite(min_global_sampled_clearance) else -1.0, 4
+        ),
+        "discretization_step_h_m": round(COLLISION_SEGMENT_MAX_STEP_M, 4),
+        "discretization_margin_m": round(DISCRETIZATION_MARGIN_M, 4),
         "min_obstacle_clearance_m": round(
-            min_global_clearance if math.isfinite(min_global_clearance) else -1.0, 4
+            min_global_lower_bound_clearance if math.isfinite(min_global_lower_bound_clearance) else -1.0, 4
         ),
         "landing_xy_error_m": round(landing_xy_err, 4),
         "final_altitude_m": round(float(landing_res["final_altitude_m"]), 4),
@@ -2025,6 +2432,7 @@ def validate_episode_data(
     return {
         "pilot_exit_code": pilot_exit_code,
         "pilot_status_source": pilot_status_source,
+        "reader_info": reader_info,
         "configuration_status": configuration_status,
         "recording_status": recording_status,
         "mission_status": mission_status,
@@ -2039,6 +2447,7 @@ def validate_episode_directory(
     ep_dir: Path,
     pilot_exit_code: Optional[int] = None,
     update_meta: bool = False,
+    backend: str = "auto",
 ) -> Dict[str, Any]:
     """
     Valida un directorio de episodio completo (`datasets/task_XXXX/episode_YY`).
@@ -2133,6 +2542,7 @@ def validate_episode_directory(
         report: Dict[str, Any] = {
             "pilot_exit_code": resolved_exit_code,
             "pilot_status_source": pilot_status_source,
+            "reader_info": {"backend": "none"},
             "configuration_status": "invalid" if cfg_errors else "valid",
             "recording_status": "invalid" if (not has_bag or meta_corrupted) else "not_evaluated",
             "mission_status": "invalid",
@@ -2143,7 +2553,7 @@ def validate_episode_directory(
         }
     else:
         try:
-            telemetry = load_episode_telemetry(ep_dir)
+            telemetry = load_episode_telemetry(ep_dir, backend=backend)
             report = validate_episode_data(
                 telemetry,
                 wp_cfg,
@@ -2168,6 +2578,7 @@ def validate_episode_directory(
             report = {
                 "pilot_exit_code": resolved_exit_code,
                 "pilot_status_source": pilot_status_source,
+                "reader_info": {"backend": "error", "error": f"{type(e).__name__}: {e}"},
                 "configuration_status": "valid",
                 "recording_status": "invalid",
                 "mission_status": "invalid",
@@ -2198,6 +2609,7 @@ def validate_episode_directory(
             existing_meta["pilot_exit_code"] = report["pilot_exit_code"]
 
         existing_meta["pilot_status_source"] = report["pilot_status_source"]
+        existing_meta["reader_info"] = report.get("reader_info", {})
         existing_meta["configuration_status"] = report["configuration_status"]
         existing_meta["recording_status"] = report["recording_status"]
         existing_meta["mission_status"] = report["mission_status"]
@@ -2251,6 +2663,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Retorna codigo de salida 1 si al menos un episodio del dataset es rechazado.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "rosbags", "native"],
+        default="auto",
+        help="Backend de lectura de telemetria MCAP ('auto', 'rosbags', o 'native' para diagnostico).",
+    )
     args = parser.parse_args(argv)
 
     if args.episode_dir is not None:
@@ -2259,7 +2677,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Error: el directorio de episodio no existe: {args.episode_dir}", file=sys.stderr)
             return 2
 
-        rep = validate_episode_directory(ep_path, update_meta=args.update_meta)
+        rep = validate_episode_directory(ep_path, update_meta=args.update_meta, backend=args.backend)
         if args.json:
             print(json.dumps(rep, indent=2))
         else:
@@ -2293,7 +2711,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_list = []
     accepted_count = 0
     for ep in ep_dirs:
-        rep = validate_episode_directory(ep, update_meta=args.update_meta)
+        rep = validate_episode_directory(ep, update_meta=args.update_meta, backend=args.backend)
         label = f"{ep.parent.name}/{ep.name}"
         if rep["validation_status"] == "accepted":
             accepted_count += 1

@@ -595,32 +595,32 @@ def test_validate_episode_false_positive_battery(tmp_path):
     assert res_6["validation_status"] == "rejected"
     assert any("primitive_order_violation" in r for r in res_6["rejection_reasons"])
 
-    # Caso 7: Dos muestras discretas libres (> 0.28m) con una barra entre ellas (< 0.28m en el segmento)
+    # Caso 7: Dos muestras discretas libres (> 0.30m) con una barra entre ellas (< 0.30m en el segmento)
     from uav_ip.validate_episode import compute_min_distance_to_landmark, UAV_COLLISION_RADIUS_XY
     gate_lm = {"id": "landmark_1", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
     # La viga superior ocupa X in [4.95, 5.05], Z in [2.20, 2.30].
-    # En P1=(4.83, 0, 2.555) y P2=(5.17, 0, 2.555) (paso=0.34m <= 0.35m),
-    # dist_vertice = hypot(0.12, 0.255) = 0.2818m > 0.28m (libres en muestras discretas),
-    # pero en el punto medio (5.00, 0, 2.555) dist_segmento = 0.255m < 0.28m (colision).
-    sparse_seg = np.array([[4.83, 0.0, 2.555], [5.17, 0.0, 2.555]], dtype=np.float64)
+    # En P1=(4.83, 0, 2.576) y P2=(5.17, 0, 2.576) (paso=0.34m <= 0.35m),
+    # dist_vertice = hypot(0.12, 0.276) = 0.30096m > 0.30m (libres en muestras discretas),
+    # pero en el punto medio (5.00, 0, 2.576) dist_segmento = 0.276m < 0.30m (colision).
+    sparse_seg = np.array([[4.83, 0.0, 2.576], [5.17, 0.0, 2.576]], dtype=np.float64)
     d_without_subdiv = compute_min_distance_to_landmark(sparse_seg, gate_lm, max_step_m=10.0)
     d_with_subdiv = compute_min_distance_to_landmark(sparse_seg, gate_lm, max_step_m=0.02)
-    assert d_without_subdiv > UAV_COLLISION_RADIUS_XY  # 0.2818m > 0.28m (falso negativo sin subdividir)
-    assert d_with_subdiv < UAV_COLLISION_RADIUS_XY     # 0.2550m < 0.28m (detectado con subdivision a 0.02m)
+    assert d_without_subdiv > UAV_COLLISION_RADIUS_XY  # 0.30096m > 0.30m (falso negativo sin subdividir)
+    assert d_with_subdiv < UAV_COLLISION_RADIUS_XY     # 0.2760m < 0.30m (detectado con subdivision a 0.02m)
 
     # Verificar que validate_episode_data rechaza el episodio cuando ese segmento ocurre en vuelo
     idx_before = int(np.searchsorted(pos_valid[:, 0], 4.83))
     idx_after = int(np.searchsorted(pos_valid[:, 0], 5.17))
     pos_bar_between = np.vstack([
         pos_valid[:idx_before],
-        np.array([[4.83, 0.0, 2.555], [5.17, 0.0, 2.555]]),
+        np.array([[4.83, 0.0, 2.576], [5.17, 0.0, 2.576]]),
         pos_valid[idx_after + 1:],
     ])
     # Ajustar suavemente Z antes y despues para que ningun paso supere 0.35m pero los vertices en X=4.83 y X=5.17 sean los unicos cerca de X=5.0
     for k_step in range(1, 12):
         alpha = k_step / 12.0
-        pos_bar_between[idx_before - k_step, 2] = (1.0 - alpha) * 2.555 + alpha * 1.5
-        pos_bar_between[idx_before + 1 + k_step, 2] = (1.0 - alpha) * 2.555 + alpha * 1.5
+        pos_bar_between[idx_before - k_step, 2] = (1.0 - alpha) * 2.576 + alpha * 1.5
+        pos_bar_between[idx_before + 1 + k_step, 2] = (1.0 - alpha) * 2.576 + alpha * 1.5
     yaw_bar_between = np.zeros(len(pos_bar_between))
     tel_tunnel = _make_synthetic_telemetry(pos_bar_between, yaw_bar_between, dt_s=0.05)
     res_7 = validate_episode_data(tel_tunnel, waypoints_cfg, pilot_exit_code=0)
@@ -751,7 +751,9 @@ def test_mcap_native_cdr_offsets_and_footer_verification(tmp_path):
     verified_buf = verify_mcap_integrity(mcap_file)
     assert len(verified_buf) == len(full_mcap)
 
-    parsed = _parse_mcap_native(mcap_file, buf=verified_buf)
+    parsed_res = _parse_mcap_native(mcap_file, buf=verified_buf)
+    assert parsed_res is not None
+    parsed, _ = parsed_res
     assert len(parsed["local_pos"]) == 1
     lp = parsed["local_pos"][0]
     assert np.allclose([lp["x"], lp["y"], lp["z"]], [10.5, -3.25, -1.75], atol=1e-5)
@@ -857,9 +859,11 @@ def test_real_dataset_mcap_validation():
     # Comparar el lector mantenido (rosbags) contra el parser nativo CDR (_parse_mcap_native)
     mcap_path = ep_dir / "rosbag" / "rosbag_0.mcap"
     if mcap_path.is_file():
-        native_tel = _parse_mcap_native(mcap_path)
+        native_res = _parse_mcap_native(mcap_path)
+        assert native_res is not None
+        native_tel, _ = native_res
         try:
-            rosbags_tel = _parse_with_rosbags([mcap_path])
+            rosbags_tel, _, _ = _parse_with_rosbags([mcap_path])
         except Exception:
             rosbags_tel = None
 

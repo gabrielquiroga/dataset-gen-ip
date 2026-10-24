@@ -345,42 +345,44 @@ En la versión previa del pipeline, `data_collector.py` etiquetaba un episodio c
 
 La segunda revisión (`docs/feedback/respuesta.md`) encontró que la primera implementación todavía permitía aceptaciones incorrectas. La sección siguiente describe el estado **después de la Fase 1.1**. La trazabilidad completa (riesgo · solución · hipótesis · evidencia · limitación · condición de revisión) está en [`JUSTIFICACION_REVISION_TECNICA.md`](JUSTIFICACION_REVISION_TECNICA.md).
 
-### 16.2 Decisión Adoptada: Validador Geométrico Conservador Post-Vuelo (`validate_episode.py`)
+#### 16.2 Decisión Adoptada: Validador Geométrico Conservador Post-Vuelo (`validate_episode.py` y `validation_geometry.py`)
 
-Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semánticas (pasar por fuera de un aro, tomar el flanco equivocado de un poste) y agregan carga al simulador. En su lugar se implementó [`validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py), un **filtro conservador bajo hipótesis explícitas**. No es una certificación física de ausencia de colisiones.
+Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semánticas (pasar por fuera de un aro, tomar el flanco equivocado de un poste) y agregan carga al simulador. En su lugar se implementaron [`validation_geometry.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validation_geometry.py) y [`validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py), conformando un **filtro conservador bajo hipótesis explícitas**. No es una certificación física de ausencia de colisiones.
 
-1. **Estados en `episode_meta.json` y contrato de procedencia (`C1 + C2`):**
-   * `pilot_exit_code` y `pilot_status_source`: código de retorno del piloto y su procedencia (`"explicit_argument"`, `"recorded_meta"`, `"inferred_from_legacy_status"` o `"unknown"`). Si falta evidencia, nunca se inventa `pilot_exit_code = 0` (`unknown_pilot_exit_code`).
+1. **Estados en `episode_meta.json`, contrato de procedencia (`C1 + C2`) y política de odometría (`C6`):**
+   * `pilot_exit_code` y `pilot_status_source`: código de retorno del piloto y su procedencia (`"explicit_argument"`, `"recorded_exit_code"`, `"recorded_meta"`, `"inferred_from_legacy_status"` o `"unknown"`). Si falta evidencia, nunca se inventa `pilot_exit_code = 0` (`unknown_pilot_exit_code`).
    * `configuration_status`: validación estructural y semántica de `waypoints.yaml` mediante `validate_waypoints_config()` antes de evaluar el vuelo.
-   * `recording_status`: el `.mcap` existe (`missing_bag` si falta), tiene *magic* inicial y final y `Footer`, y no presenta:
+   * `recording_status`: el `.mcap` existe (`missing_bag` si falta), contiene obligatoriamente `/fmu/out/vehicle_odometry` para aceptación de campaña (`missing_required_vehicle_odometry` si falta, permitiendo `VehicleLocalPosition` solo como diagnóstico o si sus 5 contadores de reset están presentes y verificados), supera las verificaciones de integridad del stream MCAP y no presenta:
      * NaN ni cuaterniones degenerados,
      * marcos distintos de NED (`pose_frame`/`velocity_frame == 1`),
      * relojes ausentes o no finitos (nunca se fabrica `i * 0.01`),
      * pasos de reloj ambiguos (Patrón B o Patrón A inconsistente con sus vecinos) ni retrocesos/duplicados,
      * huecos de más de 0,15 s ni pasos de más de 0,35 m entre muestras,
-     * resets de EKF2 en vuelo.
-   * `mission_status`: despegue, primitivas en el orden declarado, distancia a obstáculos y aterrizaje en ventana temporal común.
+     * resets de EKF2 en vuelo (`ekf2_estimator_reset_in_flight`) o contadores de reset no verificables (`unverified_local_position_reset_counters`).
+   * `mission_status`: despegue, primitivas progresivas en el orden declarado (`start_index`, `event_index`, `completion_index`), cota inferior de distancia a obstáculos y aterrizaje en ventana temporal común.
    * `validation_status`: `accepted` si y solo si `configuration_status == "valid"`, `recording_status == "valid"`, `mission_status == "valid"`, `pilot_exit_code == 0` y `rejection_reasons` está vacío.
-2. **Envolvente y geometría** (constantes en el módulo):
+2. **Envolvente medida en el SDF `x500`, geometría compartida y cota inferior de discretización (`C7`):**
+   * Centralizado en [`validation_geometry.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validation_geometry.py) e importado por `world_generator.py`, `waypoint_controller.py` y `validate_episode.py`:
 
-   | Constante | Valor |
-   |---|---|
-   | `UAV_PHYSICAL_RADIUS_XY` | 0,23 m |
-   | `UAV_SAFETY_MARGIN_XY` | 0,05 m |
-   | `UAV_COLLISION_RADIUS_XY` | 0,28 m |
+   | Constante | Valor | Origen trazable (`X500_SDF_MEASUREMENT`) |
+   |---|---|---|
+   | `UAV_PHYSICAL_RADIUS_XY` | 0,25 m | Semidiagonal XY de la caja de colisión `base_link` (`0,2500 m`) y ejes de rotores (`0,2461 m`) en `x500_base/model.sdf` |
+   | `UAV_SAFETY_MARGIN_XY` | 0,05 m | Margen de seguridad |
+   | `UAV_COLLISION_RADIUS_XY` | 0,30 m | Esfera 3D protegida alrededor de `base_link` (`0,25 + 0,05 m`) |
+   | `X500_FULL_ROTOR_TIP_RADIUS_M` | 0,3857 m | Alcance radial hasta la punta física de la pala de 5,5″ (documentado para auditoría) |
 
-   La distancia se evalúa sobre la trayectoria **subdividida a ≤ 0,02 m** contra:
-   * las 4 cajas de cada `square_gate`,
-   * el anillo de cada `circular_gate`, restando la sagita de 0,0144 m del polígono de 16 segmentos,
-   * el cilindro (r = 0,10 m, h = 3,0 m) de cada `pole`.
-
-   > **Pendiente (Bloque 4 — C7):** el radio físico de 0,23 m se verificará contra `x500_base/model.sdf` junto con el módulo compartido `validation_geometry.py`. Ver `JUSTIFICACION_REVISION_TECNICA.md` §4.2.
-3. **Criterios por primitiva:**
-   * **`traverse`:** cruce del plano x_loc = 0 con |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada) o r ≤ 0,4056 m (puerta circular). Son la luz libre menos `UAV_COLLISION_RADIUS_XY`.
-   * **`slalom`:** cruce por el flanco pedido con y_cross ∈ [0,45; 2,60] m en el marco del poste.
-   * **`overfly`:** z ≥ 3,30 m sobre el poste y |y| ≤ 0,85 m.
-   * **`orbit`:** barrido antihorario ≥ 240° y error medio de guiñada centrípeta ≤ 45°.
-   * **Orden:** los eventos de las primitivas deben ser estrictamente crecientes en el tiempo.
+   * La distancia se evalúa sobre la trayectoria **subdividida a paso máximo $h = 0,02\text{ m}$** y se decide el rechazo usando la **cota inferior sobre la polilínea lineal por tramos**:
+     $$d_{\text{inferior}} = \max\left(0,\, d_{\text{muestreada}} - \frac{h}{2}\right), \quad \frac{h}{2} = 0,01\text{ m}$$
+     contra:
+     * las 4 cajas de cada `square_gate`,
+     * los **16 cilindros rectos reales** y el soporte de cada `circular_gate` definidos en `get_circular_gate_cylinders_spec()` (compartidos 1 a 1 con el SDF de `world_generator.py`),
+     * el cilindro ($r = 0,10\text{ m}$, $h = 3,0\text{ m}$) de cada `pole`.
+3. **Criterios por primitiva y secuencia temporal progresiva (`C7 + C8`):**
+   * **`traverse`:** cruce del plano $x_{\text{loc}} = 0$ con $|y| \le 0,35\text{ m}$ y $|z| \le 0,40\text{ m}$ (`square_gate`) o $r \le 0,3856\text{ m}$ (`circular_gate`), derivados como la abertura interior libre menos `UAV_COLLISION_RADIUS_XY` (`0,30 m`).
+   * **`slalom`:** cruce por el flanco pedido con $y_{\text{cross}} \in [0,47;\, 2,60]\text{ m}$ en el marco del poste.
+   * **`overfly`:** $z \ge 3,30\text{ m}$ sobre el poste y $|y| \le 0,85\text{ m}$.
+   * **`orbit`:** barrido antihorario continuo $\ge 240^\circ$ dentro del anillo `[1,25; 2,95] m` y error medio de guiñada centrípeta $\le 45^\circ$.
+   * **Secuencia progresiva (`C8`):** cada primitiva $m$ se busca a partir de `completion_index` de la primitiva $m-1$, exige `start_index[m] >= completion_index[m - 1]` y rechaza cualquier ejecución prematura ocurrida antes de completar la primitiva previa (`primitive_order_violation`).
 4. **Aterrizaje en ventana temporal común (`C4`):**
    * Se evalúa sobre la duración física `landing_window_s = 0.50 s` (`[t_end - landing_window_s, t_end]`, parámetro de ingeniería a calibrar), alineando odometría y detector mediante el reloj de recepción del bag.
    * Odometría en toda la ventana: error XY ≤ 0,75 m, z ∈ [0,0; 0,25] m y velocidad ≤ 0,25 m/s en todas las muestras del intervalo.
@@ -390,22 +392,26 @@ Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semá
    * El **Patrón B** se marca como ambiguo (`ambiguous_clock_step_pattern_b`) y se rechaza para campaña conservando el intervalo original $\Delta t_{\text{px4}}$, evitando comprimir entregas en ráfaga tras congelamientos de la fuente.
    * El **Patrón A** se repara de forma condicionada preservando exactamente el intervalo entre los vecinos UNIX válidos (`raw_px4[k+1] - raw_px4[k-1]`).
    * Los duplicados y retrocesos quedan visibles en el resultado público y provocan el rechazo.
-6. **Lectura de bags:** se prioriza `rosbags`. Si no está disponible, se usa el parser nativo MCAP/CDR (offsets verificados con un MCAP sintético y contra `rosbags` sobre un bag real).
+6. **Lectura de bags sin degradación silenciosa (`C5`):**
+   * En modo `auto`, se utiliza `rosbags` si está instalado. Si `rosbags` lanza un error de lectura o deserialización, el episodio se rechaza inmediatamente (`rosbags_deserialization_error`) y **nunca** se degrada en silencio al parser nativo.
+   * Cuando `rosbags` no está instalado, `_parse_mcap_native()` verifica el recorrido completo de registros MCAP, el CRC32 de cada `Chunk` sin comprimir, la presencia y compatibilidad textual de los esquemas de `px4_msgs` y el encabezado CDR, dejando registrado el backend e integridad en `reader_info`.
 
 ### 16.3 Endurecimiento del Piloto y del Generador
 
 * **`base_pilot.py` y `waypoint_controller.py`:**
-  * En `traverse`, el paso por `center` exige `cross_track < 0.35 m` y `alt_err < 0.40 m`, dentro de la ventana de 0,37 × 0,42 m.
+  * Importan las tolerancias de [`validation_geometry.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validation_geometry.py) y evalúan `center` en `traverse` mediante `is_traverse_center_reached()`, distinguiendo abertura rectangular (`|y| ≤ 0,33 m`, `|z| ≤ 0,38 m` para `square_gate`) y circular (`r ≤ 0,3656 m` para `circular_gate`).
   * `BasePilot` registra los instantes de recepción `last_pos_recv_time` y `last_land_detected_recv_time`.
   * En `nav_state == 4`, `WaypointController` exige frescura de posición ($\le 0,5\text{ s}$) y detector ($\le 1,5\text{ s}$), posición dentro de la plataforma ($\text{xy\_err} \le 0,75\text{ m}$), $z \le 0,25\text{ m}$ y `landed == True`, manteniendo un contador de persistencia continua (`landing_persistence_s = 3.0 s`) que se reinicia si cualquier condición deja de cumplirse; al vencer `landing_timeout_s = 10.0 s` sin confirmación termina con código `1`, que `main()` propaga al proceso.
-* **`world_generator.py`:** `check_circuit_transition_feasibility` recibe `start_pose` y comprueba, para cada transición:
-  * Δx ≥ 1,0 m y d_xy ≥ 1,4 m;
-  * pendiente ≤ 1,15 si interviene un `traverse` (≤ 1,60 entre postes);
-  * que los tramos rectos no se acerquen a landmarks de terceros.
-
-  Es un filtro heurístico previo; no reemplaza la validación posterior al vuelo.
+* **`world_generator.py`:**
+  * Construye los 16 cilindros de `circular_gate` directamente a partir de `get_circular_gate_cylinders_spec()` de `validation_geometry.py`.
+  * `check_circuit_transition_feasibility` recibe `start_pose` y comprueba, para cada transición:
+    * Δx ≥ 1,0 m y d_xy ≥ 1,4 m;
+    * pendiente ≤ 1,15 si interviene un `traverse` (≤ 1,60 entre postes);
+    * que los tramos rectos no se acerquen a landmarks de terceros.
+  * Es un filtro heurístico previo; no reemplaza la validación posterior al vuelo.
 
 ### 16.4 Alcance Actual
 
 * El validador se ejecuta **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]` o `--episode-dir <dir>`), propagando códigos de retorno `0` (aceptado), `1` (rechazo) y `2` (error de argumentos/uso). `data_collector.py` todavía usa `returncode`; la integración es la **Fase 2**.
-* Al evaluar los 12 episodios históricos locales (`task_0000`–`task_0003`) bajo el criterio estricto de reloj `C3`, los 12 superan las verificaciones de configuración, primitivas, despeje a obstáculos (`> 0.43 m`) y persistencia de aterrizaje (`C4`), pero son **rechazados** en `recording_status` por presentar 1–2 escalones de offset UNIX de `uxrce_dds_client` ($\sim 0,27\text{–}0,48\text{ s}$) clasificados como ambiguos. No se relajaron los umbrales para forzar su aceptación.
+* Al evaluar los 12 episodios históricos locales (`task_0000`–`task_0003`) con el cierre completo de la Fase 1.1 (`C1–C10`), los 12 superan las verificaciones de configuración, primitivas progresivas (`C8`), cota inferior de despeje a obstáculos (`min_obstacle_clearance_m ≥ 0,4311 m > 0,30 m`, `C7`) y persistencia de aterrizaje (`C4`), pero son **rechazados** en `recording_status` por presentar 1–2 escalones de offset UNIX de `uxrce_dds_client` ($\sim 0,22\text{–}0,48\text{ s}$) clasificados como ambiguos bajo `C3`. No se relajaron los umbrales para forzar su aceptación.
+

@@ -43,6 +43,8 @@ ros2_ws/
 │           ├── waypoint_controller.py # Piloto experto feed-forward (traverse, overfly, slalom)
 │           ├── tracking_controller.py # Piloto experto feedback (orbit)
 │           ├── synthetic_lidar.py     # Generador LiDAR analítico (Horizontal FLU, kernel C SIMD FPS)
+│           ├── validation_geometry.py # Geometría compartida, mediciones SDF x500 y tolerancias derivadas
+│           ├── validate_episode.py    # Validador post-vuelo (configuración, reloj, MCAP/CDR, misión)
 │           └── visualize_dataset.py   # Visualizador 3D, animación GIF e inspección Tube Augmentation
 │   ├── datasets/                      # Salida del dataset estructurado por tarea y episodio
 ├── docs/                          # Documentación técnica canónica
@@ -263,16 +265,18 @@ datasets/
 ```
 
 ### 2. Validación Post-Vuelo de Episodios (`validate_episode.py`)
-Verificador geométrico y de grabación independiente del piloto. Lee el `.mcap` y `waypoints.yaml` de cada episodio y decide `accepted`/`rejected` con una lista de `rejection_reasons`:
+Verificador de configuración, grabación y geometría de misión independiente del piloto. Lee `waypoints.yaml`, `episode_meta.json` y el `.mcap` de cada episodio y decide `accepted`/`rejected` con estados desglosados (`configuration_status`, `recording_status`, `mission_status`, `validation_status`) y `rejection_reasons`, devolviendo código de salida `0` (todos aceptados), `1` (al menos un rechazo) o `2` (error de uso/argumentos):
 
 ```bash
-# Reporte en terminal (no modifica archivos)
-python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --strict
-# Persistir resultados en cada episode_meta.json
+# Reporte en terminal sobre todo el dataset (no modifica archivos)
+python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets
+# Validar un único episodio en formato JSON
+python3 src/uav_ip/scripts/validate_episode.py --episode-dir datasets/task_0001/episode_00 --json
+# Persistir resultados de forma atómica en cada episode_meta.json
 python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --update-meta
 ```
 
-Es un **filtro conservador bajo hipótesis explícitas** (envolvente del UAV de 0,28 m, obstáculos estáticos con la geometría declarada, movimiento aproximadamente rectilíneo entre muestras). No es una certificación física de ausencia de colisiones. Por ahora se ejecuta offline: `data_collector.py` todavía marca el éxito por el código de salida del piloto, y la integración está planificada para la Fase 2. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
+Es un **filtro conservador bajo hipótesis explícitas** (envolvente esférica 3D de 0,30 m = 0,25 m de radio físico XY del chasis/motores `x500` + 0,05 m de margen, cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ con paso $h = 0,02\text{ m}$, obstáculos estáticos con la geometría declarada y movimiento aproximadamente rectilíneo entre muestras). No es una certificación física de ausencia de colisiones. Por ahora se ejecuta offline: `data_collector.py` todavía marca el éxito por el código de salida del piloto, y la integración está planificada para la Fase 2. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
 
 ### 3. Auditoría del Dataset y Partición Formal (`audit_dataset.py`)
 Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría para verificar la integridad del dataset y generar las particiones oficiales:

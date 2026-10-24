@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Dict, List
 import math
 import subprocess
@@ -217,24 +218,114 @@ def test_flyby_near_pad_followed_by_rest_outside_is_rejected():
     assert any(r.startswith("landing_not_at_rest") for r in rep_late["rejection_reasons"])
 
 
-def test_waypoint_controller_freshness_persistence_and_timeout_process_exit_code():
+def test_waypoint_controller_freshness_persistence_and_timeout_process_exit_code(tmp_path: Path):
     """
     Regresion C4 sobre `BasePilot` y `WaypointController`:
       - Verifica que `WaypointController` en `nav_state == 4` reinicia el contador de persistencia
         si `landed_detected` cae a `False` antes de cumplir `landing_persistence_s`.
       - Verifica mediante un subproceso real que un timeout de confirmacion de aterrizaje
-        termina el proceso con codigo de retorno `1`.
+        termina el proceso con codigo de retorno `1` y emite la marca de confirmacion.
     """
-    script = """
+    wp_path = tmp_path / "waypoints.yaml"
+    wp_path.write_text(
+        "landmarks:\n"
+        "  - {id: gate_1, type: square_gate, x: 4.0, y: 0.0, z: 1.5, yaw: 0.0}\n"
+        "primitives:\n"
+        "  - {type: traverse, target: gate_1}\n"
+        "landing: {x: 8.0, y: 0.0, z: 0.05}\n",
+        encoding="utf-8",
+    )
+    pkg_src = str(Path(__file__).resolve().parents[1])
+
+    script = f"""
 import sys
-import rclpy
-from rclpy.time import Time
+import types
+sys.path.insert(0, {pkg_src!r})
+
+try:
+    import rclpy
+    from rclpy.time import Time
+    HAS_ROS = True
+except ModuleNotFoundError:
+    HAS_ROS = False
+    rclpy = types.ModuleType("rclpy")
+    rclpy.init = lambda args=None: None
+    rclpy.ok = lambda: True
+    rclpy.shutdown = lambda: None
+    rclpy.spin = lambda node: None
+
+    class _FakeTime:
+        def __init__(self, nanoseconds=10_000_000_000, clock_type=None):
+            self.nanoseconds = int(nanoseconds)
+            self.clock_type = clock_type
+        def __sub__(self, other):
+            return _FakeTime(nanoseconds=self.nanoseconds - other.nanoseconds)
+
+    Time = _FakeTime
+    node_mod = types.ModuleType("rclpy.node")
+    class _FakeLogger:
+        def info(self, msg): pass
+        def error(self, msg): pass
+        def fatal(self, msg): pass
+    class _FakeClock:
+        def __init__(self): self._ns = 10_000_000_000
+        def now(self): return _FakeTime(self._ns)
+    class _FakeParamVal:
+        def __init__(self, val):
+            self.string_value = str(val) if isinstance(val, str) else ""
+            self.double_value = float(val) if isinstance(val, (int, float)) else 0.0
+    class _FakeParam:
+        def __init__(self, val): self._v = _FakeParamVal(val)
+        def get_parameter_value(self): return self._v
+    class Node:
+        def __init__(self, name):
+            self._params = {{"waypoints_file": {str(wp_path)!r}, "landing_persistence_s": 3.0, "landing_timeout_s": 1.0}}
+            self._clock = _FakeClock()
+            self._logger = _FakeLogger()
+        def declare_parameter(self, name, default):
+            if name not in self._params or not self._params[name]:
+                self._params[name] = default
+        def get_parameter(self, name): return _FakeParam(self._params[name])
+        def create_publisher(self, *a, **kw):
+            class _Pub:
+                def publish(self, m): pass
+            return _Pub()
+        def create_subscription(self, *a, **kw): return None
+        def create_timer(self, *a, **kw): return None
+        def get_clock(self): return self._clock
+        def get_logger(self): return self._logger
+        def destroy_node(self): pass
+    node_mod.Node = Node
+    qos_mod = types.ModuleType("rclpy.qos")
+    for k in ("QoSProfile", "ReliabilityPolicy", "HistoryPolicy", "DurabilityPolicy"):
+        setattr(qos_mod, k, type(k, (), {{"BEST_EFFORT": 1, "RELIABLE": 2, "KEEP_LAST": 1, "TRANSIENT_LOCAL": 1, "VOLATILE": 2, "__init__": lambda self, **kw: None}}))
+    sys.modules["rclpy"] = rclpy
+    sys.modules["rclpy.node"] = node_mod
+    sys.modules["rclpy.qos"] = qos_mod
+
+    px4_mod = types.ModuleType("px4_msgs")
+    px4_msg_mod = types.ModuleType("px4_msgs.msg")
+    class _DummyMsg:
+        VEHICLE_CMD_DO_SET_MODE = 176
+        VEHICLE_CMD_COMPONENT_ARM_DISARM = 400
+        VEHICLE_CMD_NAV_LAND = 21
+        NAVIGATION_STATE_OFFBOARD = 14
+        ARMING_STATE_ARMED = 2
+        def __init__(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+    for mname in ("OffboardControlMode", "TrajectorySetpoint", "VehicleCommand", "VehicleLocalPosition", "VehicleStatus", "VehicleLandDetected"):
+        setattr(px4_msg_mod, mname, _DummyMsg)
+    sys.modules["px4_msgs"] = px4_mod
+    sys.modules["px4_msgs.msg"] = px4_msg_mod
+
 from uav_ip.waypoint_controller import WaypointController
 
-rclpy.init()
+if HAS_ROS:
+    rclpy.init(args=["--ros-args", "-p", f"waypoints_file:={str(wp_path)}"])
 node = WaypointController()
 node.px4_timestamp = 1000
-node.waypoints_ned = [{"pos": [8.0, 0.0, 0.05], "yaw": 0.0, "type": "landing_touchdown"}]
+node.waypoints_ned = [{{"pos": [8.0, 0.0, 0.05], "yaw": 0.0, "type": "landing_touchdown"}}]
 node.current_pos_ned = [0.0, 8.0, -0.05]  # ENU (8.0, 0.0, 0.05)
 node.nav_state = 4
 node.landing_persistence_s = 3.0
@@ -254,14 +345,16 @@ node._control_loop()
 assert node.landed_persistence_start_time is None, "Debe reiniciar contador si landed_detected cae a False"
 
 # 2. Forzar que land_start_time haya superado landing_timeout_s sin persistencia completa
-node.land_start_time = Time(nanoseconds=max(1, now.nanoseconds - int(2.0 * 1e9)), clock_type=now.clock_type)
+node.land_start_time = Time(nanoseconds=max(1, now.nanoseconds - int(2.0 * 1e9)), clock_type=getattr(now, "clock_type", None))
 try:
     node._control_loop()  # Pasa a nav_state = 5 con exit_code = 1
     node._control_loop()  # Lanza SystemExit(1)
 except SystemExit as e:
-    rclpy.shutdown()
+    print(f"LANDING_TIMEOUT_CONFIRMED_EXIT_{{int(e.code)}}", flush=True)
+    if HAS_ROS and rclpy.ok():
+        node.destroy_node()
+        rclpy.shutdown()
     sys.exit(int(e.code))
-rclpy.shutdown()
 sys.exit(0)
 """
     proc = subprocess.run(
@@ -271,3 +364,5 @@ sys.exit(0)
         timeout=15,
     )
     assert proc.returncode == 1, f"Se esperaba codigo 1 en timeout de aterrizaje, stderr={proc.stderr}"
+    assert "LANDING_TIMEOUT_CONFIRMED_EXIT_1" in proc.stdout
+

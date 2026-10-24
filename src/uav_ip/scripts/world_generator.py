@@ -26,15 +26,19 @@ from typing import Optional
 
 import yaml
 
-# ============================================================================
-# Geometria del aro (puerta cuadrada y circular)
-# ============================================================================
-# La puerta cuadrada se extiende ±0.75m en Z y ±0.7m en Y respecto a su centro.
-# El aro circular tiene radio mayor 0.75m y radio tubular 0.05m.
-GATE_HALF_HEIGHT: float = 0.75
-GATE_HALF_WIDTH: float = 0.70
-CIRCULAR_MAJOR_RADIUS: float = 0.75
-CIRCULAR_TUBE_RADIUS: float = 0.05
+# Asegurar que el paquete uav_ip sea importable cuando world_generator.py se ejecuta directamente
+_pkg_root = Path(__file__).resolve().parent.parent
+if str(_pkg_root) not in sys.path:
+    sys.path.insert(0, str(_pkg_root))
+
+from uav_ip.validation_geometry import (
+    CIRCULAR_MAJOR_RADIUS,
+    CIRCULAR_NUM_SEGMENTS,
+    CIRCULAR_TUBE_RADIUS,
+    GATE_HALF_HEIGHT,
+    GATE_HALF_WIDTH,
+    get_circular_gate_cylinders_spec,
+)
 
 # ============================================================================
 # Rangos de randomizacion
@@ -127,36 +131,38 @@ def _create_circular_gate_element(
     yaw: float,
     major_radius: float = CIRCULAR_MAJOR_RADIUS,
     tube_radius: float = CIRCULAR_TUBE_RADIUS,
-    num_segments: int = 16,
+    num_segments: int = CIRCULAR_NUM_SEGMENTS,
 ) -> ET.Element:
     """Crea un elemento <model> SDF para un aro circular / toroide en el plano Y-Z.
 
-    Se construye mediante un anillo poligonal de num_segments cilindros cuyas
-    dimensiones coinciden exactamente con generate_canonical_circular_gate()
-    en synthetic_lidar.py (major_radius=0.75m, tube_radius=0.05m).
+    Se construye mediante `get_circular_gate_cylinders_spec()` de `validation_geometry.py`
+    para garantizar que el generador SDF y el validador geometrico utilicen poses,
+    radios y longitudes identicas para los `num_segments` cilindros finitos.
     """
     model = ET.Element("model", name=name)
     ET.SubElement(model, "static").text = "true"
     ET.SubElement(model, "pose").text = f"{x} {y} {z} 0 0 {yaw}"
 
     link = ET.SubElement(model, "link", name="link")
-    seg_length = 2.0 * major_radius * math.sin(math.pi / num_segments) * 1.05
     color = "0.85 0.15 0.15 1"
+    cyl_specs = get_circular_gate_cylinders_spec(
+        major_radius=major_radius,
+        tube_radius=tube_radius,
+        num_segments=num_segments,
+    )
 
-    for k in range(num_segments):
-        phi = (2.0 * math.pi * k) / num_segments
-        yk = major_radius * math.cos(phi)
-        zk = major_radius * math.sin(phi)
-        # Rotar el cilindro (eje local Z) alrededor de X por roll=phi
-        # alinea su eje con la tangente (0, -sin(phi), cos(phi)) del toroide en Y-Z.
-        seg_pose = f"0 {yk:.4f} {zk:.4f} {phi:.4f} 0 0"
+    for c_spec in cyl_specs:
+        k = c_spec["index"]
+        seg_pose = c_spec["pose_str"]
+        r_str = f"{c_spec['radius_m']:.4f}"
+        l_str = f"{c_spec['length_m']:.4f}"
 
         vis = ET.SubElement(link, "visual", name=f"seg_{k}_v")
         ET.SubElement(vis, "pose").text = seg_pose
         g = ET.SubElement(vis, "geometry")
         cyl = ET.SubElement(g, "cylinder")
-        ET.SubElement(cyl, "radius").text = f"{tube_radius:.4f}"
-        ET.SubElement(cyl, "length").text = f"{seg_length:.4f}"
+        ET.SubElement(cyl, "radius").text = r_str
+        ET.SubElement(cyl, "length").text = l_str
         mat = ET.SubElement(vis, "material")
         ET.SubElement(mat, "ambient").text = color
         ET.SubElement(mat, "diffuse").text = color
@@ -165,8 +171,8 @@ def _create_circular_gate_element(
         ET.SubElement(col, "pose").text = seg_pose
         gc = ET.SubElement(col, "geometry")
         cyl_c = ET.SubElement(gc, "cylinder")
-        ET.SubElement(cyl_c, "radius").text = f"{tube_radius:.4f}"
-        ET.SubElement(cyl_c, "length").text = f"{seg_length:.4f}"
+        ET.SubElement(cyl_c, "radius").text = r_str
+        ET.SubElement(cyl_c, "length").text = l_str
 
     return model
 

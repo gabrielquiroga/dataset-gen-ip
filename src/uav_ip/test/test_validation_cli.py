@@ -53,12 +53,45 @@ def _write_synthetic_valid_mcap(mcap_path: Path, dt_s: float = 0.05) -> None:
 
     header_rec = _make_mcap_record(0x01, _make_mcap_str("ros2") + _make_mcap_str("test"))
 
-    def make_schema(sid: int, name: str) -> bytes:
+    odom_msgdef = (
+        "uint64 timestamp\n"
+        "uint64 timestamp_sample\n"
+        "uint8 pose_frame\n"
+        "float32[3] position\n"
+        "float32[4] q\n"
+        "uint8 velocity_frame\n"
+        "float32[3] velocity\n"
+        "float32[3] angular_velocity\n"
+        "float32[3] position_variance\n"
+        "float32[3] orientation_variance\n"
+        "float32[3] velocity_variance\n"
+        "uint8 reset_counter\n"
+        "int8 quality\n"
+    )
+    land_msgdef = (
+        "uint64 timestamp\n"
+        "bool freefall\n"
+        "bool ground_contact\n"
+        "bool maybe_landed\n"
+        "bool landed\n"
+        "bool in_ground_effect\n"
+        "bool in_descend\n"
+        "bool has_low_throttle\n"
+        "bool vertical_movement\n"
+        "bool horizontal_movement\n"
+        "bool rotational_movement\n"
+        "bool close_to_ground_or_skipped_check\n"
+        "bool at_rest\n"
+    )
+
+    def make_schema(sid: int, name: str, schema_data: str) -> bytes:
+        bdata = schema_data.encode("utf-8")
         payload = (
             struct.pack("<H", sid)
             + _make_mcap_str(name)
             + _make_mcap_str("ros2msg")
-            + struct.pack("<I", 0)
+            + struct.pack("<I", len(bdata))
+            + bdata
         )
         return _make_mcap_record(0x03, payload)
 
@@ -76,14 +109,12 @@ def _write_synthetic_valid_mcap(mcap_path: Path, dt_s: float = 0.05) -> None:
         return _make_mcap_record(0x05, hdr + cdr_data)
 
     schemas = (
-        make_schema(1, "px4_msgs/msg/VehicleOdometry")
-        + make_schema(2, "px4_msgs/msg/VehicleLandDetected")
-        + make_schema(3, "px4_msgs/msg/VehicleStatus")
+        make_schema(1, "px4_msgs/msg/VehicleOdometry", odom_msgdef)
+        + make_schema(2, "px4_msgs/msg/VehicleLandDetected", land_msgdef)
     )
     channels = (
         make_channel(1, 1, "/fmu/out/vehicle_odometry")
         + make_channel(2, 2, "/fmu/out/vehicle_land_detected")
-        + make_channel(3, 3, "/fmu/out/vehicle_status_v4")
     )
 
     msg_chunks = []
@@ -112,7 +143,7 @@ def _write_synthetic_valid_mcap(mcap_path: Path, dt_s: float = 0.05) -> None:
         msg_chunks.append(make_msg(1, i + 1, t_ns, bytes(odom_buf)))
 
         is_landed = 1 if i >= n_flight else 0
-        land_buf = bytearray(28)
+        land_buf = bytearray(24)
         land_buf[0:4] = b"\x00\x01\x00\x00"
         struct.pack_into("<Q", land_buf, 4, t_us)
         land_buf[12] = 0
@@ -121,15 +152,6 @@ def _write_synthetic_valid_mcap(mcap_path: Path, dt_s: float = 0.05) -> None:
         land_buf[15] = is_landed
         land_buf[23] = is_landed
         msg_chunks.append(make_msg(2, i + 1, t_ns, bytes(land_buf)))
-
-    last_t_us = int(round((100.0 + (n_total - 1) * dt_s) * 1e6))
-    stat_buf = bytearray(92)
-    stat_buf[0:4] = b"\x00\x01\x00\x00"
-    struct.pack_into("<Q", stat_buf, 4, last_t_us)
-    stat_buf[28] = 2
-    stat_buf[45] = 14
-    stat_buf[62] = 0
-    msg_chunks.append(make_msg(3, 1, last_t_us * 1000, bytes(stat_buf)))
 
     footer_rec = _make_mcap_record(0x02, struct.pack("<QQI", 0, 0, 0))
     full_mcap = (

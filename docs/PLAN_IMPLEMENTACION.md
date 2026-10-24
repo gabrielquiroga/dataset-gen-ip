@@ -58,12 +58,13 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 | Módulo / Script | Ubicación | Estado Actual | Observaciones y Deuda Técnica Identificada |
 | :--- | :--- | :--- | :--- |
 | **`task_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Muestreo combinatorio sin reemplazo, firma semántica limpia, `slalom` bilateral (`left`/`right`) y soporte para `circular_gate`. |
-| **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos, validación de factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`), alineación de `plataforma_llegada` y variación de `start_pose`. |
-| **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro, suscripción a `/fmu/out/vehicle_land_detected` y conversión base NED/ENU. |
-| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de paso dentro de la ventana segura (`cross_track < 0.35m`, `alt_err < 0.40m` en `traverse`) y aterrizaje confirmado por `landed` del detector de PX4 (código 1 si vence el plazo). |
+| **`world_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Inyección dinámica SDF operativa con `circular_gate` poligonal de 16 segmentos (`get_circular_gate_cylinders_spec()`), validación de factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`), alineación de `plataforma_llegada` y variación de `start_pose`. |
+| **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro, suscripción a `/fmu/out/vehicle_land_detected`, registro de frescura de mensajes y conversión base NED/ENU. |
+| **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de paso derivadas de `validation_geometry.py` (`|y| ≤ 0.33m, |z| ≤ 0.38m` en cuadrada y `r ≤ 0.3656m` en circular) y aterrizaje confirmado por persistencia continua (`3.0 s`) de `landed` (código 1 propagado si vence `10.0 s`). |
 | **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Conversión consistente entre coordenadas Gazebo ENU y PX4 NED en el cálculo de rumbo. |
-| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial. |
-| **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador físico, geométrico y temporal independiente (parser nativo MCAP + CDR sin dependencias, clearance 3D analítico contra AABB/toroide/cilindro, verificación de primitivas y reconstrucción monótona del reloj ante saltos `Timesync`). |
+| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial (integración en línea del validador pendiente en Fase 2). |
+| **`validation_geometry.py`** | `src/uav_ip/uav_ip/` | **Completado** | Fuente única de verdad geométrica, mediciones trazables del SDF `x500` (`UAV_COLLISION_RADIUS_XY = 0.30 m`), derivación de tolerancias (`derive_validation_tolerances()`) y especificación 1 a 1 de los 16 cilindros de `circular_gate`. |
+| **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador de configuración, grabación y misión independiente del piloto (sin degradación silenciosa entre `rosbags` y parser nativo MCAP/CDR, verificación de CRC32, `VehicleOdometry` obligatoria, reloj estructurado `C3`, aterrizaje en ventana temporal común `C4`, cota inferior de discretización `C7` y secuencia progresiva de primitivas `C8`). |
 | **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR 360° en marco *Horizontal FLU* ($s=0.1$, FPS 2048 determinista acelerado ~7x con kernel C SIMD), cuota acotada en `landing_pad` y *thin wrapper* en `scripts/`. |
 | **`audit_dataset.py`** | `src/uav_ip/scripts/` | **Completado** | Auditoría universal de firmas semánticas, variabilidad espacial y particionado `train` / `val` / `held_out` sin fugas. |
 | **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Completado** | Exporta poses $SE(3)$, horizonte relativo $T_{EA}$ ($T=8$), $L=10$ keyframes, 6 keypoints del UAV, *30% Tube Augmentation* de recuperación y procesamiento multiproceso (`--dataset-dir`, `--workers`). |
@@ -214,7 +215,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 - [x] **Tarea 2.5.2: Tolerancias del piloto y confirmación de aterrizaje (`waypoint_controller.py`, `base_pilot.py`).**
 - [x] **Tarea 2.5.3: Factibilidad de transiciones (`world_generator.py`).**
 
-#### Fase 1.1: Correcciones por la Segunda Revisión (`docs/feedback/respuesta.md` y `docs/feedback/plan_f1.md`) — [EN PROGRESO: BLOQUES 1 Y 2 COMPLETADOS]
+#### Fase 1.1: Correcciones por la Segunda Revisión (`docs/feedback/respuesta.md` y `docs/feedback/plan_f1.md`) — [x] COMPLETADO (`C1–C10`)
 - [x] **CLI, descubrimiento y contrato de configuración/procedencia (`C1 + C2`):**
   * `scripts/validate_episode.py` propaga `sys.exit(main())` con códigos `0` (aceptado), `1` (rechazo) y `2` (error de uso/argumentos mutuamente excluyentes/rutas vacías o inexistentes).
   * `discover_episode_dirs()` descubre todas las carpetas `task_*/episode_*` y reporta `missing_bag` cuando falta `.mcap`.
@@ -229,26 +230,19 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
   * Sustitución de "últimas 25 muestras" por `landing_window_s = 0.50 s` (parámetro de ingeniería inicial a calibrar), evaluando error XY ≤ 0,75 m, z ∈ [0,0; 0,25] m y velocidad ≤ 0,25 m/s en toda la ventana.
   * Persistencia real de `VehicleLandDetected.landed == True` (nunca `ground_contact`) en toda la ventana con al menos 2 mensajes distintos, timestamps finitos `> 0` y vigencia ≤ 1,5 s.
   * `BasePilot` registra `last_pos_recv_time` y `last_land_detected_recv_time`; `WaypointController` exige frescura, posición XY en plataforma, `z ≤ 0.25 m`, `landed == True` y un contador de persistencia continua (`landing_persistence_s = 3.0 s`) que se reinicia si alguna condición cae, saliendo con código `1` propagado al proceso al vencer `landing_timeout_s = 10.0 s`.
-- [x] **Envolvente única (pendiente consolidar en `validation_geometry.py` y medir SDF en `C7`):**
-  * `UAV_COLLISION_RADIUS_XY = 0.23 + 0.05 = 0.28 m`.
-  * Ventana de `traverse`: |y| ≤ 0,37 m y |z| ≤ 0,42 m (puerta cuadrada), r ≤ 0,4056 m (puerta circular).
-  * Piloto: `cross_track < 0.35 m`, `alt_err < 0.40 m`.
-- [x] **Colisiones entre muestras (pendiente cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ en `C7`):**
-  * Subdivisión de segmentos a ≤ 0,02 m.
-  * Hueco temporal máximo de 0,15 s y paso espacial máximo de 0,35 m.
-- [x] **Lectura de bags (pendiente eliminar degradación silenciosa y fijar política de odometría en `C5 + C6`):**
-  * Se prioriza `rosbags`.
-  * Verificación de *magic* inicial y final y `Footer` (los MCAP truncados se rechazan).
-  * Offsets CDR corregidos (`vx` 56, `heading` 104, `at_rest` 23, `arming_state` 28, `nav_state` 45, `failsafe` 62).
-- [x] **Condiciones exigidas (pendiente secuencia temporal progresiva `start_index`/`completion_index` en `C8`):**
-  * Orden temporal de las primitivas.
-  * Error medio de guiñada ≤ 45° y barrido ≥ 240° en `orbit`.
-  * `pose_frame`/`velocity_frame == 1` y *flags* de validez.
-- [x] **`world_generator.py`:**
-  * `start_pose` se genera antes del circuito y se pasa al chequeo de factibilidad.
-  * Los tramos rectos de transición se comparan contra landmarks de terceros.
-- [x] **Tests modulares (`C1–C4` implementados; `C5–C9` en Bloques 3 y 4):**
-  * `test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py` y `test_synthetic_lidar.py` (42 tests en total).
+- [x] **Lectura de bags sin degradación silenciosa y política de odometría (`C5 + C6`):**
+  * `load_episode_telemetry(bag_path, backend=...)` registra `reader_info` (`backend`, `backend_version`, `integrity_checks`, `schema_revision`, `schemas_verified`). Si `rosbags` está instalado y falla al deserializar, propaga el rechazo sin degradar en silencio al parser nativo.
+  * `verify_mcap_integrity()` verifica *magic* inicial/final, `Footer`, recorrido completo del stream de registros y `uncompressed_crc` (`zlib.crc32`) en cada `Chunk` sin comprimir; `_parse_mcap_native()` verifica presencia y compatibilidad textual de esquemas de `px4_msgs`, encabezado CDR y los 5 contadores de reset de `VehicleLocalPosition`.
+  * `VehicleOdometry` es obligatoria para aceptación de campaña (`missing_required_vehicle_odometry`); `VehicleLocalPosition` queda como diagnóstico o exige sus contadores de reset presentes y verificados (`unverified_local_position_reset_counters`).
+- [x] **Geometría compartida, medición del SDF `x500` y cota inferior de discretización (`C7`):**
+  * Módulo compartido `src/uav_ip/uav_ip/validation_geometry.py` importado por `world_generator.py`, `waypoint_controller.py` y `validate_episode.py`.
+  * `X500_SDF_MEASUREMENT` documenta las medidas trazables de `x500_base/model.sdf` (`UAV_PHYSICAL_RADIUS_XY = 0.25 m`, `UAV_SAFETY_MARGIN_XY = 0.05 m`, `UAV_COLLISION_RADIUS_XY = 0.30 m`, más `X500_FULL_ROTOR_TIP_RADIUS_M = 0.3857 m`).
+  * Ventana de `traverse`: `|y| ≤ 0.35 m` y `|z| ≤ 0.40 m` (`square_gate`), `r ≤ 0.3856 m` (`circular_gate`); piloto con `is_traverse_center_reached()` (`|y| ≤ 0.33 m, |z| ≤ 0.38 m` en cuadrada y `r ≤ 0.3656 m` en circular).
+  * Cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ con paso $h = 0,02\text{ m}$ ($h/2 = 0,01\text{ m}$) y geometría compartida 1 a 1 de los 16 cilindros rectos de `circular_gate` (`get_circular_gate_cylinders_spec()`).
+- [x] **Secuencia temporal progresiva de primitivas (`C8`):**
+  * Cada primitiva $m$ se busca desde el `completion_index` de la primitiva $m-1$, reportando `start_index`, `event_index` y `completion_index` y rechazando ejecuciones prematuras fuera de turno (`primitive_order_violation`).
+- [x] **Suite modular de pruebas y trazabilidad documental (`C9 + C10`):**
+  * 56 tests en 8 módulos (`test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py`, `test_mcap_reader.py`, `test_validation_geometry.py`, `test_primitive_validation.py`, `test_synthetic_lidar.py`).
 
 #### Fase 2: Integración en la Recolección, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
 - [ ] **Tarea 2.5.4: Integrar el validador en `data_collector.py`:**
