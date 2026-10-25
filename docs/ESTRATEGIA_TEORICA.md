@@ -211,23 +211,34 @@ provocando que el dron diverja irremediablemente de la trayectoria segura y coli
 ### 10.2 Formulación Matemática del Flujo Correctivo en $SE(3)$
 Para dotar a la política de difusión de capacidad intrínseca de autocorrección sin requerir bucles interactivos online costosos (DAgger), se sintetiza un conjunto de demostraciones de recuperación dentro de un **tubo de perturbación $\epsilon$** (*Tube Augmentation*):
 
-1. **Muestreo de Estados Perturbados:**
-   Para un $30\%$ de los instantes temporales $t$, se aplica una perturbación estocástica a la pose nominal del dron $T_{WE}^t = (p_t, R_t) \in SE(3)$:
-   $$\delta p \sim \mathcal{N}(0, \sigma_p^2 I_3), \quad \|\delta p\| \le 0.60\text{ m}, \quad \sigma_p = 0.25\text{ m}$$
+1. **Muestreo de Estados Perturbados en Esfera Euclídea Sólida con Filtrado de Colisiones:**
+   Para un $30\%$ de los instantes temporales $t$, se aplica una perturbación estocástica a la pose nominal del dron $T_{WE}^t = (p_t, R_t) \in SE(3)$ mediante **muestreo por rechazo en esfera sólida 3D**:
+   $$\delta p \sim \mathcal{N}(0, \sigma_p^2 I_3), \quad \|\delta p\|_2 \le 0.60\text{ m}, \quad \sigma_p = 0.25\text{ m}$$
    $$\delta \psi \sim \mathcal{N}(0, \sigma_\psi^2), \quad |\delta \psi| \le 15^\circ, \quad \sigma_\psi = 5^\circ$$
+   *(Sustituye formalmente el recorte por coordenadas en cubo $[-0.6, 0.6]^3$, que permitía desviaciones de hasta $\sqrt{3} \times 0.60 \approx 1.04\text{ m}$ en las esquinas).*
+
+   **Condiciones Geométricas de Seguridad (`_is_perturbation_safe`):**
+   - **Despeje contra Obstáculos:** Toda pose perturbada $\tilde{p}_t = p_t + \delta p$ y su segmento rectilíneo de recuperación hacia $p_{t+1}$ deben satisfacer una cota inferior de clearance $\ge \text{UAV\_COLLISION\_RADIUS\_XY} = 0.30\text{ m}$ contra todos los landmarks estáticos usando `compute_landmark_clearance()` de `uav_ip.validation_geometry`.
+   - **Transitabilidad en Puertas (`traverse`):** Si la pose nominal se sitúa en la vecindad axial del aro ($|x_{\text{local}}| \le 0.60\text{ m}$), la perturbación lateral debe permanecer estrictamente dentro de la apertura libre ($|y| \le 0.50\text{ m}, |z| \le 0.55\text{ m}$ en cuadradas o $r \le 0.5356\text{ m}$ en circulares). Asimismo, si la cuerda de recuperación cruza el plano $x_{\text{local}} = 0$, el punto de intersección debe atravesar la abertura interior sin colisionar con el marco. Las perturbaciones que violen estas restricciones son descartadas y remuestreadas.
+
    La pose perturbada resultante en coordenadas del mundo ENU es:
    $$\tilde{T}_{WE}^t = \begin{bmatrix} R_z(\psi_t + \delta \psi) & p_t + \delta p \\ 0 & 1 \end{bmatrix}$$
 
 2. **Generación de la Observación Perturbada:**
    Dado el modelo analítico de superficies de los landmarks, la nube de puntos LiDAR egocéntrica $\tilde{P}_{\text{scene}}^t$ se calcula evaluando directamente el sensor desde la pose perturbada $\tilde{T}_{WE}^t$ en el marco Horizontal FLU, aplicando el filtro de rango omnidireccional $R_{\text{max}} = 10.0\text{ m}$ y FPS submuestreado a 2048 puntos.
 
-3. **Demostración de la Acción Correctiva hacia el Horizonte Nominal:**
-   Dada la trayectoria futura de referencia del experto $\{ T_{WE}^{t+k} \}_{k=1}^T$ ($T=8$ pasos a $\sim 10\text{ Hz}$), la acción objetivo requerida para corregir el desvío se formula unívocamente mediante la transformación relativa entre la pose perturbada actual y el hito nominal futuro:
+3. **Demostración de la Acción Correctiva hacia el Horizonte Nominal y Grilla Temporal Uniforme (10 Hz):**
+   Las poses del agente se interpolan uniformemente en el tiempo a $\Delta t = 0.1\text{ s}$ ($10\text{ Hz}$) sobre el reloj reparado `reconstructed_time_s`, desenvolviendo previamente la fase angular con `np.unwrap` para eliminar discontinuidades en $\pm \pi$.
+   
+   Dada la trayectoria futura de referencia del experto $\{ T_{WE}^{t+k} \}_{k=1}^T$ ($T=8$ pasos a $10\text{ Hz}$, cubriendo exactamente $0.8\text{ s}$ físicos), la acción correctiva relativa es:
    $$\tilde{T}_{EA}^{(t,k)} = (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} \in SE(3)$$
    
    **Propiedad de Convergencia por Identidad de Grupo:**
    $$\tilde{T}_{WE}^t \cdot \tilde{T}_{EA}^{(t,k)} = \tilde{T}_{WE}^t \cdot (\tilde{T}_{WE}^t)^{-1} \cdot T_{WE}^{t+k} = T_{WE}^{t+k}$$
-   Por construcción, la acción relativa etiquetada compensa el desplazamiento $\delta p$ y $\delta \psi$ y apunta de regreso a la trayectoria del experto en el horizonte anticipado. Que la política aprendida reproduzca esa convergencia en lazo cerrado es una hipótesis a evaluar experimentalmente, no una consecuencia garantizada.
+   Por construcción, la acción relativa etiquetada compensa el desplazamiento $\delta p$ y $\delta \psi$ y apunta de regreso a la trayectoria del experto en el horizonte anticipado.
+
+   **Máscara Booleana de Validez (`valid_mask`):**
+   Para los últimos 7 timesteps de la demostración donde el tiempo restante de trayectoria es $< 0.8\text{ s}$, el horizonte se mantiene clampeado a la pose final estacionaria de aterrizaje, incorporando en `HeteroData` el tensor booleano `data['agent'].valid_mask` de dimensiones $(T, 8)$ que identifica con `True` los pasos con trayectoria física real y con `False` los instantes terminales clampeados.
 
 4. **Perturbación del Estado Binario de Vuelo ($10\%$ flip):**
    Para robustecer el modelo en las fases críticas de despegue y aterrizaje y evitar que memorice el estado binario $s_t \in \{0, 1\}$ como un oráculo determinista:

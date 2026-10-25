@@ -105,7 +105,7 @@ from uav_ip.validation_geometry import (
 # Constantes Geometricas y Umbrales de Validacion (Sincronizados con Documentacion)
 # ============================================================================
 
-VALIDATOR_VERSION: str = "1.1.0"
+VALIDATOR_VERSION: str = "1.2.0"
 
 SUPPORTED_LANDMARK_TYPES = frozenset({"gate", "square_gate", "circular_gate", "pole"})
 GATE_LANDMARK_TYPES = frozenset({"gate", "square_gate", "circular_gate"})
@@ -118,6 +118,8 @@ TAKEOFF_MIN_ALT_M: float = 0.95
 MIN_ACTIVE_GROUND_Z_M: float = 0.15
 MAX_ALLOWED_DT_GAP_S: float = 0.15      # Hueco temporal maximo admisible entre muestras (150 ms)
 MAX_ALLOWED_STEP_DIST_M: float = 0.35   # Paso espacial maximo admisible entre muestras consecutivas (m)
+TIMESYNC_MATCH_WINDOW_S: float = 0.05   # Ventana maxima de coincidencia temporal entre salto de odometria y TimesyncStatus (s)
+TIMESYNC_MATCH_TOL_S: float = 0.05      # Tolerancia maxima de magnitud entre salto de odometria y delta estimated_offset (s)
 
 LANDING_WINDOW_S: float = 0.50          # Duracion de la ventana temporal final de aterrizaje (s, parametro de ingenieria)
 LANDING_MAX_FINAL_Z_M: float = 0.25     # Altitud maxima en la ventana final de reposo (m)
@@ -133,6 +135,7 @@ EXPECTED_TOPIC_SCHEMAS = {
     "/fmu/out/vehicle_land_detected": "px4_msgs/msg/VehicleLandDetected",
     "/fmu/out/vehicle_status_v4": "px4_msgs/msg/VehicleStatus",
     "/fmu/in/trajectory_setpoint": "px4_msgs/msg/TrajectorySetpoint",
+    "/fmu/out/timesync_status": "px4_msgs/msg/TimesyncStatus",
 }
 
 EXPECTED_SCHEMA_REQUIRED_TOKENS: Dict[str, Tuple[str, ...]] = {
@@ -181,6 +184,14 @@ EXPECTED_SCHEMA_REQUIRED_TOKENS: Dict[str, Tuple[str, ...]] = {
         "float32 yaw",
         "float32 yawspeed",
     ),
+    "px4_msgs/msg/TimesyncStatus": (
+        "uint64 timestamp",
+        "uint8 source_protocol",
+        "uint64 remote_timestamp",
+        "int64 observed_offset",
+        "int64 estimated_offset",
+        "uint32 round_trip_time",
+    ),
 }
 
 
@@ -219,6 +230,8 @@ def get_effective_validation_parameters() -> Dict[str, Any]:
         "min_active_ground_z_m": MIN_ACTIVE_GROUND_Z_M,
         "max_allowed_dt_gap_s": MAX_ALLOWED_DT_GAP_S,
         "max_allowed_step_dist_m": MAX_ALLOWED_STEP_DIST_M,
+        "timesync_match_window_s": TIMESYNC_MATCH_WINDOW_S,
+        "timesync_match_tol_s": TIMESYNC_MATCH_TOL_S,
         "landing_window_s": LANDING_WINDOW_S,
         "landing_max_xy_err_m": tols["landing_max_xy_err_m"],
         "landing_max_final_z_m": LANDING_MAX_FINAL_Z_M,
@@ -405,6 +418,7 @@ def _parse_mcap_native(
         "land_detected": [],
         "vehicle_status": [],
         "setpoints": [],
+        "timesync_status": [],
     }
     compressed_chunk_found = False
 
@@ -593,6 +607,33 @@ def _parse_mcap_native(
                         "yawspeed": float(sp_yawspeed),
                     })
 
+                elif topic == "/fmu/out/timesync_status":
+                    # Layout CDR exacto segun src/px4_msgs/msg/TimesyncStatus.msg:
+                    # 4..12: timestamp (uint64)
+                    # 12..13: source_protocol (uint8), 13..20: padding a 8 bytes
+                    # 20..28: remote_timestamp (uint64)
+                    # 28..36: observed_offset (int64)
+                    # 36..44: estimated_offset (int64)
+                    # 44..48: round_trip_time (uint32)
+                    if len(raw) < 48:
+                        raise ValueError(f"truncated_cdr_payload_timesync_status ({len(raw)} < 48)")
+                    ts_us = struct.unpack_from("<Q", raw, 4)[0]
+                    source_protocol = int(raw[12])
+                    remote_ts_us, obs_offset_us, est_offset_us, rtt_us = struct.unpack_from("<QqqI", raw, 20)
+                    telemetry["timesync_status"].append({
+                        "timestamp": int(log_time),
+                        "timestamp_us": int(ts_us),
+                        "source_protocol": source_protocol,
+                        "remote_timestamp": int(remote_ts_us),
+                        "remote_timestamp_us": int(remote_ts_us),
+                        "observed_offset": int(obs_offset_us),
+                        "observed_offset_us": int(obs_offset_us),
+                        "estimated_offset": int(est_offset_us),
+                        "estimated_offset_us": int(est_offset_us),
+                        "round_trip_time": int(rtt_us),
+                        "round_trip_time_us": int(rtt_us),
+                    })
+
             elif op == 0x06:  # Chunk record
                 comp, p = _read_mcap_str(b, rec_start + 28, limit=rec_end)
                 clen = struct.unpack_from("<Q", b, p)[0]
@@ -628,6 +669,7 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Tuple[Dict[str, List[Dict[str, Any
         "land_detected": [],
         "vehicle_status": [],
         "setpoints": [],
+        "timesync_status": [],
     }
     verified_schemas: set[str] = set()
     with AnyReader(mcaps, default_typestore=typestore) as reader:
@@ -711,6 +753,22 @@ def _parse_with_rosbags(mcaps: List[Path]) -> Tuple[Dict[str, List[Dict[str, Any
                     "yaw": float(getattr(msg, "yaw", 0.0)),
                     "yawspeed": float(getattr(msg, "yawspeed", float("nan"))),
                 })
+            elif topic == "/fmu/out/timesync_status":
+                remote_ts = int(getattr(msg, "remote_timestamp", 0))
+                obs_offset = int(getattr(msg, "observed_offset", 0))
+                est_offset = int(getattr(msg, "estimated_offset", 0))
+                merged["timesync_status"].append({
+                    "timestamp": int(timestamp),
+                    "timestamp_us": int(getattr(msg, "timestamp", 0)),
+                    "source_protocol": int(getattr(msg, "source_protocol", 0)),
+                    "remote_timestamp": remote_ts,
+                    "remote_timestamp_us": remote_ts,
+                    "observed_offset": obs_offset,
+                    "observed_offset_us": obs_offset,
+                    "estimated_offset": est_offset,
+                    "estimated_offset_us": est_offset,
+                    "round_trip_time": int(getattr(msg, "round_trip_time", 0)),
+                })
     rb_ver = str(getattr(rosbags, "__version__", "unknown"))
     return merged, sorted(verified_schemas), rb_ver
 
@@ -792,6 +850,7 @@ def load_episode_telemetry(
         "land_detected": [],
         "vehicle_status": [],
         "setpoints": [],
+        "timesync_status": [],
     }
     all_schemas: set[str] = set()
     for mp in mcaps:
@@ -1173,9 +1232,84 @@ class ClockReconstructionResult(dict):
             raise AttributeError(f"'ClockReconstructionResult' object has no attribute '{name}'") from exc
 
 
+def _extract_timesync_offset_steps(
+    timesync_status: Optional[Sequence[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Extrae escalones de offset significativos (|Δestimated_offset| > 0.01 s) a partir de la
+    secuencia de mensajes `/fmu/out/timesync_status`.
+    Soporta tanto diccionarios con campos en microsegundos/nanosegundos (`estimated_offset_us`,
+    `estimated_offset`, `timestamp`, `timestamp_us`) como en segundos (`estimated_offset_s`,
+    `timestamp_bag_s`, `timestamp_px4_s`).
+    """
+    if not timesync_status or len(timesync_status) < 2:
+        return []
+
+    raw_offsets: List[float] = []
+    has_explicit_s = False
+    has_explicit_us = False
+    for item in timesync_status:
+        if "estimated_offset_s" in item:
+            raw_offsets.append(float(item["estimated_offset_s"]))
+            has_explicit_s = True
+        elif "estimated_offset_us" in item:
+            raw_offsets.append(float(item["estimated_offset_us"]) * 1e-6)
+            has_explicit_us = True
+        elif "estimated_offset" in item:
+            raw_offsets.append(float(item["estimated_offset"]))
+        else:
+            raw_offsets.append(0.0)
+
+    if not has_explicit_s and not has_explicit_us:
+        max_abs = max((abs(v) for v in raw_offsets), default=0.0)
+        if max_abs > 50.0:
+            raw_offsets = [v * 1e-6 for v in raw_offsets]
+
+    events: List[Dict[str, Any]] = []
+    for m in range(1, len(timesync_status)):
+        delta_offset_s = float(raw_offsets[m] - raw_offsets[m - 1])
+        if abs(delta_offset_s) <= 0.010:
+            continue
+
+        cur = timesync_status[m]
+        prev = timesync_status[m - 1]
+
+        t_bag_s: Optional[float] = None
+        if "timestamp_bag_s" in cur:
+            t_bag_s = float(cur["timestamp_bag_s"])
+        elif "timestamp" in cur and cur["timestamp"] is not None:
+            val_b = float(cur["timestamp"])
+            t_bag_s = val_b * 1e-9 if val_b > 1e12 else val_b
+
+        prev_bag_s: Optional[float] = None
+        if "timestamp_bag_s" in prev:
+            prev_bag_s = float(prev["timestamp_bag_s"])
+        elif "timestamp" in prev and prev["timestamp"] is not None:
+            val_pb = float(prev["timestamp"])
+            prev_bag_s = val_pb * 1e-9 if val_pb > 1e12 else val_pb
+
+        t_px4_s: Optional[float] = None
+        if "timestamp_px4_s" in cur:
+            t_px4_s = float(cur["timestamp_px4_s"])
+        elif "timestamp_us" in cur and cur["timestamp_us"] is not None:
+            val_p = float(cur["timestamp_us"])
+            t_px4_s = val_p * 1e-6 if val_p > 1e11 else val_p
+
+        events.append({
+            "msg_index": int(m),
+            "t_bag_s": t_bag_s,
+            "prev_t_bag_s": prev_bag_s,
+            "t_px4_s": t_px4_s,
+            "delta_offset_s": delta_offset_s,
+            "used": False,
+        })
+    return events
+
+
 def reconstruct_simulation_clock(
     ts_px4_s: np.ndarray,
     ts_bag_s: np.ndarray,
+    timesync_status: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> ClockReconstructionResult:
     """
     Analiza y reconstruye de forma condicionada el reloj de simulacion a partir del reloj de
@@ -1184,11 +1318,18 @@ def reconstruct_simulation_clock(
         reparacion condicionada que verifica la consistencia del intervalo entre los vecinos UNIX
         validos (`raw_px4[k+1] - raw_px4[k-1]`) y reparte dicho intervalo proporcionalmente a
         `dt_bag`, preservando exactamente el span entre vecinos sin borrar huecos reales.
-      - Patron B (escalon de offset UNIX entre muestras `> 1e8` s): se marca como ambiguo
-        (`ambiguous_clock_step_pattern_b`) y NO se repara automaticamente, conservando el
-        intervalo original `dt_px4` para nunca comprimir una entrega en rafaga tras congelacion.
-      - Retrocesos o duplicados (`dt <= 0`) no explicados por un Patron A valido quedan visibles
-        en `reconstructed_time_s` y en `backstep_or_duplicate_mask`, marcando `usable_for_validation=False`.
+      - Patron B (escalon de offset UNIX entre muestras `> 1e8` s):
+        * Si `timesync_status` está disponible y un salto en `VehicleOdometry.timestamp` coincide
+          dentro de `±TIMESYNC_MATCH_WINDOW_S` (0.05 s) con un cambio en `TimesyncStatus.estimated_offset`
+          de idéntica magnitud (`|Δt_odom - Δestimated_offset| <= TIMESYNC_MATCH_TOL_S`), se valida
+          formalmente como reajuste de offset de red y se repara `reconstructed_time_s` aplicando
+          el diferencial de offset.
+        * En ausencia de correlación analítica con `timesync_status`, se marca como ambiguo
+          (`ambiguous_clock_step_pattern_b`) y NO se repara automaticamente, conservando el
+          intervalo original `dt_px4` para nunca comprimir una entrega en rafaga tras congelacion.
+      - Retrocesos o duplicados (`dt <= 0`) no explicados por un Patron A valido o desambiguacion
+        de `timesync_status` quedan visibles en `reconstructed_time_s` y en `backstep_or_duplicate_mask`,
+        marcando `usable_for_validation=False`.
       - Relojes ausentes, no finitos o `<= 0` provocan rechazo inmediato (`usable_for_validation=False`).
     """
     raw_px4 = np.asarray(ts_px4_s, dtype=np.float64)
@@ -1331,10 +1472,12 @@ def reconstruct_simulation_clock(
                 if "ambiguous_clock_step_pattern_a" not in reasons:
                     reasons.append("ambiguous_clock_step_pattern_a")
 
-    # 2. Patron B: escalon de offset UNIX entre muestras consecutivas > 1e8 s.
-    # No se repara automaticamente porque una entrega en rafaga tras congelacion de la fuente
-    # produce la misma firma ("lag grande antes, lag pequeno despues"). Se conserva dt_px4[i]
-    # y se marca como ambiguo para rechazar en campana.
+    # 2. Patron B y desambiguacion analitica mediante /fmu/out/timesync_status:
+    # Si un salto entre muestras consecutivas > 1e8 s coincide en ±0.05 s con un escalon
+    # en TimesyncStatus.estimated_offset de identica magnitud (dentro de ±0.05 s), se valida
+    # como reajuste de offset de red y se repara aplicando el diferencial de offset.
+    # De lo contrario, se conserva dt_px4[i] y se rechaza como ambiguo o dropout.
+    ts_events = _extract_timesync_offset_steps(timesync_status)
     for i in range(M):
         if repaired_step_mask[i] or ambiguous_step_mask[i]:
             continue
@@ -1344,6 +1487,66 @@ def reconstruct_simulation_clock(
             and 0.0 < dt_bag[i] <= 0.100
             and abs(dt_px4[i] - dt_bag[i]) > 0.050
         ):
+            odom_step_excess = float(dt_px4[i] - dt_bag[i])
+            matched_ev: Optional[Dict[str, Any]] = None
+            matched_sign: float = 1.0
+
+            for ev in ts_events:
+                if ev["used"]:
+                    continue
+                time_ok = False
+                if ev["t_bag_s"] is not None:
+                    tb = float(ev["t_bag_s"])
+                    if (raw_bag[i] - TIMESYNC_MATCH_WINDOW_S) <= tb <= (raw_bag[i + 1] + TIMESYNC_MATCH_WINDOW_S):
+                        time_ok = True
+                if not time_ok and ev["t_px4_s"] is not None:
+                    tp = float(ev["t_px4_s"])
+                    p_lo = min(float(raw_px4[i]), float(raw_px4[i + 1])) - TIMESYNC_MATCH_WINDOW_S
+                    p_hi = max(float(raw_px4[i]), float(raw_px4[i + 1])) + TIMESYNC_MATCH_WINDOW_S
+                    if p_lo <= tp <= p_hi:
+                        time_ok = True
+                if not time_ok:
+                    continue
+
+                d_off = float(ev["delta_offset_s"])
+                for sgn in (1.0, -1.0):
+                    eff_off = sgn * d_off
+                    if (
+                        abs(odom_step_excess - eff_off) <= TIMESYNC_MATCH_TOL_S
+                        or abs(float(dt_px4[i]) - eff_off) <= TIMESYNC_MATCH_TOL_S
+                    ):
+                        matched_ev = ev
+                        matched_sign = sgn
+                        break
+                if matched_ev is not None:
+                    break
+
+            if matched_ev is not None:
+                eff_off = matched_sign * float(matched_ev["delta_offset_s"])
+                candidate_dt = float(dt_px4[i]) - eff_off
+                if candidate_dt < 1e-4 or abs(candidate_dt - float(dt_bag[i])) > float(dt_bag[i]):
+                    rep_dt = float(dt_bag[i])
+                else:
+                    rep_dt = candidate_dt
+
+                if 0.0 < rep_dt <= MAX_ALLOWED_DT_GAP_S:
+                    matched_ev["used"] = True
+                    dt_reconstructed[i] = rep_dt
+                    repaired_step_mask[i] = True
+                    repaired_events.append(
+                        {
+                            "step_index": int(i),
+                            "step_indices": [int(i)],
+                            "original_px4_dt_s": float(dt_px4[i]),
+                            "bag_dt_s": round(float(dt_bag[i]), 6),
+                            "timesync_msg_index": int(matched_ev["msg_index"]),
+                            "timesync_delta_offset_s": round(float(eff_off), 6),
+                            "repaired_dt_s": round(float(rep_dt), 6),
+                            "method": "pattern_b_timesync_status_disambiguated",
+                        }
+                    )
+                    continue
+
             lag_before = float(raw_bag[i] - raw_px4[i])
             lag_after = float(raw_bag[i + 1] - raw_px4[i + 1])
             if lag_before >= 0.150 and -0.020 <= lag_after <= 0.050:
@@ -2092,7 +2295,11 @@ def validate_episode_data(
         rejection_reasons.append(f"missing_or_invalid_bag_timestamps ({missing_bag_ts_count})")
 
     # 2. Reconstruccion condicionada y verificacion estricta del reloj
-    clock_res = reconstruct_simulation_clock(ts_px4_raw_s, ts_bag_raw_s)
+    clock_res = reconstruct_simulation_clock(
+        ts_px4_raw_s,
+        ts_bag_raw_s,
+        timesync_status=telemetry.get("timesync_status"),
+    )
     ts_sim_s = clock_res["reconstructed_time_s"]
     timesync_offset_jumps = int(clock_res["num_repaired_steps"])
     unexplained_backsteps = int(clock_res["num_backsteps_or_duplicates"])

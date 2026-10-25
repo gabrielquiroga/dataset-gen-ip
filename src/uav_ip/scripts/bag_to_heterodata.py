@@ -56,7 +56,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple
 
 # Evitar contencion de hilos BLAS/OpenMP cuando se ejecuta con multiprocessing.Pool
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -91,6 +91,20 @@ try:
         rot_z,
         fps_numpy,
     )
+    from uav_ip.validation_geometry import (
+        COLLISION_SEGMENT_MAX_STEP_M,
+        TRAVERSE_CIRC_MAX_R,
+        TRAVERSE_MAX_ABS_Y,
+        TRAVERSE_MAX_ABS_Z,
+        UAV_COLLISION_RADIUS_XY,
+        compute_landmark_clearance,
+        subdivide_trajectory_segments,
+        world_to_landmark_local,
+    )
+    from uav_ip.validate_episode import (
+        load_episode_telemetry,
+        reconstruct_simulation_clock,
+    )
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent))
     from synthetic_lidar import (
@@ -102,6 +116,20 @@ except ImportError:
         quaternion_to_rot_matrix,
         rot_z,
         fps_numpy,
+    )
+    from validation_geometry import (
+        COLLISION_SEGMENT_MAX_STEP_M,
+        TRAVERSE_CIRC_MAX_R,
+        TRAVERSE_MAX_ABS_Y,
+        TRAVERSE_MAX_ABS_Z,
+        UAV_COLLISION_RADIUS_XY,
+        compute_landmark_clearance,
+        subdivide_trajectory_segments,
+        world_to_landmark_local,
+    )
+    from validate_episode import (
+        load_episode_telemetry,
+        reconstruct_simulation_clock,
     )
 
 # Librerias opcionales de rosbags (soporta rosbags >= 0.10, 0.11 y versiones legadas)
@@ -153,7 +181,11 @@ except ImportError:
 TOPIC_ODOM = "/fmu/out/vehicle_odometry"
 TOPIC_LOCAL_POS = "/fmu/out/vehicle_local_position_v1"
 TOPIC_SETPOINT = "/fmu/in/trajectory_setpoint"
+TOPIC_TIMESYNC = "/fmu/out/timesync_status"
 TOPIC_PCL_DEPRECATED = "/depth_camera/points"
+
+DEFAULT_RESAMPLE_HZ: float = 10.0
+DEFAULT_RESAMPLE_DT_S: float = 0.1
 
 
 def find_waypoints_file(bag_path: Path, explicit_path: Optional[Path] = None) -> Optional[Path]:
@@ -176,21 +208,32 @@ def find_waypoints_file(bag_path: Path, explicit_path: Optional[Path] = None) ->
 def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[Dict[str, Any]]]:
     """
     Parsea los mensajes de telemetria de PX4 desde el archivo .mcap.
-    Soporta rosbags 0.11+ (AnyReader / Typestore) y versiones anteriores.
+    Soporta rosbags 0.11+ (AnyReader / Typestore), versiones anteriores y fallback al
+    lector nativo verificado de `validate_episode.py` cuando `rosbags` no esta instalado.
     """
     if AnyReader is None and Reader is None:
-        detail = f": {_rosbags_err}" if _rosbags_err else ""
-        raise ImportError(
-            f"No se pudo cargar la libreria 'rosbags'{detail}. "
-            "Ejecuta: bash src/uav_ip/scripts/setup_venv_ip.sh"
-        )
+        try:
+            bundle = load_episode_telemetry(Path(bag_path), backend="auto")
+            return {
+                "odometry": list(bundle.get("odometry", [])),
+                "local_pos": list(bundle.get("local_pos", [])),
+                "setpoints": list(bundle.get("setpoints", [])),
+                "timesync_status": list(bundle.get("timesync_status", [])),
+            }
+        except Exception:
+            detail = f": {_rosbags_err}" if _rosbags_err else ""
+            raise ImportError(
+                f"No se pudo cargar la libreria 'rosbags'{detail}. "
+                "Ejecuta: bash src/uav_ip/scripts/setup_venv_ip.sh"
+            )
 
     if verbose:
         print(f"Leyendo rosbag desde: {bag_path}")
-    data = {
+    data: Dict[str, List[Dict[str, Any]]] = {
         "odometry": [],
         "local_pos": [],
-        "setpoints": []
+        "setpoints": [],
+        "timesync_status": [],
     }
 
     bag_p = Path(bag_path)
@@ -204,7 +247,20 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
         else:
             target_paths = [bag_p]
 
+        try:
+            from rosbags.typesys import get_types_from_msg
+        except ImportError:
+            get_types_from_msg = None
+
         with AnyReader(target_paths, default_typestore=_typestore) as reader:
+            if get_types_from_msg is not None and _typestore is not None:
+                for conn in reader.connections:
+                    if conn.msgdef and getattr(conn.msgdef, "data", None) and conn.msgtype not in _typestore.types:
+                        try:
+                            _typestore.register(get_types_from_msg(conn.msgdef.data, conn.msgtype))
+                        except Exception:
+                            pass
+
             for connection, timestamp, rawdata in reader.messages():
                 topic = connection.topic
 
@@ -213,11 +269,15 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     pos = list(msg.position) if hasattr(msg, "position") else [0.0, 0.0, 0.0]
                     q = list(msg.q) if hasattr(msg, "q") else [1.0, 0.0, 0.0, 0.0]
                     vel = list(msg.velocity) if hasattr(msg, "velocity") else [0.0, 0.0, 0.0]
+                    ts_us = int(getattr(msg, "timestamp", 0))
+                    ts_sample_us = int(getattr(msg, "timestamp_sample", ts_us))
                     data["odometry"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": ts_us,
+                        "timestamp_sample_us": ts_sample_us,
                         "position": pos,
                         "q": q,
-                        "velocity": vel
+                        "velocity": vel,
                     })
 
                 elif topic == TOPIC_LOCAL_POS:
@@ -226,12 +286,16 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     y = float(msg.y) if hasattr(msg, "y") else 0.0
                     z = float(msg.z) if hasattr(msg, "z") else 0.0
                     heading = float(msg.heading) if hasattr(msg, "heading") else 0.0
+                    ts_us = int(getattr(msg, "timestamp", 0))
+                    ts_sample_us = int(getattr(msg, "timestamp_sample", ts_us))
                     data["local_pos"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": ts_us,
+                        "timestamp_sample_us": ts_sample_us,
                         "x": x,
                         "y": y,
                         "z": z,
-                        "heading": heading
+                        "heading": heading,
                     })
 
                 elif topic == TOPIC_SETPOINT:
@@ -239,9 +303,28 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     sp_pos = list(msg.position) if hasattr(msg, "position") else [0.0, 0.0, 0.0]
                     sp_yaw = float(msg.yaw) if hasattr(msg, "yaw") else 0.0
                     data["setpoints"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": int(getattr(msg, "timestamp", 0)),
                         "position": sp_pos,
-                        "yaw": sp_yaw
+                        "yaw": sp_yaw,
+                    })
+
+                elif topic == TOPIC_TIMESYNC:
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    est_offset = int(getattr(msg, "estimated_offset", 0))
+                    obs_offset = int(getattr(msg, "observed_offset", 0))
+                    remote_ts = int(getattr(msg, "remote_timestamp", 0))
+                    data["timesync_status"].append({
+                        "timestamp": int(timestamp),
+                        "timestamp_us": int(getattr(msg, "timestamp", 0)),
+                        "source_protocol": int(getattr(msg, "source_protocol", 0)),
+                        "remote_timestamp": remote_ts,
+                        "remote_timestamp_us": remote_ts,
+                        "observed_offset": obs_offset,
+                        "observed_offset_us": obs_offset,
+                        "estimated_offset": est_offset,
+                        "estimated_offset_us": est_offset,
+                        "round_trip_time": int(getattr(msg, "round_trip_time", 0)),
                     })
     else:
         deserializer = _typestore.deserialize_cdr if _typestore is not None else deserialize_cdr
@@ -257,11 +340,15 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     pos = list(msg.position) if hasattr(msg, "position") else [0.0, 0.0, 0.0]
                     q = list(msg.q) if hasattr(msg, "q") else [1.0, 0.0, 0.0, 0.0]
                     vel = list(msg.velocity) if hasattr(msg, "velocity") else [0.0, 0.0, 0.0]
+                    ts_us = int(getattr(msg, "timestamp", 0))
+                    ts_sample_us = int(getattr(msg, "timestamp_sample", ts_us))
                     data["odometry"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": ts_us,
+                        "timestamp_sample_us": ts_sample_us,
                         "position": pos,
                         "q": q,
-                        "velocity": vel
+                        "velocity": vel,
                     })
 
                 elif topic == TOPIC_LOCAL_POS:
@@ -270,12 +357,16 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     y = float(msg.y) if hasattr(msg, "y") else 0.0
                     z = float(msg.z) if hasattr(msg, "z") else 0.0
                     heading = float(msg.heading) if hasattr(msg, "heading") else 0.0
+                    ts_us = int(getattr(msg, "timestamp", 0))
+                    ts_sample_us = int(getattr(msg, "timestamp_sample", ts_us))
                     data["local_pos"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": ts_us,
+                        "timestamp_sample_us": ts_sample_us,
                         "x": x,
                         "y": y,
                         "z": z,
-                        "heading": heading
+                        "heading": heading,
                     })
 
                 elif topic == TOPIC_SETPOINT:
@@ -283,9 +374,28 @@ def parse_bag_telemetry(bag_path: Path, verbose: bool = True) -> Dict[str, List[
                     sp_pos = list(msg.position) if hasattr(msg, "position") else [0.0, 0.0, 0.0]
                     sp_yaw = float(msg.yaw) if hasattr(msg, "yaw") else 0.0
                     data["setpoints"].append({
-                        "timestamp": timestamp,
+                        "timestamp": int(timestamp),
+                        "timestamp_us": int(getattr(msg, "timestamp", 0)),
                         "position": sp_pos,
-                        "yaw": sp_yaw
+                        "yaw": sp_yaw,
+                    })
+
+                elif topic == TOPIC_TIMESYNC:
+                    msg = deserializer(rawdata, connection.msgtype)
+                    est_offset = int(getattr(msg, "estimated_offset", 0))
+                    obs_offset = int(getattr(msg, "observed_offset", 0))
+                    remote_ts = int(getattr(msg, "remote_timestamp", 0))
+                    data["timesync_status"].append({
+                        "timestamp": int(timestamp),
+                        "timestamp_us": int(getattr(msg, "timestamp", 0)),
+                        "source_protocol": int(getattr(msg, "source_protocol", 0)),
+                        "remote_timestamp": remote_ts,
+                        "remote_timestamp_us": remote_ts,
+                        "observed_offset": obs_offset,
+                        "observed_offset_us": obs_offset,
+                        "estimated_offset": est_offset,
+                        "estimated_offset_us": est_offset,
+                        "round_trip_time": int(getattr(msg, "round_trip_time", 0)),
                     })
 
     if verbose:
@@ -432,6 +542,164 @@ def compute_flight_state(
     return state
 
 
+def compute_action_valid_mask(
+    T: int,
+    horizon: int = 8,
+    action_stride: int = 1,
+) -> np.ndarray:
+    """
+    Construye el tensor booleano `valid_mask` de dimensiones `(T, horizon)` que indica
+    explicitamente cuales pasos futuros del horizonte tienen trayectoria real (`t + k * stride < T`)
+    y cuales pertenecen al tramo terminal clampeado a la pose estacionaria de aterrizaje.
+    """
+    stride = max(1, int(action_stride))
+    mask = np.zeros((T, horizon), dtype=bool)
+    for t in range(T):
+        for k in range(1, horizon + 1):
+            mask[t, k - 1] = bool((t + k * stride) < T)
+    return mask
+
+
+def _slerp_quaternions(
+    t_raw: np.ndarray,
+    q_raw: np.ndarray,
+    t_grid: np.ndarray,
+) -> np.ndarray:
+    """
+    Interpola cuaterniones unitarios `[qw, qx, qy, qz]` sobre `t_grid` mediante SLERP
+    garantizando continuidad antipodal (`q` y `-q` representan la misma rotacion).
+    """
+    q_arr = np.asarray(q_raw, dtype=np.float64).copy()
+    N = len(q_arr)
+    if N == 0:
+        return np.zeros((len(t_grid), 4), dtype=np.float32)
+    if N == 1:
+        q0 = q_arr[0] / max(1e-12, float(np.linalg.norm(q_arr[0])))
+        return np.tile(q0.astype(np.float32), (len(t_grid), 1))
+
+    # Normalizar y asegurar continuidad de signo en la serie original
+    for i in range(N):
+        nrm = float(np.linalg.norm(q_arr[i]))
+        if nrm > 1e-12:
+            q_arr[i] /= nrm
+        else:
+            q_arr[i] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        if i > 0 and float(np.dot(q_arr[i - 1], q_arr[i])) < 0.0:
+            q_arr[i] = -q_arr[i]
+
+    idx_hi = np.clip(np.searchsorted(t_raw, t_grid, side="right"), 1, N - 1)
+    idx_lo = idx_hi - 1
+
+    t0 = t_raw[idx_lo]
+    t1 = t_raw[idx_hi]
+    denom = np.maximum(1e-12, t1 - t0)
+    alpha = np.clip((t_grid - t0) / denom, 0.0, 1.0)
+
+    out = np.zeros((len(t_grid), 4), dtype=np.float64)
+    for j in range(len(t_grid)):
+        qa = q_arr[idx_lo[j]]
+        qb = q_arr[idx_hi[j]]
+        dot = float(np.dot(qa, qb))
+        if dot < 0.0:
+            qb = -qb
+            dot = -dot
+        u = float(alpha[j])
+        if dot > 0.9995:
+            q_interp = (1.0 - u) * qa + u * qb
+        else:
+            theta_0 = math.acos(min(1.0, max(-1.0, dot)))
+            sin_theta_0 = math.sin(theta_0)
+            theta = theta_0 * u
+            s0 = math.cos(theta) - dot * math.sin(theta) / sin_theta_0
+            s1 = math.sin(theta) / sin_theta_0
+            q_interp = s0 * qa + s1 * qb
+        nrm = float(np.linalg.norm(q_interp))
+        out[j] = q_interp / max(1e-12, nrm)
+
+    return out.astype(np.float32)
+
+
+def resample_trajectory_10hz(
+    reconstructed_time_s: np.ndarray,
+    pos_enu_m: np.ndarray,
+    yaw_enu: np.ndarray,
+    q_ned: Optional[np.ndarray] = None,
+    target_hz: float = DEFAULT_RESAMPLE_HZ,
+) -> Dict[str, np.ndarray]:
+    """
+    Remuestrea uniformemente en el tiempo una trayectoria sobre `reconstructed_time_s`
+    a una grilla fija de `target_hz` (por defecto 10 Hz, Δt = 0.1 s):
+      - Posiciones 3D: interpolacion lineal en cada eje ENU.
+      - Rumbo (`yaw_enu`): desenvolvimiento de fase (`np.unwrap`) antes de interpolar
+        linealmente para evitar singularidades en ±pi, reajustando luego a [-pi, pi)
+        y reconstruyendo analiticamente `rot_enu = R_z(yaw) in SO(3)`.
+      - Cuaterniones (`q_ned`): SLERP antipodalmente continuo.
+    """
+    t_raw = np.asarray(reconstructed_time_s, dtype=np.float64).reshape(-1)
+    pos_raw = np.asarray(pos_enu_m, dtype=np.float64)
+    yaw_raw = np.asarray(yaw_enu, dtype=np.float64).reshape(-1)
+
+    N = len(t_raw)
+    dt_s = 1.0 / float(target_hz)
+    if N == 0:
+        return {
+            "timestamps_s": np.zeros((0,), dtype=np.float64),
+            "pos_enu_m": np.zeros((0, 3), dtype=np.float64),
+            "yaw_enu": np.zeros((0, 1), dtype=np.float32),
+            "rot_enu": np.zeros((0, 3, 3), dtype=np.float32),
+            "q_ned": np.zeros((0, 4), dtype=np.float32),
+            "dt_s": np.float32(dt_s),
+        }
+
+    # Normalizar origen temporal a 0.0 s y garantizar monotonia estricta para np.interp
+    t_rel = t_raw - float(t_raw[0])
+    for i in range(1, N):
+        if t_rel[i] <= t_rel[i - 1]:
+            t_rel[i] = t_rel[i - 1] + 1e-6
+
+    duration_s = float(t_rel[-1])
+    if duration_s < dt_s * 0.5 or N == 1:
+        t_grid = np.array([0.0], dtype=np.float64)
+    else:
+        num_steps = int(math.floor((duration_s + 1e-9) / dt_s)) + 1
+        t_grid = np.arange(num_steps, dtype=np.float64) * dt_s
+        t_grid = t_grid[t_grid <= duration_s + 1e-9]
+        if len(t_grid) > 0 and t_grid[-1] > duration_s:
+            t_grid[-1] = duration_s
+
+    T_grid = len(t_grid)
+    pos_interp = np.zeros((T_grid, 3), dtype=np.float64)
+    for d in range(3):
+        pos_interp[:, d] = np.interp(t_grid, t_rel, pos_raw[:, d])
+
+    yaw_unwrapped = np.unwrap(yaw_raw)
+    yaw_interp_unwrapped = np.interp(t_grid, t_rel, yaw_unwrapped)
+    # Reajustar a [-pi, pi)
+    yaw_wrapped = np.arctan2(np.sin(yaw_interp_unwrapped), np.cos(yaw_interp_unwrapped))
+    yaw_wrapped = np.where(yaw_wrapped >= math.pi, yaw_wrapped - 2.0 * math.pi, yaw_wrapped)
+
+    rot_interp = np.zeros((T_grid, 3, 3), dtype=np.float32)
+    for k in range(T_grid):
+        rot_interp[k] = rot_z(float(yaw_wrapped[k])).astype(np.float32)
+
+    if q_ned is not None and len(q_ned) == N:
+        q_interp = _slerp_quaternions(t_rel, q_ned, t_grid)
+    else:
+        q_interp = np.zeros((T_grid, 4), dtype=np.float32)
+        for k in range(T_grid):
+            half_y = 0.5 * float(yaw_wrapped[k])
+            q_interp[k] = [math.cos(half_y), 0.0, 0.0, math.sin(half_y)]
+
+    return {
+        "timestamps_s": t_grid,
+        "pos_enu_m": pos_interp,
+        "yaw_enu": yaw_wrapped.reshape(-1, 1).astype(np.float32),
+        "rot_enu": rot_interp,
+        "q_ned": q_interp,
+        "dt_s": np.float32(dt_s),
+    }
+
+
 def compute_se3_action_horizon(
     pos_enu_scaled: np.ndarray,
     yaw_enu: np.ndarray,
@@ -485,6 +753,102 @@ def compute_se3_action_horizon(
     return pose_se3, action_se3, action_local
 
 
+def _is_perturbation_safe(
+    p_nom_m: np.ndarray,
+    tilde_p_m: np.ndarray,
+    p_next_m: np.ndarray,
+    landmarks: Sequence[Dict[str, Any]],
+    max_pos_dev: float = 0.60,
+    min_clearance_m: float = UAV_COLLISION_RADIUS_XY,
+) -> bool:
+    """
+    Verifica que una perturbacion candidata `tilde_p_m` para Tube Augmentation cumpla:
+      1. Cota esferica euclidea solida: `||tilde_p_m - p_nom_m||_2 <= max_pos_dev` (0.60 m).
+      2. Clearance contra todos los obstaculos (`compute_landmark_clearance`) >= `UAV_COLLISION_RADIUS_XY` (0.30 m)
+         tanto en la pose perturbada como a lo largo de la cuerda recta de recuperacion hacia `p_next_m`.
+      3. Transitabilidad en puertas (`traverse`): si la pose nominal o la cuerda de recuperacion
+         atraviesa el plano o vecindad axial de una puerta, la pose perturbada y el cruce del plano
+         deben permanecer dentro de la apertura libre del aro sin colisionar con el marco.
+    """
+    dp = np.asarray(tilde_p_m, dtype=np.float64) - np.asarray(p_nom_m, dtype=np.float64)
+    if float(np.linalg.norm(dp)) > float(max_pos_dev) + 1e-9:
+        return False
+
+    if not landmarks:
+        return True
+
+    chord = np.vstack([
+        np.asarray(tilde_p_m, dtype=np.float64).reshape(1, 3),
+        np.asarray(p_next_m, dtype=np.float64).reshape(1, 3),
+    ])
+
+    for lm in landmarks:
+        cl = compute_landmark_clearance(
+            chord,
+            lm,
+            max_step_m=COLLISION_SEGMENT_MAX_STEP_M,
+        )
+        if float(cl["lower_bound_distance_m"]) < float(min_clearance_m):
+            return False
+
+        l_type = str(lm.get("type", "gate"))
+        l_action = str(lm.get("action", "traverse")).lower()
+        if l_type in ("gate", "square_gate", "circular_gate") and l_action == "traverse":
+            pts_check = np.vstack([
+                np.asarray(p_nom_m, dtype=np.float64).reshape(1, 3),
+                np.asarray(tilde_p_m, dtype=np.float64).reshape(1, 3),
+                np.asarray(p_next_m, dtype=np.float64).reshape(1, 3),
+            ])
+            local_pts = world_to_landmark_local(
+                pts_check,
+                float(lm["x"]),
+                float(lm["y"]),
+                float(lm.get("z", 1.5)),
+                float(lm.get("yaw", 0.0)),
+            )
+            nom_local = local_pts[0]
+            pert_local = local_pts[1]
+            next_local = local_pts[2]
+
+            if l_type == "circular_gate":
+                nom_in_aperture = math.hypot(float(nom_local[1]), float(nom_local[2])) <= TRAVERSE_CIRC_MAX_R + 0.15
+            else:
+                nom_in_aperture = (
+                    abs(float(nom_local[1])) <= TRAVERSE_MAX_ABS_Y + 0.15
+                    and abs(float(nom_local[2])) <= TRAVERSE_MAX_ABS_Z + 0.15
+                )
+
+            # Si el punto nominal esta en la vecindad axial de cruce de la puerta, exigir que
+            # la perturbacion lateral no saque al dron fuera de la apertura libre del aro
+            if abs(float(nom_local[0])) <= 0.60 and nom_in_aperture:
+                if l_type == "circular_gate":
+                    if math.hypot(float(pert_local[1]), float(pert_local[2])) > TRAVERSE_CIRC_MAX_R:
+                        return False
+                else:
+                    if (
+                        abs(float(pert_local[1])) > TRAVERSE_MAX_ABS_Y
+                        or abs(float(pert_local[2])) > TRAVERSE_MAX_ABS_Z
+                    ):
+                        return False
+
+            # Si la cuerda de recuperacion cruza el plano x_local = 0 de la puerta, verificar
+            # que el punto de interseccion pase por dentro de la apertura libre del aro
+            x0, x1 = float(pert_local[0]), float(next_local[0])
+            if (x0 <= 0.0 <= x1 or x1 <= 0.0 <= x0) and abs(x1 - x0) > 1e-6:
+                alpha = -x0 / (x1 - x0)
+                y_cross = float(pert_local[1]) + alpha * float(next_local[1] - pert_local[1])
+                z_cross = float(pert_local[2]) + alpha * float(next_local[2] - pert_local[2])
+                if math.hypot(y_cross, z_cross) <= 1.25:
+                    if l_type == "circular_gate":
+                        if math.hypot(y_cross, z_cross) > TRAVERSE_CIRC_MAX_R:
+                            return False
+                    else:
+                        if abs(y_cross) > TRAVERSE_MAX_ABS_Y or abs(z_cross) > TRAVERSE_MAX_ABS_Z:
+                            return False
+
+    return True
+
+
 def compute_tube_augmentation(
     pos_enu_m: np.ndarray,
     yaw_enu: np.ndarray,
@@ -509,11 +873,14 @@ def compute_tube_augmentation(
     Aumento de Datos Sintetico para Recuperacion (30% Tube Augmentation, Instant Policy Apendices D y E).
 
     Para una fraccion p_aug = tube_aug_prob (default: 0.30) de los instantes t de la trayectoria:
-      1. Muestrea una perturbacion local de posicion \delta p ~ N(0, \sigma_p^2 I) (\sigma_p = 0.25 m)
-         y orientacion \delta \psi ~ N(0, \sigma_\psi^2) (\sigma_\psi = 5 deg), y con probabilidad
+      1. Muestrea por rechazo una perturbacion local de posicion \delta p ~ N(0, \sigma_p^2 I)
+         (\sigma_p = 0.25 m) dentro de la esfera euclidea solida ||\delta p||_2 <= max_pos_dev (0.60 m),
+         verificando clearance >= UAV_COLLISION_RADIUS_XY (0.30 m) contra todos los landmarks
+         (`compute_landmark_clearance`) y transitabilidad libre en maniobras `traverse` de puertas.
+      2. Muestrea orientacion \delta \psi ~ N(0, \sigma_\psi^2) (\sigma_\psi = 5 deg), y con probabilidad
          state_flip_prob = 0.10 invierte el estado binario de entrada \tilde{s}_t = 1 - s_t.
-      2. Sintetiza analiticamente la observacion LiDAR 360° en la pose perturbada \tilde{T}_{WE}^t.
-      3. Calcula el horizonte de acciones correctivas hacia las poses futuras nominales:
+      3. Sintetiza analiticamente la observacion LiDAR 360° en la pose perturbada \tilde{T}_{WE}^t.
+      4. Calcula el horizonte de acciones correctivas hacia las poses futuras nominales:
              \tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t + k * stride},   k = 1, ..., horizon
          garantizando que el flujo de accion apunte convergentemente de regreso a la trayectoria experta.
     """
@@ -534,6 +901,7 @@ def compute_tube_augmentation(
             "y": np.zeros((0, horizon, 5), dtype=np.float32),
             "action_se3": np.zeros((0, horizon, 4, 4), dtype=np.float32),
             "target_pos_enu": np.zeros((0, horizon, 3), dtype=np.float32),
+            "valid_mask": np.zeros((0, horizon), dtype=bool),
         }
 
     rng = np.random.RandomState((int(ep_seed) * 9973 + 17) % (2**31 - 1))
@@ -564,45 +932,80 @@ def compute_tube_augmentation(
             extra_c = int(remaining[rng.randint(0, len(remaining))])
             aug_indices = np.array(sorted(list(aug_indices) + [extra_c]), dtype=np.int64)
 
-    T_aug = len(aug_indices)
-    aug_mask = np.zeros(T, dtype=np.uint8)
-    aug_mask[aug_indices] = 1
-
     yaw_flat = np.asarray(yaw_enu, dtype=np.float64).reshape(-1)
     s_flat = np.asarray(flight_state, dtype=np.float32).reshape(-1)
     pos_scaled = (pos_enu_m * float(scale_factor)).astype(np.float64)
+    full_valid_mask = compute_action_valid_mask(T, horizon=horizon, action_stride=action_stride)
 
     sigma_yaw_rad = math.radians(float(tube_sigma_yaw_deg))
     max_yaw_rad = math.radians(float(max_yaw_dev_deg))
+    max_r = float(max_pos_dev)
 
-    aug_scene_pos = np.zeros((T_aug, fps_pts, 3), dtype=np.float32)
-    aug_pos_enu = np.zeros((T_aug, 3), dtype=np.float32)
-    aug_yaw_enu = np.zeros((T_aug, 1), dtype=np.float32)
-    aug_rot_enu = np.zeros((T_aug, 3, 3), dtype=np.float32)
-    aug_pose_se3 = np.zeros((T_aug, 4, 4), dtype=np.float32)
-    aug_delta_pos_m = np.zeros((T_aug, 3), dtype=np.float32)
-    aug_delta_yaw = np.zeros((T_aug, 1), dtype=np.float32)
-    aug_flight_state_in = np.zeros((T_aug, 1), dtype=np.float32)
-    aug_action_local = np.zeros((T_aug, horizon, 5), dtype=np.float32)
-    aug_action_se3 = np.zeros((T_aug, horizon, 4, 4), dtype=np.float32)
-    aug_target_pos_enu = np.zeros((T_aug, horizon, 3), dtype=np.float32)
+    accepted_indices: List[int] = []
+    aug_scene_pos_list: List[np.ndarray] = []
+    aug_pos_enu_list: List[np.ndarray] = []
+    aug_yaw_enu_list: List[np.ndarray] = []
+    aug_rot_enu_list: List[np.ndarray] = []
+    aug_pose_se3_list: List[np.ndarray] = []
+    aug_delta_pos_m_list: List[np.ndarray] = []
+    aug_delta_yaw_list: List[np.ndarray] = []
+    aug_flight_state_in_list: List[np.ndarray] = []
+    aug_action_local_list: List[np.ndarray] = []
+    aug_action_se3_list: List[np.ndarray] = []
+    aug_target_pos_enu_list: List[np.ndarray] = []
 
     for i, t_idx in enumerate(aug_indices):
         t = int(t_idx)
         p_nom_m = pos_enu_m[t].astype(np.float64)
+        t_next = min(T - 1, t + max(1, int(action_stride)))
+        p_next_m = pos_enu_m[t_next].astype(np.float64)
         yaw_nom = float(yaw_flat[t])
 
-        # Perturbacion gaussiana acotada en posicion (m) y yaw (rad)
-        dp_m = rng.normal(0.0, float(tube_sigma_pos), size=3)
-        dp_m = np.clip(dp_m, -float(max_pos_dev), float(max_pos_dev))
-        # Garantizar una desviacion transversal/vertical minima no trivial (>= 5 cm) para entrenamiento util
-        if np.linalg.norm(dp_m) < 0.05:
-            dp_m[1] = 0.15 if (i % 2 == 0) else -0.15
+        # Muestreo por rechazo en esfera euclidea solida ||dp||_2 <= max_pos_dev (0.60 m)
+        # con verificacion de clearance >= UAV_COLLISION_RADIUS_XY (0.30 m) y apertura de puertas.
+        found_safe = False
+        dp_m = np.zeros(3, dtype=np.float64)
+        tilde_p_m = p_nom_m.copy()
 
-        tilde_p_m = p_nom_m + dp_m
-        if tilde_p_m[2] < min_safe_alt:
-            tilde_p_m[2] = float(min_safe_alt)
-            dp_m[2] = tilde_p_m[2] - p_nom_m[2]
+        for attempt in range(96):
+            scale_try = 1.0 if attempt < 64 else max(0.20, 1.0 - (attempt - 60) * 0.02)
+            cand_dp = rng.normal(0.0, float(tube_sigma_pos) * scale_try, size=3)
+            norm_dp = float(np.linalg.norm(cand_dp))
+            if norm_dp > max_r:
+                if attempt < 64:
+                    continue
+                cand_dp = cand_dp * (max_r * 0.85 / max(1e-9, norm_dp))
+                norm_dp = float(np.linalg.norm(cand_dp))
+
+            # Garantizar desviacion minima no trivial (>= 5 cm) para entrenamiento util
+            if norm_dp < 0.05:
+                cand_dp = np.array([0.0, 0.15 if ((i + attempt) % 2 == 0) else -0.15, 0.0], dtype=np.float64)
+                if float(np.linalg.norm(cand_dp)) > max_r:
+                    cand_dp = cand_dp * (max_r / float(np.linalg.norm(cand_dp)))
+
+            cand_tilde_p = p_nom_m + cand_dp
+            if cand_tilde_p[2] < min_safe_alt:
+                cand_tilde_p[2] = float(min_safe_alt)
+                cand_dp = cand_tilde_p - p_nom_m
+                if float(np.linalg.norm(cand_dp)) > max_r:
+                    continue
+
+            if _is_perturbation_safe(
+                p_nom_m=p_nom_m,
+                tilde_p_m=cand_tilde_p,
+                p_next_m=p_next_m,
+                landmarks=landmarks,
+                max_pos_dev=max_r,
+                min_clearance_m=UAV_COLLISION_RADIUS_XY,
+            ):
+                dp_m = cand_dp
+                tilde_p_m = cand_tilde_p
+                found_safe = True
+                break
+
+        if not found_safe:
+            # Si ninguna perturbacion en t cumple el margen de colision, descartar este instante
+            continue
 
         dyaw_pert = float(np.clip(rng.normal(0.0, sigma_yaw_rad), -max_yaw_rad, max_yaw_rad))
         tilde_yaw = _wrap_angle(yaw_nom + dyaw_pert)
@@ -632,14 +1035,9 @@ def compute_tube_augmentation(
             gravity_aligned=gravity_aligned,
         )
 
-        aug_scene_pos[i] = tilde_cloud
-        aug_pos_enu[i] = tilde_p_scaled.astype(np.float32)
-        aug_yaw_enu[i, 0] = float(tilde_yaw)
-        aug_rot_enu[i] = tilde_R.astype(np.float32)
-        aug_pose_se3[i] = T_we_pert.astype(np.float32)
-        aug_delta_pos_m[i] = dp_m.astype(np.float32)
-        aug_delta_yaw[i, 0] = float(dyaw_pert)
-        aug_flight_state_in[i, 0] = float(s_in)
+        act_local_step = np.zeros((horizon, 5), dtype=np.float32)
+        act_se3_step = np.zeros((horizon, 4, 4), dtype=np.float32)
+        target_pos_step = np.zeros((horizon, 3), dtype=np.float32)
 
         # Accion correctiva relativa \tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t+k}
         for k in range(1, horizon + 1):
@@ -654,26 +1052,64 @@ def compute_tube_augmentation(
             T_ea_corr[:3, :3] = R_rel_corr.astype(np.float32)
             T_ea_corr[:3, 3] = dp_flu.astype(np.float32)
 
-            aug_action_se3[i, k - 1] = T_ea_corr
-            aug_action_local[i, k - 1, 0:3] = dp_flu.astype(np.float32)
-            aug_action_local[i, k - 1, 3] = float(dyaw_corr)
-            aug_action_local[i, k - 1, 4] = float(s_flat[tk])
-            aug_target_pos_enu[i, k - 1] = p_tk.astype(np.float32)
+            act_se3_step[k - 1] = T_ea_corr
+            act_local_step[k - 1, 0:3] = dp_flu.astype(np.float32)
+            act_local_step[k - 1, 3] = float(dyaw_corr)
+            act_local_step[k - 1, 4] = float(s_flat[tk])
+            target_pos_step[k - 1] = p_tk.astype(np.float32)
+
+        accepted_indices.append(t)
+        aug_scene_pos_list.append(tilde_cloud.astype(np.float32))
+        aug_pos_enu_list.append(tilde_p_scaled.astype(np.float32))
+        aug_yaw_enu_list.append(np.array([float(tilde_yaw)], dtype=np.float32))
+        aug_rot_enu_list.append(tilde_R.astype(np.float32))
+        aug_pose_se3_list.append(T_we_pert.astype(np.float32))
+        aug_delta_pos_m_list.append(dp_m.astype(np.float32))
+        aug_delta_yaw_list.append(np.array([float(dyaw_pert)], dtype=np.float32))
+        aug_flight_state_in_list.append(np.array([float(s_in)], dtype=np.float32))
+        aug_action_local_list.append(act_local_step)
+        aug_action_se3_list.append(act_se3_step)
+        aug_target_pos_enu_list.append(target_pos_step)
+
+    final_aug_indices = np.array(accepted_indices, dtype=np.int64)
+    N_acc = len(final_aug_indices)
+    aug_mask = np.zeros(T, dtype=np.uint8)
+    if N_acc > 0:
+        aug_mask[final_aug_indices] = 1
+
+    if N_acc == 0:
+        return {
+            "aug_mask": aug_mask,
+            "timestep_idx": final_aug_indices,
+            "scene_pos": np.zeros((0, fps_pts, 3), dtype=np.float32),
+            "pos_enu": np.zeros((0, 3), dtype=np.float32),
+            "yaw_enu": np.zeros((0, 1), dtype=np.float32),
+            "rot_enu": np.zeros((0, 3, 3), dtype=np.float32),
+            "pose_se3": np.zeros((0, 4, 4), dtype=np.float32),
+            "delta_pos_m": np.zeros((0, 3), dtype=np.float32),
+            "delta_yaw": np.zeros((0, 1), dtype=np.float32),
+            "flight_state_in": np.zeros((0, 1), dtype=np.float32),
+            "y": np.zeros((0, horizon, 5), dtype=np.float32),
+            "action_se3": np.zeros((0, horizon, 4, 4), dtype=np.float32),
+            "target_pos_enu": np.zeros((0, horizon, 3), dtype=np.float32),
+            "valid_mask": np.zeros((0, horizon), dtype=bool),
+        }
 
     return {
         "aug_mask": aug_mask,
-        "timestep_idx": aug_indices,
-        "scene_pos": aug_scene_pos,
-        "pos_enu": aug_pos_enu,
-        "yaw_enu": aug_yaw_enu,
-        "rot_enu": aug_rot_enu,
-        "pose_se3": aug_pose_se3,
-        "delta_pos_m": aug_delta_pos_m,
-        "delta_yaw": aug_delta_yaw,
-        "flight_state_in": aug_flight_state_in,
-        "y": aug_action_local,
-        "action_se3": aug_action_se3,
-        "target_pos_enu": aug_target_pos_enu,
+        "timestep_idx": final_aug_indices,
+        "scene_pos": np.stack(aug_scene_pos_list, axis=0),
+        "pos_enu": np.stack(aug_pos_enu_list, axis=0),
+        "yaw_enu": np.stack(aug_yaw_enu_list, axis=0),
+        "rot_enu": np.stack(aug_rot_enu_list, axis=0),
+        "pose_se3": np.stack(aug_pose_se3_list, axis=0),
+        "delta_pos_m": np.stack(aug_delta_pos_m_list, axis=0),
+        "delta_yaw": np.stack(aug_delta_yaw_list, axis=0),
+        "flight_state_in": np.stack(aug_flight_state_in_list, axis=0),
+        "y": np.stack(aug_action_local_list, axis=0),
+        "action_se3": np.stack(aug_action_se3_list, axis=0),
+        "target_pos_enu": np.stack(aug_target_pos_enu_list, axis=0),
+        "valid_mask": full_valid_mask[final_aug_indices],
     }
 
 
@@ -785,6 +1221,64 @@ def _extract_episode_seed(waypoints_file: Path, wp_cfg: Dict[str, Any]) -> int:
     return 42
 
 
+def _extract_reconstructed_time_s(
+    odom_list: Sequence[Dict[str, Any]],
+    timesync_status: Optional[Sequence[Dict[str, Any]]] = None,
+) -> np.ndarray:
+    """
+    Reconstruye el eje temporal fisico en segundos `reconstructed_time_s` usando
+    `reconstruct_simulation_clock` de `uav_ip.validate_episode`.
+    """
+    N = len(odom_list)
+    if N == 0:
+        return np.zeros((0,), dtype=np.float64)
+
+    ts_px4_s = np.zeros(N, dtype=np.float64)
+    ts_bag_s = np.zeros(N, dtype=np.float64)
+    for i, item in enumerate(odom_list):
+        raw_bag = float(item.get("timestamp", 0.0))
+        t_b = raw_bag * 1e-9 if raw_bag > 1e12 else raw_bag
+        ts_bag_s[i] = t_b
+
+        ts_sample_us = int(item.get("timestamp_sample_us", 0))
+        ts_us = int(item.get("timestamp_us", 0))
+        px4_us = ts_sample_us if ts_sample_us > 0 else ts_us
+        if px4_us > 0:
+            ts_px4_s[i] = float(px4_us) * 1e-6
+        else:
+            ts_px4_s[i] = t_b if t_b > 0.0 else float(i) * 0.008
+
+    if np.all(ts_bag_s <= 0.0):
+        ts_bag_s = ts_px4_s.copy()
+
+    clock_res = reconstruct_simulation_clock(
+        ts_px4_s,
+        ts_bag_s,
+        timesync_status=timesync_status,
+    )
+    rec_t = clock_res.get("reconstructed_time_s")
+    if rec_t is not None and len(rec_t) == N and np.all(np.isfinite(rec_t)):
+        rec_arr = np.asarray(rec_t, dtype=np.float64).copy()
+        # Si algun paso legado tuviera dt <= 0 (p. ej. bags previos a Fase 1.1 procesados con --include-failed),
+        # reemplazar unicamente pasos no positivos por dt_bag positivo para interpolacion bien definida.
+        dt_rec = np.diff(rec_arr)
+        if np.any(dt_rec <= 0.0) or np.any(dt_rec > 0.20):
+            dt_b = np.diff(ts_bag_s)
+            for k in range(len(dt_rec)):
+                if (dt_rec[k] <= 0.0 or dt_rec[k] > 0.20) and 0.0 < dt_b[k] <= 0.20:
+                    dt_rec[k] = dt_b[k]
+                elif dt_rec[k] <= 0.0:
+                    dt_rec[k] = 1e-4
+            rec_arr = np.concatenate([[0.0], np.cumsum(dt_rec)])
+        return rec_arr
+
+    t_fallback = ts_bag_s - float(ts_bag_s[0])
+    for i in range(1, N):
+        if t_fallback[i] <= t_fallback[i - 1]:
+            t_fallback[i] = t_fallback[i - 1] + 0.008
+    return t_fallback
+
+
 def build_heterodata_from_synthetic_lidar(
     parsed_data: Dict[str, Any],
     waypoints_file: Path,
@@ -804,12 +1298,15 @@ def build_heterodata_from_synthetic_lidar(
     tube_sigma_pos: float = 0.25,
     tube_sigma_yaw_deg: float = 5.0,
     state_flip_prob: float = 0.10,
+    target_hz: float = DEFAULT_RESAMPLE_HZ,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Construye el HeteroData usando SyntheticLidarGenerator en marco Horizontal FLU,
-    calcula las acciones relativas SE(3) en horizonte T=8, extrae L=10 keyframes geometricos
-    e inyecta el 30% de Tube Augmentation para recuperacion en vuelo cerrado.
+    remuestreando uniformemente la trayectoria sobre `reconstructed_time_s` a 10 Hz (Δt = 0.1 s)
+    para que el horizonte T=8 cubra exactamente 0.8 s, calcula las acciones relativas SE(3)
+    con su mascara terminal `valid_mask` (T, 8), extrae L=10 keyframes geometricos
+    e inyecta el 30% de Tube Augmentation filtrado por esfera euclidea y clearance de colision.
     """
     with open(waypoints_file, "r") as f:
         wp_cfg = yaml.safe_load(f)
@@ -861,74 +1358,99 @@ def build_heterodata_from_synthetic_lidar(
             print(f"  Recorte de vuelo util aplicado: [{start_idx}:{end_idx}] "
                   f"({len(odom_list)} de {total_raw} muestras conservadas).")
 
-    sampled_indices = list(range(0, len(odom_list), max(1, subsample_step)))
-    T = len(sampled_indices)
-    if verbose:
-        print(f"Generando nubes LiDAR sinteticas 360° (gravity_aligned={gravity_aligned}) para T={T} instantes...")
+    # Extraer poses crudas y reconstruir el reloj de simulacion
+    N_raw = len(odom_list)
+    raw_pos_enu = np.zeros((N_raw, 3), dtype=np.float64)
+    raw_yaw_enu = np.zeros(N_raw, dtype=np.float64)
+    raw_q_ned = np.zeros((N_raw, 4), dtype=np.float64)
 
-    pos_enu_m_list = []
-    yaw_enu_list = []
-    rot_enu_list = []
-    q_ned_list = []
-    scene_pointclouds = []
-
-    for step_i, idx in enumerate(sampled_indices):
-        item = odom_list[idx]
+    for i, item in enumerate(odom_list):
         if not using_local_pos:
             pos_ned = item["position"]
             q_ned = [float(item["q"][0]), float(item["q"][1]), float(item["q"][2]), float(item["q"][3])]
             p_enu, R_full = px4_odometry_to_gazebo_enu(pos_ned, q_ned, gravity_aligned=False)
             yaw_val = extract_yaw_from_rot_matrix(R_full)
-            R_stab = rot_z(yaw_val)
-            drone_pose = {
-                "x": float(p_enu[0]),
-                "y": float(p_enu[1]),
-                "z": float(p_enu[2]),
-                "yaw": float(yaw_val),
-                "R": R_stab if gravity_aligned else R_full,
-                "q_ned": q_ned,
-            }
         else:
             p_ned = [item["x"], item["y"], item["z"]]
             p_enu = ned_to_gazebo_enu(p_ned)
             yaw_val = _wrap_angle(yaw_ned_to_gazebo_enu(item["heading"]))
-            R_stab = rot_z(yaw_val)
             half_yaw_ned = 0.5 * float(item["heading"])
             q_ned = [math.cos(half_yaw_ned), 0.0, 0.0, math.sin(half_yaw_ned)]
-            drone_pose = {
-                "x": float(p_enu[0]),
-                "y": float(p_enu[1]),
-                "z": float(p_enu[2]),
-                "yaw": float(yaw_val),
-            }
 
+        raw_pos_enu[i] = p_enu
+        raw_yaw_enu[i] = yaw_val
+        raw_q_ned[i] = q_ned
+
+    reconstructed_time_s = _extract_reconstructed_time_s(
+        odom_list,
+        timesync_status=parsed_data.get("timesync_status"),
+    )
+
+    # Remuestreo temporal uniforme a 10 Hz (Δt = 0.1 s) sobre reconstructed_time_s
+    resampled = resample_trajectory_10hz(
+        reconstructed_time_s=reconstructed_time_s,
+        pos_enu_m=raw_pos_enu,
+        yaw_enu=raw_yaw_enu,
+        q_ned=raw_q_ned,
+        target_hz=target_hz,
+    )
+    timestamps_s = resampled["timestamps_s"]
+    pos_enu_m = resampled["pos_enu_m"]                           # (T, 3) en metros
+    agent_positions = (pos_enu_m * scale_factor).astype(np.float32)  # (T, 3) escalado s=0.1
+    agent_yaw = resampled["yaw_enu"]                             # (T, 1) rad en [-pi, pi)
+    agent_rot = resampled["rot_enu"]                             # (T, 3, 3) R_z(yaw) in SO(3)
+    agent_q_ned = resampled["q_ned"]                             # (T, 4)
+    dt_s = float(resampled["dt_s"])
+    T = len(pos_enu_m)
+
+    if verbose:
+        print(
+            f"Generando nubes LiDAR sinteticas 360° a {target_hz:.1f} Hz "
+            f"(Δt={dt_s:.2f}s, gravity_aligned={gravity_aligned}) para T={T} instantes..."
+        )
+
+    scene_pointclouds = []
+    for step_i in range(T):
+        p_enu = pos_enu_m[step_i]
+        yaw_val = float(agent_yaw[step_i, 0])
+        R_stab = agent_rot[step_i].astype(np.float64)
+        q_ned_step = agent_q_ned[step_i].tolist()
+        if not gravity_aligned:
+            _, R_full = px4_odometry_to_gazebo_enu([0.0, 0.0, 0.0], q_ned_step, gravity_aligned=False)
+            R_pose = R_full
+        else:
+            R_pose = R_stab
+
+        drone_pose = {
+            "x": float(p_enu[0]),
+            "y": float(p_enu[1]),
+            "z": float(p_enu[2]),
+            "yaw": float(yaw_val),
+            "R": R_pose,
+            "q_ned": q_ned_step,
+        }
         step_seed = (ep_seed * 10000 + step_i) % (2**31 - 1)
         cloud_scaled = lidar_gen.generate_pointcloud(
             drone_pose, landmarks, landing, seed=step_seed, gravity_aligned=gravity_aligned
         )
         scene_pointclouds.append(cloud_scaled)
 
-        pos_enu_m_list.append(p_enu)
-        yaw_enu_list.append([yaw_val])
-        rot_enu_list.append(R_stab)
-        q_ned_list.append(q_ned)
-
-    pos_enu_m = np.array(pos_enu_m_list, dtype=np.float64)                  # (T, 3) en metros
-    agent_positions = (pos_enu_m * scale_factor).astype(np.float32)         # (T, 3) escalado s=0.1
-    agent_yaw = np.array(yaw_enu_list, dtype=np.float32)                    # (T, 1) rad
-    agent_rot = np.array(rot_enu_list, dtype=np.float32)                    # (T, 3, 3) R_z(yaw)
-    agent_q_ned = np.array(q_ned_list, dtype=np.float32)                    # (T, 4)
     scene_pointclouds = np.array(scene_pointclouds, dtype=np.float32)       # (T, 2048, 3)
 
     # 1. Estado binario de vuelo s_t in {0, 1} y 6 nodos keypoint canonicos
     flight_state = compute_flight_state(pos_enu_m, landing=landing)         # (T, 1)
     keypoints_body = get_uav_keypoints_body(scale_factor=scale_factor)      # (6, 3)
 
-    # 2. Poses SE(3) y horizonte de acciones relativas T=8 sobre la trayectoria ejecutada
+    # 2. Poses SE(3), horizonte de acciones relativas T=8 (0.8 s a 10 Hz) y valid_mask (T, 8)
     pose_se3, action_se3, action_local = compute_se3_action_horizon(
         agent_positions,
         agent_yaw,
         flight_state,
+        horizon=action_horizon,
+        action_stride=action_stride,
+    )
+    valid_mask = compute_action_valid_mask(
+        T,
         horizon=action_horizon,
         action_stride=action_stride,
     )
@@ -964,15 +1486,16 @@ def build_heterodata_from_synthetic_lidar(
     # 5. Setpoints crudos de PX4 (conservados exclusivamente para diagnostico del controlador)
     setpoints = parsed_data.get("setpoints", [])
     setpoint_raw = np.zeros((T, 3), dtype=np.float32)
-    if setpoints:
+    if setpoints and N_raw > 0:
         sp_timestamps = np.array([sp["timestamp"] for sp in setpoints], dtype=np.int64)
         sp_positions = np.array(
             [ned_to_gazebo_enu(sp["position"]) * scale_factor for sp in setpoints],
             dtype=np.float32,
         )
-        for i, idx in enumerate(sampled_indices):
-            t = odom_list[idx]["timestamp"]
-            sp_idx = np.searchsorted(sp_timestamps, t, side="right") - 1
+        raw_bag_ts = np.array([item["timestamp"] for item in odom_list], dtype=np.float64)
+        interp_bag_ts = np.interp(timestamps_s, reconstructed_time_s - reconstructed_time_s[0], raw_bag_ts)
+        for i in range(T):
+            sp_idx = np.searchsorted(sp_timestamps, int(round(interp_bag_ts[i])), side="right") - 1
             sp_idx = int(np.clip(sp_idx, 0, len(sp_positions) - 1))
             setpoint_raw[i] = sp_positions[sp_idx]
     else:
@@ -995,6 +1518,9 @@ def build_heterodata_from_synthetic_lidar(
 
         data["agent"].y = torch.from_numpy(action_local)
         data["agent"].action_se3 = torch.from_numpy(action_se3)
+        data["agent"].valid_mask = torch.from_numpy(valid_mask)
+        data["agent"].timestamps_s = torch.from_numpy(timestamps_s.astype(np.float32))
+        data["agent"].dt_s = torch.tensor(float(dt_s), dtype=torch.float32)
         data["agent"].keyframe_indices = torch.from_numpy(keyframe_indices)
         data["agent"].aug_mask = torch.from_numpy(aug_dict["aug_mask"])
         data["agent"].setpoint_raw = torch.from_numpy(setpoint_raw)
@@ -1012,6 +1538,7 @@ def build_heterodata_from_synthetic_lidar(
         data["aug"].y = torch.from_numpy(aug_dict["y"])
         data["aug"].action_se3 = torch.from_numpy(aug_dict["action_se3"])
         data["aug"].target_pos_enu = torch.from_numpy(aug_dict["target_pos_enu"])
+        data["aug"].valid_mask = torch.from_numpy(aug_dict["valid_mask"])
 
         # Aristas temporales t -> t+1
         if T > 1:
@@ -1042,6 +1569,9 @@ def build_heterodata_from_synthetic_lidar(
             keypoints_body=keypoints_body,
             agent_y=action_local,
             action_se3=action_se3,
+            valid_mask=valid_mask,
+            timestamps_s=timestamps_s.astype(np.float32),
+            dt_s=np.float32(dt_s),
             keyframe_indices=keyframe_indices,
             aug_mask=aug_dict["aug_mask"],
             setpoint_raw=setpoint_raw,
@@ -1057,6 +1587,7 @@ def build_heterodata_from_synthetic_lidar(
             aug_y=aug_dict["y"],
             aug_action_se3=aug_dict["action_se3"],
             aug_target_pos_enu=aug_dict["target_pos_enu"],
+            aug_valid_mask=aug_dict["valid_mask"],
         )
         if verbose:
             print(f"Torch/HeteroData no disponible. Datos SE(3) guardados en formato NumPy: {saved_path}")
@@ -1071,8 +1602,10 @@ def discover_dataset_episodes(
     include_failed: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Descubre recursivamente todos los episodios validos (task_XXXX/episode_YY)
-    dentro de dataset_dir que contienen un rosbag (.mcap) y waypoints.yaml.
+    Descubre recursivamente todos los episodios aceptados (task_XXXX/episode_YY)
+    dentro de dataset_dir que contienen un rosbag (.mcap), waypoints.yaml y,
+    cuando `include_failed=False`, exigen estrictamente `validation_status == 'accepted'`
+    en `episode_meta.json`.
     """
     dataset_dir = Path(dataset_dir).resolve()
     if not dataset_dir.is_dir():
@@ -1101,15 +1634,16 @@ def discover_dataset_episodes(
     episodes = []
     for ep_dir in candidate_ep_dirs:
         meta_file = ep_dir / "episode_meta.json"
-        if meta_file.is_file() and not include_failed:
+        if not include_failed:
+            if not meta_file.is_file():
+                continue
             try:
-                with open(meta_file, "r") as f:
+                with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                status = str(meta.get("status", "success")).lower()
-                if status not in ("success", "ok"):
-                    continue
             except Exception:
-                pass
+                continue
+            if meta.get("validation_status") != "accepted":
+                continue
 
         bag_dir = ep_dir / "rosbag"
         if not bag_dir.is_dir():

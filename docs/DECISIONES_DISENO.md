@@ -412,6 +412,7 @@ Se descartaron los plugins de contacto de Gazebo porque no detectan fallas semá
 
 ### 16.4 Alcance Actual
 
-* El validador se ejecuta **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]` o `--episode-dir <dir>`), propagando códigos de retorno `0` (aceptado), `1` (rechazo) y `2` (error de argumentos/uso). `data_collector.py` todavía usa `returncode`; la integración es la **Fase 2**.
-* Al evaluar los 12 episodios históricos locales (`task_0000`–`task_0003`) con el cierre completo de la Fase 1.1 (`C1–C10`), los 12 superan las verificaciones de configuración, primitivas progresivas (`C8`), cota inferior de despeje a obstáculos (`min_obstacle_clearance_m ≥ 0,4311 m > 0,30 m`, `C7`) y persistencia de aterrizaje (`C4`), pero son **rechazados** en `recording_status` por presentar 1–2 escalones de offset UNIX de `uxrce_dds_client` ($\sim 0,22\text{–}0,48\text{ s}$) clasificados como ambiguos bajo `C3`. No se relajaron los umbrales para forzar su aceptación.
+* El validador se ejecuta tanto **offline** (`scripts/validate_episode.py --dataset-dir datasets [--update-meta]` o `--episode-dir <dir>`), propagando códigos de retorno `0` (aceptado), `1` (rechazo) y `2` (error de argumentos/uso), como **en línea** dentro de `data_collector.py` (Fase 2) tras el cierre limpio del bag con `SIGINT`.
+* Al evaluar los 12 episodios históricos locales (`task_0000`–`task_0003`) con el cierre completo de la Fase 1.1 (`C1–C10`), los 12 superan las verificaciones de configuración, primitivas progresivas (`C8`), cota inferior de despeje a obstáculos (`min_obstacle_clearance_m ≥ 0,4311 m > 0,30 m`, `C7`) y persistencia de aterrizaje (`C4`), pero fueron grabados antes de registrar `/fmu/out/timesync_status`, por lo que sus escalones de offset UNIX se rechazan por ambigüedad. La nueva campaña (Fase 3) registrará `timesync_status` para desambiguación analítica formal.
+
 

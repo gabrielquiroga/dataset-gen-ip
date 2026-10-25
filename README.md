@@ -139,6 +139,7 @@ rm -rf rosbag_test_001
 # Grabar tópicos de telemetría compacta
 ros2 bag record -o rosbag_test_001 \
   /fmu/out/vehicle_odometry \
+  /fmu/out/timesync_status \
   /fmu/in/trajectory_setpoint \
   /fmu/out/vehicle_land_detected \
   /fmu/out/vehicle_status_v4 \
@@ -276,29 +277,41 @@ python3 src/uav_ip/scripts/validate_episode.py --episode-dir datasets/task_0001/
 python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --update-meta
 ```
 
-Es un **filtro conservador bajo hipótesis explícitas** (envolvente esférica 3D de 0,30 m = 0,25 m de radio físico XY del chasis/motores `x500` + 0,05 m de margen, cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ con paso $h = 0,02\text{ m}$, obstáculos estáticos con la geometría declarada y movimiento aproximadamente rectilíneo entre muestras). No es una certificación física de ausencia de colisiones. Por ahora se ejecuta offline: `data_collector.py` todavía marca el éxito por el código de salida del piloto, y la integración está planificada para la Fase 2. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
+**Integración en línea y desambiguación analítica del reloj (Fase 2):**
+- **Invocación automática:** `data_collector.py` invoca automáticamente `validate_episode_directory(ep_dir, update_meta=True)` tras cerrar limpiamente el bag con `SIGINT`.
+- **Desambiguación del Patrón B:** Si `VehicleOdometry` experimenta un salto de reloj en SITL por recalibración periódica de offset UNIX de `uxrce_dds_client`, se correlaciona analíticamente en una ventana de $\pm 0.05\text{ s}$ contra `TimesyncStatus.estimated_offset`. Si la magnitud coincide, se repara el reloj en `reconstructed_time_s` (`timesync_offset_adjustment_repaired`) y el episodio se clasifica como válido (`usable_for_validation = True`).
+- **Conservación estricta de intentos:** Los intentos fallidos se conservan intactos con sus motivos de rechazo. Los reintentos con semilla derivada se guardan en `episode_XX_attempt_YY` sin sobrescribir jamás el intento original `episode_XX`.
+- **Filtro conservador bajo hipótesis explícitas:** Envolvente esférica 3D de 0,30 m (0,25 m de radio físico XY de chasis/motores `x500` + 0,05 m de margen de seguridad), cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ con paso $h = 0,02\text{ m}$, y obstáculos estáticos. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
 
-### 3. Auditoría del Dataset y Partición Formal (`audit_dataset.py`)
-Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría para verificar la integridad del dataset y generar las particiones oficiales:
+### 3. Auditoría en 3 Capas del Dataset y Partición Formal (`audit_dataset.py`)
+Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría en 3 capas para verificar la integridad del dataset y generar las particiones oficiales:
 
 ```bash
 python3 src/uav_ip/scripts/audit_dataset.py --dataset-dir datasets
 ```
 
-Este comando realiza las siguientes validaciones y exportaciones:
-- **Detección de duplicados:** Comprueba las firmas semánticas de todas las tareas y asegura que no existan tareas repetidas.
-- **Auditoría de calidad de vuelo:** Analiza los metadatos de cada episodio (`episode_meta.json`) para reportar tasas de éxito, colisiones y *timeouts*.
-- **Control de variabilidad espacial:** Verifica que los episodios de una misma tarea presenten posiciones físicas aleatorizadas en sus `waypoints.yaml`.
-- **Generación de particiones Train / Val / Held-Out:** Crea en `datasets/splits/`:
-  - `train_tasks.json` ($\sim 70\%$ de las firmas semánticas).
-  - `val_tasks.json` ($\sim 15\%$ de las firmas).
-  - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, sin solapamiento de firmas semánticas con train/val, para evaluar generalización *in-context* sobre estructuras de tarea no vistas).
-  - `dataset_summary.json` (resumen estadístico global).
+Este comando realiza las siguientes validaciones estructuradas en 3 capas:
+- **Capa 1 (Vuelos crudos y metadatos):**
+  - Reporta tasas de aceptación por intento original (`original_attempt_acceptance_rate`) por separado de la tasa post-reintentos (`post_retry_slot_acceptance_rate`).
+  - Desglose exhaustivo de motivos de rechazo (`rejection_reasons`).
+  - Detección de colisiones de firmas semánticas y control de variabilidad espacial de waypoints.
+- **Capa 2 (Tensores de aprendizaje `.pt`):**
+  - Audita finitud estricta (cero NaNs e Infs en todos los tensores).
+  - Verificación dimensional: `scene.pos` $(T, 2048, 3)$, `agent.action_se3` $(T, 8, 4, 4)$, `agent.valid_mask` $(T, 8)$.
+  - Ortogonalidad estricta en $SO(3)$ ($R^\top R = I_3$, $\det R = +1.0$) en matrices de rotación y transformaciones relativas.
+  - Verificación del horizonte físico continuo de $0.8\text{ s}$ ($\Delta t = 0.1\text{ s}$) y cota esférica sólida $\|\delta p\|_2 \le 0.60\text{ m}$ en Tube Augmentation.
+- **Capa 3 (Particionado oficial y splits):**
+  - Exige un umbral mínimo de episodios aceptados ($\ge 5$, configurable con `--min-accepted-episodes`) antes de incluir una tarea en los splits.
+  - Genera particiones mutuamente excluyentes en `datasets/splits/`:
+    - `train_tasks.json` ($\sim 70\%$ de las firmas semánticas).
+    - `val_tasks.json` ($\sim 15\%$ de las firmas).
+    - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, para evaluar generalización *in-context*).
+    - `dataset_summary.json` (resumen estadístico global de las 3 capas).
 
 *(Para realizar un chequeo rápido en terminal sin generar archivos JSON, puedes agregar el flag `--no-export`).*
 
 ### 4. Conversión por Lotes a Formato PyTorch Geometric
-Una vez validado el dataset, puedes convertir automáticamente todos los episodios de todas las tareas a grafos `HeteroData` (`data.pt`) utilizando el modo batch multiproceso de `bag_to_heterodata.py`:
+Una vez validado el dataset, puedes convertir automáticamente los episodios aceptados a grafos `HeteroData` (`data.pt`) utilizando el modo batch multiproceso de `bag_to_heterodata.py`:
 
 ```bash
 # Activar entorno ML
@@ -312,10 +325,12 @@ python3 src/uav_ip/scripts/bag_to_heterodata.py \
   --scale 0.1
 ```
 
-**Ventajas y Características del Procesamiento por Lotes:**
-- **Procesamiento Multiproceso:** Distribuye los episodios uniformemente entre la cantidad de trabajadores (`--workers`), procesando 100 episodios en segundos en lugar de minutos.
-- **Aceleración SIMD C:** El submuestreo FPS de nubes de puntos compila dinámicamente un kernel en C vectorizado (`-O3 -march=native -ffast-math`), reduciendo el tiempo de cálculo de $\sim 43\text{ ms}$ a $\sim 6\text{ ms}$ por nube.
-- **Generación Automática de Tube Augmentation:** Incorpora en cada episodio un conjunto de nodos de recuperación `data['aug']` (30% de pasos perturbados con horizonte de acción correctiva en $SE(3)$ y 10% flip de estado de vuelo), listos para el entrenamiento del modelo de difusión.
+**Ventajas y Características del Procesamiento por Lotes (Fase 2):**
+- **Filtrado Estricto de Postproceso:** Ignora por defecto cualquier episodio con `validation_status != "accepted"` en `episode_meta.json` (desactivable con `--include-failed`).
+- **Remuestreo Temporal Uniforme a 10 Hz:** Interpola poses y observaciones a $\Delta t = 0.1\text{ s}$ exactos sobre `reconstructed_time_s`, desenvolviendo el ángulo de guiñada (`np.unwrap`) para evitar singularidades en $\pm \pi$, garantizando que el horizonte $T=8$ cubra exactamente $0.8\text{ s}$ físicos.
+- **Máscara de Validez de Acción (`valid_mask`):** Incorpora un tensor booleano $(T, 8)$ que marca como válidos los pasos con trayectoria futura real y distingue los últimos 7 timesteps donde el horizonte queda clampeado al aterrizaje estacionario.
+- **Tube Augmentation con Seguridad Geométrica:** Muestreo en esfera euclídea sólida $\|\delta p\|_2 \le 0.60\text{ m}$, descartando perturbaciones que violen el clearance de colisión ($\ge 0.30\text{ m}$) contra landmarks o que salgan de la apertura libre en maniobras `traverse` de aros.
+- **Procesamiento Multiproceso y Aceleración SIMD C:** Distribuye los episodios uniformemente entre núcleos (`--workers`), con submuestreo FPS compilado con SIMD vectorizado (`-O3 -march=native -ffast-math`).
 - **Keyframes de Contexto:** Extrae automáticamente $L=10$ hitos temporales para estructurar el condicionamiento *in-context*.
 
 ---

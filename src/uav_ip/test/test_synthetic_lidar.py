@@ -891,4 +891,330 @@ def test_real_dataset_mcap_validation():
                 assert a["failsafe"] == b["failsafe"]
 
 
+def test_resample_10hz_angular_continuity_and_valid_mask():
+    """
+    Valida Tarea 2.5.5:
+      1. `resample_trajectory_10hz` interpola uniformemente a 10 Hz (Δt = 0.1 s) sobre `reconstructed_time_s`,
+         de modo que el horizonte T=8 cubra exactamente 0.8 s.
+      2. El desenvolvimiento de fase (`np.unwrap`) evita saltos espurios por 0 rad cuando el rumbo
+         cruza la discontinuidad ±pi (ej. de +178° a -178°).
+      3. `compute_action_valid_mask(T, horizon=8)` marca como True los pasos con trayectoria futura
+         real (`t + k < T`) y False los pasos terminales clampeados en los ultimos 7 timesteps.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from bag_to_heterodata import compute_action_valid_mask, resample_trajectory_10hz
+
+    # Simular 2.0 s a 125 Hz (251 muestras, dt = 0.008 s) cruzando de +175° a -175° por ±pi
+    t_raw = np.linspace(0.0, 2.0, 251, dtype=np.float64)
+    pos_raw = np.column_stack([
+        t_raw * 2.0,
+        np.sin(t_raw),
+        np.full_like(t_raw, 1.5),
+    ])
+    yaw_continuous = np.radians(np.linspace(170.0, 190.0, 251))
+    yaw_wrapped_raw = np.arctan2(np.sin(yaw_continuous), np.cos(yaw_continuous))
+    q_raw = np.column_stack([
+        np.cos(0.5 * yaw_continuous),
+        np.zeros_like(t_raw),
+        np.zeros_like(t_raw),
+        np.sin(0.5 * yaw_continuous),
+    ])
+
+    res = resample_trajectory_10hz(t_raw, pos_raw, yaw_wrapped_raw, q_ned=q_raw, target_hz=10.0)
+    ts_grid = res["timestamps_s"]
+    assert len(ts_grid) == 21  # 0.0, 0.1, ..., 2.0 s
+    assert np.allclose(np.diff(ts_grid), 0.10, atol=1e-9)
+    # Horizonte T=8 pasos a 10 Hz cubre exactamente 0.8 s
+    assert (ts_grid[8] - ts_grid[0]) == pytest.approx(0.80, abs=1e-9)
+
+    # Verificar que en t = 1.0 s (justo en ±pi) el yaw interpolado esta cerca de ±pi y NO en 0 rad
+    yaw_mid = float(res["yaw_enu"][10, 0])
+    assert abs(yaw_mid) > math.radians(178.0), f"Singularidad en ±pi no desenvuelta: yaw_mid={yaw_mid}"
+
+    # Verificar rot_enu en SO(3)
+    R_batch = res["rot_enu"]
+    assert R_batch.shape == (21, 3, 3)
+    for k in range(21):
+        Rk = R_batch[k].astype(np.float64)
+        assert np.allclose(Rk.T @ Rk, np.eye(3), atol=1e-5)
+        assert float(np.linalg.det(Rk)) == pytest.approx(1.0, abs=1e-5)
+
+    # Verificar valid_mask (T, 8)
+    vm = compute_action_valid_mask(21, horizon=8, action_stride=1)
+    assert vm.shape == (21, 8)
+    assert vm.dtype == np.bool_
+    # Primeros 13 pasos (t = 0..12, pues 12 + 8 = 20 < 21) tienen horizonte completo valido
+    assert np.all(vm[:13, :])
+    # En t = 13, k=8 cae en 21 >= 21 (False), mientras k=1..7 son True
+    assert np.all(vm[13, :7]) and (not vm[13, 7])
+    # En el ultimo paso t = 20, todos los 8 pasos futuros estan clampeados (False)
+    assert not np.any(vm[20, :])
+
+
+def test_tube_augmentation_euclidean_sphere_and_collision_filtering():
+    """
+    Valida Tarea 2.5.5 en `compute_tube_augmentation()`:
+      1. Cota esferica euclidea solida: ninguna muestra perturbada supera `||δp||_2 <= 0.60 m`
+         (a diferencia del antiguo cubo `[-0.6, 0.6]^3` que permitia hasta 1.04 m).
+      2. Clearance contra obstaculos: toda muestra perturbada y su cuerda de recuperacion mantienen
+         `min_surface_distance_m >= UAV_COLLISION_RADIUS_XY` (0.30 m) segun `compute_landmark_clearance()`.
+      3. Transitabilidad en puertas (`traverse`): perturbaciones que saldrian de la apertura libre
+         del aro o cuya cuerda colisionaria con el marco son rechazadas por `_is_perturbation_safe()`.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from bag_to_heterodata import _is_perturbation_safe, compute_tube_augmentation
+    from uav_ip.validation_geometry import UAV_COLLISION_RADIUS_XY, compute_landmark_clearance
+
+    gate_lm = {"id": "gate_1", "type": "square_gate", "action": "traverse", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
+    pole_lm = {"id": "pole_1", "type": "pole", "action": "slalom", "x": 8.0, "y": 0.45, "z": 1.25, "yaw": 0.0}
+    landmarks = [gate_lm, pole_lm]
+
+    # 1. Verificar rechazo directo en _is_perturbation_safe:
+    p_nom = np.array([5.0, 0.0, 1.5], dtype=np.float64)
+    p_next = np.array([5.3, 0.0, 1.5], dtype=np.float64)
+
+    # a) Esquina del cubo [0.5, 0.5, 0.5] tiene norma 0.866 m > 0.60 m -> rechazada
+    assert not _is_perturbation_safe(p_nom, p_nom + np.array([0.5, 0.5, 0.5]), p_next, landmarks, max_pos_dev=0.60)
+    # b) Perturbacion lateral de 0.55 m en el plano de la puerta (sale de TRAVERSE_MAX_ABS_Y = 0.50 m
+    #    y se acerca al poste del marco en y=0.75 m) -> rechazada
+    assert not _is_perturbation_safe(p_nom, np.array([5.0, 0.55, 1.5]), p_next, landmarks, max_pos_dev=0.60)
+    # c) Perturbacion dentro de la apertura libre (dy = 0.20 m, dz = 0.10 m) -> aceptada
+    assert _is_perturbation_safe(p_nom, np.array([5.0, 0.20, 1.60]), p_next, landmarks, max_pos_dev=0.60)
+
+    # 2. Ejecutar compute_tube_augmentation con sigma alto para forzar cola gaussiana y proximidad a obstaculos
+    T = 60
+    pos_enu_m = np.column_stack([
+        np.linspace(1.0, 11.0, T),
+        np.zeros(T),
+        np.full(T, 1.5),
+    ]).astype(np.float64)
+    yaw_enu = np.zeros((T, 1), dtype=np.float32)
+    flight_state = np.ones((T, 1), dtype=np.float32)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+
+    aug = compute_tube_augmentation(
+        pos_enu_m=pos_enu_m,
+        yaw_enu=yaw_enu,
+        flight_state=flight_state,
+        landmarks=landmarks,
+        landing={"x": 11.0, "y": 0.0, "z": 0.05},
+        lidar_gen=gen,
+        ep_seed=12345,
+        scale_factor=0.1,
+        horizon=8,
+        action_stride=1,
+        tube_aug_prob=0.50,
+        tube_sigma_pos=0.45,  # sigma grande para estresar el rechazo esferico y de colision
+        max_pos_dev=0.60,
+    )
+
+    dp_norms = np.linalg.norm(aug["delta_pos_m"], axis=1)
+    assert len(dp_norms) > 0
+    assert float(np.max(dp_norms)) <= 0.60 + 1e-5, f"Violacion de esfera euclidea: max={np.max(dp_norms)}"
+
+    # Verificar que todas las poses perturbadas mantienen clearance >= UAV_COLLISION_RADIUS_XY (0.30 m)
+    pert_pos_m = (aug["pos_enu"] / 0.1).astype(np.float64)
+    for idx_a in range(len(pert_pos_m)):
+        t_step = int(aug["timestep_idx"][idx_a])
+        t_next = min(T - 1, t_step + 1)
+        chord = np.vstack([pert_pos_m[idx_a], pos_enu_m[t_next]])
+        for lm in landmarks:
+            cl = compute_landmark_clearance(chord, lm)
+            assert cl["lower_bound_distance_m"] >= UAV_COLLISION_RADIUS_XY - 1e-6
+            assert cl["sampled_min_distance_m"] >= UAV_COLLISION_RADIUS_XY - 1e-6
+
+
+def test_phase2_three_layer_audit_and_strict_filtering(tmp_path):
+    """
+    Valida Tareas 2.5.4, 2.5.5 y 2.5.6 de extremo a extremo:
+      - `DataCollector.get_attempt_episode_id` genera `episode_00` para el intento original
+        y `episode_00_attempt_01` para reintentos sin sobrescribir el intento original.
+      - `discover_dataset_episodes` ignora estrictamente episodios con `validation_status != "accepted"`.
+      - `audit_dataset` ejecuta las 3 capas:
+          * Capa 1: tasa de aceptacion en intento original vs post-reintento y desglose de rechazos.
+          * Capa 2: auditoria de tensores `.pt` / `.npz` (finitud, dimensiones, SO(3), valid_mask, 0.8s).
+          * Capa 3: exige `>= 5` episodios aceptados por tarea antes de incluirla en los splits.
+    """
+    import json
+    import sys
+    from pathlib import Path
+    import yaml
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from audit_dataset import audit_dataset, audit_heterodata_file
+    from bag_to_heterodata import build_heterodata_from_synthetic_lidar, discover_dataset_episodes
+    from data_collector import DataCollector
+
+    # 1. Verificar convencion no destructiva de intentos en DataCollector
+    assert DataCollector.get_attempt_episode_id(0, 0) == "episode_00"
+    assert DataCollector.get_attempt_episode_id(0, 1) == "episode_00_attempt_01"
+    assert DataCollector.get_attempt_episode_id(3, 2) == "episode_03_attempt_02"
+    assert DataCollector.get_attempt_seed(0, 1, 0, 0) != DataCollector.get_attempt_seed(0, 1, 0, 1)
+
+    # 2. Construir mini-dataset sintetico con:
+    #    - task_0000: 5 slots aceptados (4 en intento original + 1 en _attempt_01 tras fallo original) -> elegible (>= 5)
+    #    - task_0001: solo 3 episodios aceptados -> excluida del particionado (< 5)
+    ds_dir = tmp_path / "datasets"
+    for t_idx, n_acc in [(0, 5), (1, 3)]:
+        t_dir = ds_dir / f"task_{t_idx:04d}"
+        t_dir.mkdir(parents=True)
+        task_cfg = {
+            "task_id": f"task_{t_idx:04d}",
+            "logic": "A1_DIRECT",
+            "profile": "B1_LINEAR",
+            "landmarks": [
+                {"id": f"lm_{t_idx}_1", "type": "square_gate", "action": "traverse"},
+                {"id": f"lm_{t_idx}_2", "type": "pole", "action": "slalom"},
+            ],
+            "primitives": [
+                {"type": "traverse", "landmark_id": f"lm_{t_idx}_1"},
+                {"type": "slalom", "landmark_id": f"lm_{t_idx}_2"},
+            ],
+        }
+        with open(t_dir / "task_config.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(task_cfg, f)
+
+        for ep_i in range(n_acc):
+            if t_idx == 0 and ep_i == 0:
+                # Intento original fallido conservado intacto + reintento exitoso en episode_00_attempt_01
+                fail_dir = t_dir / "episode_00"
+                (fail_dir / "rosbag").mkdir(parents=True)
+                (fail_dir / "rosbag" / "rosbag_0.mcap").write_bytes(b"dummy")
+                with open(fail_dir / "waypoints.yaml", "w", encoding="utf-8") as f:
+                    yaml.safe_dump({"landmarks": [{"id": "g1", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.5}]}, f)
+                with open(fail_dir / "episode_meta.json", "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "task_id": "task_0000",
+                            "episode_id": "episode_00",
+                            "original_episode_id": "episode_00",
+                            "attempt_index": 0,
+                            "status": "success",
+                            "validation_status": "rejected",
+                            "rejection_reasons": ["collision_detected_landmark_0"],
+                        },
+                        f,
+                    )
+                ep_folder_name = "episode_00_attempt_01"
+                att_idx = 1
+            else:
+                ep_folder_name = f"episode_{ep_i:02d}"
+                att_idx = 0
+
+            ep_dir = t_dir / ep_folder_name
+            (ep_dir / "rosbag").mkdir(parents=True)
+            (ep_dir / "rosbag" / "rosbag_0.mcap").write_bytes(b"dummy")
+            wp_cfg = {
+                "seed": 100 + t_idx * 10 + ep_i,
+                "landmarks": [
+                    {
+                        "id": "g1",
+                        "type": "square_gate",
+                        "action": "traverse",
+                        "x": 5.0 + 0.2 * ep_i,
+                        "y": 0.1 * ep_i,
+                        "z": 1.5,
+                        "yaw": 0.0,
+                    }
+                ],
+                "landing": {"x": 10.0, "y": 0.0, "z": 0.05},
+            }
+            with open(ep_dir / "waypoints.yaml", "w", encoding="utf-8") as f:
+                yaml.safe_dump(wp_cfg, f)
+            with open(ep_dir / "episode_meta.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "task_id": f"task_{t_idx:04d}",
+                        "episode_id": ep_folder_name,
+                        "original_episode_id": f"episode_{ep_i:02d}",
+                        "attempt_index": att_idx,
+                        "status": "success",
+                        "validation_status": "accepted",
+                        "rejection_reasons": [],
+                    },
+                    f,
+                )
+
+            # Generar tensor heterodata (.pt o .npz) para el primer episodio aceptado de task_0000
+            if t_idx == 0 and ep_i == 0:
+                N_samples = 150  # 1.2 s a 125 Hz -> 13 pasos a 10 Hz
+                base_ns = 1_700_000_000_000_000_000
+                base_us = 1_700_000_000_000_000
+                odom_samples = []
+                for s_i in range(N_samples):
+                    t_sec = s_i * 0.008
+                    odom_samples.append({
+                        "timestamp": base_ns + int(round(t_sec * 1e9)),
+                        "timestamp_us": base_us + int(round(t_sec * 1e6)),
+                        "timestamp_sample_us": base_us + int(round(t_sec * 1e6)),
+                        "position": [0.0, float(t_sec * 3.0), -1.5],  # NED -> ENU x=t*3, y=0, z=1.5
+                        "q": [1.0, 0.0, 0.0, 0.0],
+                        "velocity": [0.0, 3.0, 0.0],
+                    })
+                build_res = build_heterodata_from_synthetic_lidar(
+                    parsed_data={"odometry": odom_samples, "local_pos": [], "setpoints": [], "timesync_status": []},
+                    waypoints_file=ep_dir / "waypoints.yaml",
+                    output_path=ep_dir / "heterodata.pt",
+                    trim_idle=False,
+                    verbose=False,
+                )
+                assert build_res["ok"] is True
+                t_audit = audit_heterodata_file(Path(build_res["saved_path"]))
+                assert t_audit["valid"] is True, t_audit["issues"]
+                assert t_audit["horizon"] == 8
+                assert t_audit["horizon_duration_s"] == pytest.approx(0.80, abs=0.02)
+
+    # 3. Verificar que discover_dataset_episodes ignora el episodio rechazado (task_0000/episode_00)
+    discovered = discover_dataset_episodes(ds_dir, include_failed=False)
+    disc_labels = [d["label"] for d in discovered]
+    assert "task_0000/episode_00" not in disc_labels
+    assert "task_0000/episode_00_attempt_01" in disc_labels
+    assert len(discovered) == 8  # 5 aceptados en task_0000 + 3 aceptados en task_0001
+
+    # 4. Ejecutar auditoria en 3 capas con min_accepted_episodes=5
+    splits_dir = tmp_path / "splits"
+    audit_res = audit_dataset(
+        dataset_dir=ds_dir,
+        output_dir=splits_dir,
+        min_accepted_episodes=5,
+        seed=42,
+        no_export=False,
+    )
+
+    # Capa 1: 8 slots en total (5 en task_0000 + 3 en task_0001); 7 exitosos en 1er intento y 8 tras reintento
+    l1 = audit_res["layer1_raw_flights"]
+    assert l1["primary_attempts_total"] == 8
+    assert l1["primary_attempts_accepted"] == 7
+    assert l1["retry_attempts_total"] == 1
+    assert l1["retry_attempts_accepted"] == 1
+    assert l1["accepted_episode_slots"] == 8
+    assert l1["rejection_reason_counts"].get("collision_detected_landmark_0") == 1
+
+    # Capa 2: 1 archivo de tensores auditado y 100% valido
+    l2 = audit_res["layer2_tensors"]
+    assert l2["tensor_files_audited"] == 1
+    assert l2["tensor_files_valid"] == 1
+    assert l2["tensor_files_invalid"] == 0
+
+    # Capa 3: task_0001 excluida por tener 3 < 5 episodios aceptados; solo task_0000 entra en splits
+    assert "task_0001" in audit_res["excluded_tasks"]
+    all_split_tasks = audit_res["train_tasks"] + audit_res["val_tasks"] + audit_res["held_out_tasks"]
+    assert all_split_tasks == ["task_0000"]
+
+
 

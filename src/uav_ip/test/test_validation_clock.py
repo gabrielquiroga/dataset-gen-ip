@@ -270,3 +270,72 @@ def test_validate_episode_data_rejects_pattern_b_and_missing_clocks():
     assert rep_no_px4["validation_status"] == "rejected"
     assert rep_no_px4["recording_status"] == "invalid"
     assert any(r.startswith("missing_or_invalid_px4_timestamps") for r in rep_no_px4["rejection_reasons"])
+
+
+def test_timesync_status_analytical_disambiguation_repairs_pattern_b():
+    """
+    Tarea 2.5.4:
+      1. Si un salto de reloj en VehicleOdometry coincide en ±0.05 s con un escalon en
+         TimesyncStatus.estimated_offset de identica magnitud (Δt_odom ≈ Δestimated_offset),
+         se valida formalmente como reajuste de offset de red, se repara `reconstructed_time_s`
+         aplicando el diferencial de offset y se declara `usable_for_validation = True`
+         (y `validation_status == "accepted"` en `validate_episode_data`).
+      2. Si el salto en VehicleOdometry NO coincide en magnitud o ventana temporal con
+         `timesync_status`, se mantiene el rechazo estricto por `ambiguous_clock_step_pattern_b`
+         o `telemetry_dropout_gap`.
+    """
+    fx = _make_clean_flight_fixture()
+    odom = fx["telemetry"]["odometry"]
+    jump_idx = 100
+    offset_jump_us = 350_000  # 0.35 s
+
+    for i in range(jump_idx):
+        odom[i]["timestamp_sample_us"] -= offset_jump_us
+        odom[i]["timestamp_us"] -= offset_jump_us
+
+    # Caso A: Sin timesync_status -> rechazado por ambiguous_clock_step_pattern_b
+    rep_no_ts = validate_episode_data(fx["telemetry"], fx["waypoints_cfg"], pilot_exit_code=0)
+    assert rep_no_ts["validation_status"] == "rejected"
+    assert any(r.startswith("ambiguous_clock_step_pattern_b") for r in rep_no_ts["rejection_reasons"])
+
+    # Caso B: Con timesync_status coincidente en tiempo (±0.01 s) y magnitud (350_000 us) -> aceptado
+    t_jump_ns = odom[jump_idx]["timestamp"]
+    t_jump_us = odom[jump_idx]["timestamp_sample_us"]
+    fx["telemetry"]["timesync_status"] = [
+        {
+            "timestamp": t_jump_ns - 500_000_000,
+            "timestamp_us": t_jump_us - 500_000 - offset_jump_us,
+            "estimated_offset": -offset_jump_us,
+            "estimated_offset_us": -offset_jump_us,
+        },
+        {
+            "timestamp": t_jump_ns + 5_000_000,  # +0.005 s dentro de la ventana de ±0.05 s
+            "timestamp_us": t_jump_us + 5_000,
+            "estimated_offset": 0,
+            "estimated_offset_us": 0,
+        },
+    ]
+
+    rep_with_ts = validate_episode_data(fx["telemetry"], fx["waypoints_cfg"], pilot_exit_code=0)
+    assert rep_with_ts["validation_status"] == "accepted", rep_with_ts["rejection_reasons"]
+    assert rep_with_ts["recording_status"] == "valid"
+    assert rep_with_ts["metrics"]["timesync_offset_jumps"] == 1
+    assert rep_with_ts["metrics"]["ambiguous_clock_steps"] == 0
+    assert rep_with_ts["metrics"]["max_dt_gap_s"] <= 0.15
+
+    # Caso C: Con timesync_status de magnitud discordante (ej. 100 ms vs salto de 350 ms) -> rechazado
+    fx["telemetry"]["timesync_status"][0]["estimated_offset"] = -100_000
+    fx["telemetry"]["timesync_status"][0]["estimated_offset_us"] = -100_000
+    rep_bad_mag = validate_episode_data(fx["telemetry"], fx["waypoints_cfg"], pilot_exit_code=0)
+    assert rep_bad_mag["validation_status"] == "rejected"
+    assert any(r.startswith("ambiguous_clock_step_pattern_b") for r in rep_bad_mag["rejection_reasons"])
+
+    # Caso D: Con timesync_status fuera de la ventana temporal (±0.05 s, ej. desplazado 0.25 s) -> rechazado
+    fx["telemetry"]["timesync_status"][0]["estimated_offset"] = -offset_jump_us
+    fx["telemetry"]["timesync_status"][0]["estimated_offset_us"] = -offset_jump_us
+    fx["telemetry"]["timesync_status"][1]["timestamp"] = t_jump_ns + 250_000_000
+    fx["telemetry"]["timesync_status"][1]["timestamp_us"] = t_jump_us + 250_000
+    rep_bad_time = validate_episode_data(fx["telemetry"], fx["waypoints_cfg"], pilot_exit_code=0)
+    assert rep_bad_time["validation_status"] == "rejected"
+    assert any(r.startswith("ambiguous_clock_step_pattern_b") for r in rep_bad_time["rejection_reasons"])
+

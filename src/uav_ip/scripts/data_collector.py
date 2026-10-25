@@ -32,7 +32,19 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
+
+# Asegurar que el paquete local `uav_ip` sea importable desde scripts/
+ROS2_WS = Path.home() / "ros2_ws"
+UAV_IP_PKG = ROS2_WS / "src" / "uav_ip"
+if str(UAV_IP_PKG) not in sys.path:
+    sys.path.insert(0, str(UAV_IP_PKG))
+
+from uav_ip.validate_episode import (  # noqa: E402
+    VALIDATOR_VERSION,
+    get_effective_validation_parameters,
+    validate_episode_directory,
+)
 
 
 # ============================================================================
@@ -40,8 +52,6 @@ from typing import Optional
 # ============================================================================
 
 # Rutas del proyecto
-ROS2_WS = Path.home() / "ros2_ws"
-UAV_IP_PKG = ROS2_WS / "src" / "uav_ip"
 WORLD_GENERATOR = UAV_IP_PKG / "scripts" / "world_generator.py"
 TASK_GENERATOR = UAV_IP_PKG / "scripts" / "task_generator.py"
 GENERATED_WORLDS = UAV_IP_PKG / "generated_worlds"
@@ -57,8 +67,16 @@ RECORD_TOPICS = [
     "/fmu/out/vehicle_land_detected",
     "/fmu/out/vehicle_status_v4",
     "/fmu/out/vehicle_local_position_v1",
+    "/fmu/out/timesync_status",
     "/fmu/in/vehicle_command",
 ]
+
+REQUIRED_ACTIVE_PX4_TOPICS = [
+    "/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_status_v4",
+    "/fmu/out/vehicle_land_detected",
+]
+PX4_TOPIC_READY_TIMEOUT = 25.0
 
 # Timeouts (segundos)
 PX4_STARTUP_TIMEOUT = 50       # Tiempo para que PX4 + Gazebo arranquen
@@ -251,6 +269,7 @@ class DataCollector:
         min_landmarks: int = 2,
         max_landmarks: int = 5,
         include_circular_gates: bool = False,
+        max_retries: int = 2,
     ):
         self.num_tasks = num_tasks
         self.episodes_per_task = episodes_per_task
@@ -264,12 +283,17 @@ class DataCollector:
         self.min_landmarks = min_landmarks
         self.max_landmarks = max_landmarks
         self.include_circular_gates = include_circular_gates
+        self.max_retries = max(0, int(max_retries))
         self.pm = ProcessManager()
 
-        # Contadores globales
+        # Contadores globales (intentos originales vs reintentos)
         self.total_success = 0
         self.total_failed = 0
         self.total_timeout = 0
+        self.primary_attempts_total = 0
+        self.primary_attempts_accepted = 0
+        self.retry_attempts_total = 0
+        self.retry_attempts_accepted = 0
 
         # Handler para Ctrl+C
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -293,6 +317,38 @@ class DataCollector:
         self._print_summary()
         sys.exit(0)
 
+    @staticmethod
+    def get_attempt_episode_id(ep_idx: int, attempt_idx: int = 0) -> str:
+        """
+        Retorna el identificador de carpeta para un intento de episodio:
+          - Intento original (`attempt_idx == 0`): `episode_XX`
+          - Reintentos (`attempt_idx >= 1`): `episode_XX_attempt_YY`
+        Nunca sobrescribe el intento original ni reintentos previos.
+        """
+        base_id = f"episode_{ep_idx:02d}"
+        if attempt_idx <= 0:
+            return base_id
+        return f"{base_id}_attempt_{attempt_idx:02d}"
+
+    @staticmethod
+    def get_attempt_seed(base_seed: int, task_idx: int, ep_idx: int, attempt_idx: int = 0) -> int:
+        """Calcula una semilla determinista derivada para el intento."""
+        return (base_seed + task_idx) * 1000 + ep_idx + 1 + max(0, int(attempt_idx)) * 100000
+
+    def _next_available_attempt_index(self, task_dir: Path, ep_idx: int, start_attempt: int = 0) -> int:
+        """
+        Encuentra el primer indice de intento (`>= start_attempt`) cuyo directorio no contiene
+        aun un intento registrado (`episode_meta.json`), garantizando que nunca se sobrescriba
+        un intento previo (exitoso o fallido).
+        """
+        att = max(0, int(start_attempt))
+        while True:
+            cand_id = self.get_attempt_episode_id(ep_idx, att)
+            cand_dir = task_dir / cand_id
+            if not (cand_dir / "episode_meta.json").exists():
+                return att
+            att += 1
+
     # ----------------------------------------------------------------
     #  Flujo principal
     # ----------------------------------------------------------------
@@ -305,8 +361,8 @@ class DataCollector:
         print("=" * 60)
         print("  INSTANT POLICY — Data Collector")
         print(f"  Tareas: {self.num_tasks}  |  Episodios/tarea: "
-              f"{self.episodes_per_task}")
-        print(f"  Total vuelos: {self.num_tasks * self.episodes_per_task}")
+              f"{self.episodes_per_task}  |  Max reintentos/ep: {self.max_retries}")
+        print(f"  Validador integrado: v{VALIDATOR_VERSION}")
         print(f"  Dataset dir: {self.dataset_dir}")
         print("=" * 60)
 
@@ -348,44 +404,98 @@ class DataCollector:
                 if self._interrupted:
                     break
 
-                ep_id = f"episode_{ep_idx:02d}"
-                ep_dir = task_dir / ep_id
-                # Semilla deterministica y unica por episodio para variar las poses 3D
-                ep_seed = (self.base_seed + task_idx) * 1000 + ep_idx + 1
+                base_ep_id = self.get_attempt_episode_id(ep_idx, 0)
 
-                # Resume: saltar episodios completos
-                if self.resume and self._is_episode_complete(ep_dir):
-                    print(f"  [SKIP] {ep_id} ya completo.")
+                # Resume: saltar slots de episodio que ya cuentan con un intento aceptado
+                if self.resume and self._is_episode_slot_complete(task_dir, ep_idx):
+                    print(f"  [SKIP] {base_ep_id} ya cuenta con un intento aceptado.")
                     continue
 
-                print(f"\n  --- {task_id} / {ep_id} "
-                      f"({ep_idx + 1}/{self.episodes_per_task}) (ep_seed={ep_seed}) ---")
+                slot_accepted = False
+                for retry_num in range(self.max_retries + 1):
+                    if self._interrupted:
+                        break
 
-                # Generar mundo fisico y waypoints aleatorios para este episodio
-                if not self._generate_episode_world(task_id, ep_seed):
-                    print(f"  [ERROR] Fallo generando mundo para {task_id}/{ep_id}. Saltando.")
-                    self.total_failed += 1
-                    continue
+                    attempt_idx = self._next_available_attempt_index(task_dir, ep_idx, start_attempt=retry_num)
+                    ep_id = self.get_attempt_episode_id(ep_idx, attempt_idx)
+                    ep_dir = task_dir / ep_id
+                    ep_seed = self.get_attempt_seed(self.base_seed, task_idx, ep_idx, attempt_idx)
 
-                result = self._run_episode(
-                    task_id, ep_id, ep_dir,
-                    task_seed=task_seed, ep_seed=ep_seed
-                )
+                    attempt_label = (
+                        "intento original"
+                        if attempt_idx == 0
+                        else f"reintento #{attempt_idx} de {base_ep_id}"
+                    )
+                    print(
+                        f"\n  --- {task_id} / {ep_id} [{attempt_label}] "
+                        f"({ep_idx + 1}/{self.episodes_per_task}) (ep_seed={ep_seed}) ---"
+                    )
 
-                if result == "success":
-                    self.total_success += 1
-                    print(f"  [OK] {ep_id} completado exitosamente.")
-                elif result == "timeout":
-                    self.total_timeout += 1
-                    print(f"  [TIMEOUT] {ep_id} excedio el limite de "
-                          f"{self.episode_timeout}s.")
-                else:
-                    self.total_failed += 1
-                    print(f"  [FAIL] {ep_id} fallo (exit code: {result}).")
+                    if attempt_idx == 0:
+                        self.primary_attempts_total += 1
+                    else:
+                        self.retry_attempts_total += 1
 
-                # Cooldown entre episodios
-                if not self._interrupted:
-                    time.sleep(POST_EPISODE_COOLDOWN)
+                    # Generar mundo fisico y waypoints aleatorios para este intento
+                    if not self._generate_episode_world(task_id, ep_seed):
+                        print(f"  [ERROR] Fallo generando mundo para {task_id}/{ep_id}.")
+                        ep_dir.mkdir(parents=True, exist_ok=True)
+                        self._save_episode_metadata(
+                            ep_dir,
+                            task_id,
+                            ep_id,
+                            "world_gen_failed",
+                            task_seed=task_seed,
+                            ep_seed=ep_seed,
+                            attempt_idx=attempt_idx,
+                            original_episode_id=base_ep_id,
+                            validation_status="rejected",
+                            rejection_reasons=["world_generation_failed"],
+                        )
+                        self.total_failed += 1
+                        continue
+
+                    result = self._run_episode(
+                        task_id,
+                        ep_id,
+                        ep_dir,
+                        task_seed=task_seed,
+                        ep_seed=ep_seed,
+                        attempt_idx=attempt_idx,
+                        original_episode_id=base_ep_id,
+                    )
+
+                    # Cooldown entre intentos/episodios
+                    if not self._interrupted:
+                        time.sleep(POST_EPISODE_COOLDOWN)
+
+                    if result == "accepted":
+                        self.total_success += 1
+                        if attempt_idx == 0:
+                            self.primary_attempts_accepted += 1
+                        else:
+                            self.retry_attempts_accepted += 1
+                        slot_accepted = True
+                        print(f"  [ACCEPTED] {ep_id} validado y aceptado.")
+                        break
+                    elif result == "timeout":
+                        self.total_timeout += 1
+                        print(
+                            f"  [REJECTED/TIMEOUT] {ep_id} excedio el limite de "
+                            f"{self.episode_timeout}s (conservado para auditoria)."
+                        )
+                    else:
+                        self.total_failed += 1
+                        print(
+                            f"  [REJECTED] {ep_id} rechazado ({result}). "
+                            f"Intento conservado intacto en {ep_dir.name}."
+                        )
+
+                if not slot_accepted and not self._interrupted:
+                    print(
+                        f"  [WARN] No se logro un intento aceptado para {task_id}/{base_ep_id} "
+                        f"tras {self.max_retries + 1} intento(s)."
+                    )
 
         elapsed = time.time() - start_time
         print(f"\n{'='*60}")
@@ -453,6 +563,75 @@ class DataCollector:
         return True
 
     # ----------------------------------------------------------------
+    #  Verificacion activa de topicos de PX4 antes de volar
+    # ----------------------------------------------------------------
+
+    def _wait_for_px4_topics(self, timeout_s: float = PX4_TOPIC_READY_TIMEOUT) -> bool:
+        """
+        Espera activamente a que los topicos esenciales de PX4 esten registrados y que
+        `/fmu/out/vehicle_odometry` este publicando muestras antes de grabar el bag y
+        lanzar el piloto experto.
+        """
+        deadline = time.time() + float(timeout_s)
+        full_env = os.environ.copy()
+        full_env["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "33")
+
+        topics_visible = False
+        while time.time() < deadline:
+            if not self.pm.is_running("px4") or not self.pm.is_running("xrce"):
+                return False
+            try:
+                res = subprocess.run(
+                    ["ros2", "topic", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    env=full_env,
+                )
+                if res.returncode == 0:
+                    active_topics = set(line.strip() for line in res.stdout.splitlines() if line.strip())
+                    if all(req in active_topics for req in REQUIRED_ACTIVE_PX4_TOPICS):
+                        topics_visible = True
+                        break
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+        if not topics_visible:
+            return False
+
+        # Verificar que /fmu/out/vehicle_odometry tenga al menos un publicador activo y emita mensajes
+        remaining = max(3.0, deadline - time.time())
+        try:
+            res_echo = subprocess.run(
+                ["ros2", "topic", "echo", "--once", "/fmu/out/vehicle_odometry"],
+                capture_output=True,
+                text=True,
+                timeout=min(remaining, 10.0),
+                env=full_env,
+            )
+            if res_echo.returncode == 0 and res_echo.stdout.strip():
+                return True
+        except Exception:
+            pass
+
+        # Fallback: comprobar publisher count > 0 en ros2 topic info
+        try:
+            res_info = subprocess.run(
+                ["ros2", "topic", "info", "/fmu/out/vehicle_odometry"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                env=full_env,
+            )
+            if res_info.returncode == 0 and "Publisher count: 0" not in res_info.stdout:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    # ----------------------------------------------------------------
     #  Ejecucion de un episodio
     # ----------------------------------------------------------------
 
@@ -463,11 +642,13 @@ class DataCollector:
         ep_dir: Path,
         task_seed: Optional[int] = None,
         ep_seed: Optional[int] = None,
+        attempt_idx: int = 0,
+        original_episode_id: Optional[str] = None,
     ) -> str:
-        """Ejecuta un episodio completo.
+        """Ejecuta y valida automaticamente un episodio completo.
 
         Returns:
-            "success", "timeout", o el exit code como string.
+            "accepted", "timeout", o descripcion del motivo de rechazo/error.
         """
         ep_dir.mkdir(parents=True, exist_ok=True)
         log_dir = ep_dir / "logs"
@@ -487,6 +668,9 @@ class DataCollector:
         # 0. Matar procesos huerfanos de ejecuciones previas
         self._kill_stale_processes()
 
+        exit_code: Optional[int] = None
+        raw_status: str = "unknown_error"
+
         try:
             # 1. Lanzar XRCE-DDS Agent
             print("    Lanzando MicroXRCEAgent...")
@@ -497,6 +681,18 @@ class DataCollector:
                 print("    [ERROR] MicroXRCEAgent murio al iniciar "
                       "(¿puerto 8888 ocupado?). Ver xrce.log")
                 self._print_log_tail(log_dir / "xrce.log", "XRCE Log (ultimas lineas)")
+                self._save_episode_metadata(
+                    ep_dir,
+                    task_id,
+                    ep_id,
+                    "xrce_crash",
+                    task_seed=task_seed,
+                    ep_seed=ep_seed,
+                    attempt_idx=attempt_idx,
+                    original_episode_id=original_episode_id,
+                    validation_status="rejected",
+                    rejection_reasons=["xrce_agent_startup_crash"],
+                )
                 return "xrce_crash"
 
             # 2. Lanzar PX4 + Gazebo
@@ -507,6 +703,18 @@ class DataCollector:
             if not self.pm.is_running("px4"):
                 print("    [ERROR] PX4 murio al iniciar. Ver px4.log")
                 self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
+                self._save_episode_metadata(
+                    ep_dir,
+                    task_id,
+                    ep_id,
+                    "px4_crash",
+                    task_seed=task_seed,
+                    ep_seed=ep_seed,
+                    attempt_idx=attempt_idx,
+                    original_episode_id=original_episode_id,
+                    validation_status="rejected",
+                    rejection_reasons=["px4_startup_crash"],
+                )
                 return "px4_crash"
 
             # 3. Lanzar gz_bridge (solo requerido si se utiliza modelo con camara de profundidad)
@@ -517,7 +725,24 @@ class DataCollector:
             else:
                 print("    [INFO] Vehiculo gz_x500: Observacion privilegiada activa (sin camara de profundidad).")
 
-            # 4. Espera de estabilizacion
+            # 4. Verificar activamente que los topicos de PX4 esten publicando antes de grabar/volar
+            print("    Verificando publicacion activa de topicos PX4...")
+            if not self._wait_for_px4_topics(timeout_s=PX4_TOPIC_READY_TIMEOUT):
+                print("    [ERROR] Los topicos de PX4 no comenzaron a publicar a tiempo.")
+                self._save_episode_metadata(
+                    ep_dir,
+                    task_id,
+                    ep_id,
+                    "px4_topics_inactive",
+                    task_seed=task_seed,
+                    ep_seed=ep_seed,
+                    attempt_idx=attempt_idx,
+                    original_episode_id=original_episode_id,
+                    validation_status="rejected",
+                    rejection_reasons=["px4_topics_not_publishing_before_takeoff"],
+                )
+                return "px4_topics_inactive"
+
             print(f"    Esperando {PRE_FLIGHT_SETTLE}s de estabilizacion...")
             time.sleep(PRE_FLIGHT_SETTLE)
 
@@ -537,28 +762,58 @@ class DataCollector:
             exit_code = self.pm.wait("pilot", timeout=self.episode_timeout)
 
             if exit_code is None:
-                # Timeout
+                raw_status = "timeout"
                 print(f"\n    [TIMEOUT] El episodio excedio los {self.episode_timeout}s.")
-                self._save_episode_metadata(
-                    ep_dir, task_id, ep_id, "timeout",
-                    task_seed=task_seed, ep_seed=ep_seed
-                )
                 self._print_log_tail(log_dir / "px4.log", "PX4 Log (ultimas lineas)")
                 self._print_log_tail(log_dir / "pilot.log", "Pilot Log (ultimas lineas)")
-                return "timeout"
             elif exit_code == 0:
-                # Guardar metadata del episodio exitoso
-                self._save_episode_metadata(
-                    ep_dir, task_id, ep_id, "success",
-                    task_seed=task_seed, ep_seed=ep_seed
-                )
-                return "success"
+                raw_status = "success"
             else:
-                self._save_episode_metadata(
-                    ep_dir, task_id, ep_id, f"pilot_exit_{exit_code}",
-                    task_seed=task_seed, ep_seed=ep_seed
-                )
-                return str(exit_code)
+                raw_status = f"pilot_exit_{exit_code}"
+
+            # 8. Cerrar limpiamente el bag ANTES de ejecutar el validador post-vuelo
+            print("    Cerrando rosbag limpiamente (SIGINT)...")
+            self.pm.stop("bag", signal.SIGINT)
+
+            # Guardar metadata base con version y parametros congelados del validador
+            self._save_episode_metadata(
+                ep_dir,
+                task_id,
+                ep_id,
+                raw_status,
+                task_seed=task_seed,
+                ep_seed=ep_seed,
+                attempt_idx=attempt_idx,
+                original_episode_id=original_episode_id,
+            )
+
+            # 9. Invocar automaticamente el validador sobre el episodio cerrado
+            print(f"    Ejecutando validate_episode_directory (v{VALIDATOR_VERSION})...")
+            val_report = validate_episode_directory(
+                ep_dir,
+                pilot_exit_code=exit_code,
+                update_meta=True,
+            )
+            val_status = val_report.get("validation_status", "rejected")
+            rej_reasons = val_report.get("rejection_reasons", [])
+
+            if raw_status == "timeout" and "pilot_timeout" not in rej_reasons:
+                rej_reasons = ["pilot_timeout"] + list(rej_reasons)
+                val_status = "rejected"
+                meta_path = ep_dir / "episode_meta.json"
+                if meta_path.is_file():
+                    with open(meta_path, "r", encoding="utf-8") as mf:
+                        meta_obj = json.load(mf)
+                    meta_obj["validation_status"] = "rejected"
+                    meta_obj["rejection_reasons"] = rej_reasons
+                    with open(meta_path, "w", encoding="utf-8") as mf:
+                        json.dump(meta_obj, mf, indent=2)
+
+            if val_status == "accepted" and raw_status == "success":
+                return "accepted"
+            if raw_status == "timeout":
+                return "timeout"
+            return f"rejected ({', '.join(rej_reasons) if rej_reasons else raw_status})"
 
         except Exception as e:
             print(f"    [EXCEPTION] {e}")
@@ -567,7 +822,7 @@ class DataCollector:
         finally:
             # Cleanup: detener todo agresivamente
             print("    Cerrando procesos...")
-            # Bag: SIGINT para cierre limpio del archivo (tiene timeout interno de gracia)
+            # Bag: SIGINT para cierre limpio del archivo (no-op si ya se detuvo en el paso 8)
             self.pm.stop("bag", signal.SIGINT)
             
             # En lugar de pedir amablemente con stop_all() y causar cuelgues,
@@ -725,16 +980,23 @@ class DataCollector:
         status: str,
         task_seed: Optional[int] = None,
         ep_seed: Optional[int] = None,
+        attempt_idx: int = 0,
+        original_episode_id: Optional[str] = None,
+        validation_status: Optional[str] = None,
+        rejection_reasons: Optional[List[str]] = None,
     ) -> None:
-        """Guarda metadata del episodio en JSON."""
+        """Guarda metadata del episodio en JSON con parametros congelados del validador."""
         spawn_pose = (
             PX4_MODEL_POSE_GROUND
             if self.no_takeoff_platform
             else PX4_MODEL_POSE_PLATFORM
         )
-        meta = {
+        meta: Dict[str, Any] = {
             "task_id": task_id,
             "episode_id": ep_id,
+            "original_episode_id": original_episode_id or ep_id.split("_attempt_")[0],
+            "attempt_index": int(attempt_idx),
+            "is_retry": bool(attempt_idx > 0),
             "task_seed": task_seed,
             "episode_seed": ep_seed,
             "status": status,
@@ -747,30 +1009,51 @@ class DataCollector:
             "lidar_r_max": 10.0,
             "topics_recorded": RECORD_TOPICS,
             "episode_timeout_s": self.episode_timeout,
+            "validator_version": VALIDATOR_VERSION,
+            "validation_parameters": get_effective_validation_parameters(),
         }
+        if validation_status is not None:
+            meta["validation_status"] = validation_status
+        if rejection_reasons is not None:
+            meta["rejection_reasons"] = list(rejection_reasons)
+
         meta_path = ep_dir / "episode_meta.json"
-        with open(meta_path, "w") as f:
+        with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
     def _is_task_complete(self, task_dir: Path) -> bool:
-        """Verifica si una tarea tiene todos sus episodios completos."""
+        """Verifica si una tarea tiene todos sus slots de episodio aceptados."""
         if not task_dir.is_dir():
             return False
         complete = 0
         for ep_idx in range(self.episodes_per_task):
-            ep_dir = task_dir / f"episode_{ep_idx:02d}"
-            if self._is_episode_complete(ep_dir):
+            if self._is_episode_slot_complete(task_dir, ep_idx):
                 complete += 1
         return complete >= self.episodes_per_task
 
+    def _is_episode_slot_complete(self, task_dir: Path, ep_idx: int) -> bool:
+        """
+        Verifica si el slot `episode_XX` cuenta con un intento aceptado (ya sea en
+        `episode_XX` o en alguno de sus reintentos `episode_XX_attempt_YY`).
+        """
+        base_dir = task_dir / self.get_attempt_episode_id(ep_idx, 0)
+        if self._is_episode_complete(base_dir):
+            return True
+        for att_dir in sorted(task_dir.glob(f"episode_{ep_idx:02d}_attempt_*")):
+            if att_dir.is_dir() and self._is_episode_complete(att_dir):
+                return True
+        return False
+
     def _is_episode_complete(self, ep_dir: Path) -> bool:
-        """Verifica si un episodio fue completado exitosamente."""
+        """Verifica si un directorio de episodio fue validado y aceptado (`validation_status == 'accepted'`)."""
         meta_path = ep_dir / "episode_meta.json"
         if not meta_path.exists():
             return False
         try:
-            with open(meta_path) as f:
+            with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
+            if "validation_status" in meta:
+                return meta.get("validation_status") == "accepted"
             return meta.get("status") == "success"
         except Exception:
             return False
@@ -790,13 +1073,24 @@ class DataCollector:
                 print(f"      [WARN] No se pudo leer {log_file.name}: {e}")
 
     def _print_summary(self) -> None:
-        """Imprime resumen de la recoleccion."""
+        """Imprime resumen de la recoleccion diferenciando intento original vs post-reintento."""
         total = self.total_success + self.total_failed + self.total_timeout
-        print(f"\n  Resumen: {total} episodios ejecutados")
-        print(f"    Exitosos:  {self.total_success}")
-        print(f"    Fallidos:  {self.total_failed}")
+        print(f"\n  Resumen: {total} intentos ejecutados")
+        print(f"    Aceptados: {self.total_success}")
+        print(f"    Rechazados:{self.total_failed}")
         print(f"    Timeouts:  {self.total_timeout}")
-        if total > 0:
+        if self.primary_attempts_total > 0:
+            p_rate = self.primary_attempts_accepted / self.primary_attempts_total * 100.0
+            post_rate = self.total_success / self.primary_attempts_total * 100.0
+            print(
+                f"    Exito en 1er intento (original): "
+                f"{self.primary_attempts_accepted}/{self.primary_attempts_total} ({p_rate:.1f}%)"
+            )
+            print(
+                f"    Exito tras reintentos (slots):   "
+                f"{self.total_success}/{self.primary_attempts_total} ({post_rate:.1f}%)"
+            )
+        elif total > 0:
             rate = self.total_success / total * 100
             print(f"    Tasa de exito: {rate:.1f}%")
         print("=" * 60)
@@ -874,6 +1168,11 @@ def main():
         "--include-circular-gates", action="store_true",
         help="Incluir aros circulares (circular_gate) en el catalogo de tareas.",
     )
+    parser.add_argument(
+        "--max-retries", type=int, default=2,
+        help="Maximo de reintentos con semilla derivada cuando un episodio es rechazado "
+        "(guardados como episode_XX_attempt_YY sin sobrescribir el intento original). Default: 2.",
+    )
 
     args = parser.parse_args()
 
@@ -893,6 +1192,7 @@ def main():
         min_landmarks=args.min_landmarks,
         max_landmarks=args.max_landmarks,
         include_circular_gates=args.include_circular_gates,
+        max_retries=args.max_retries,
     )
     
     try:

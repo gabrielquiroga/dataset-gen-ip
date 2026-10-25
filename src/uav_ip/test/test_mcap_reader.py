@@ -409,3 +409,60 @@ def test_odometry_policy_rejects_local_pos_only_and_never_fabricates_zero_resets
     assert any(r.startswith("ekf2_estimator_reset_in_flight") for r in rep_with_rc["rejection_reasons"])
     assert rep_with_rc["metrics"]["estimator_resets_verified"] is True
     assert rep_with_rc["metrics"]["in_flight_estimator_resets"] == 1
+
+
+def test_native_mcap_parser_deserializes_timesync_status(tmp_path: Path):
+    """
+    Fase 2 (Tarea 2.5.4): Verifica que `_parse_mcap_native` y `verify_mcap_integrity`
+    reconocen el esquema `px4_msgs/msg/TimesyncStatus` en `/fmu/out/timesync_status`
+    y deserializan correctamente `timestamp`, `estimated_offset`, `observed_offset` y `round_trip_time`.
+    """
+    buf = bytearray(48)
+    buf[0] = 0x00
+    buf[1] = 0x01
+    ts_us = 1_790_000_000_000_000
+    remote_ts_us = 15_000_000
+    observed_offset_us = -350_000
+    estimated_offset_us = -350_000
+    rtt_us = 1200
+    struct.pack_into("<Q", buf, 4, ts_us)
+    buf[12] = 2  # source_protocol
+    struct.pack_into("<QqqI", buf, 20, remote_ts_us, observed_offset_us, estimated_offset_us, rtt_us)
+
+    header_rec = _mcap_record(0x01, _mcap_str("ros2") + _mcap_str("uav_ip_test"))
+    schema_ts = _mcap_record(
+        0x03,
+        struct.pack("<H", 1)
+        + _mcap_str("px4_msgs/msg/TimesyncStatus")
+        + _mcap_str("ros2msg")
+        + _mcap_bytes(
+            b"uint64 timestamp\nuint8 source_protocol\nuint64 remote_timestamp\n"
+            b"int64 observed_offset\nint64 estimated_offset\nuint32 round_trip_time\n"
+        ),
+    )
+    chan_ts = _mcap_record(
+        0x04,
+        struct.pack("<HH", 1, 1) + _mcap_str("/fmu/out/timesync_status") + _mcap_str("cdr") + struct.pack("<I", 0),
+    )
+    log_ns = ts_us * 1000
+    msg_ts = _mcap_record(0x05, struct.pack("<HIQQ", 1, 0, log_ns, log_ns) + bytes(buf))
+    footer_rec = _mcap_record(0x02, struct.pack("<QQI", 0, 0, 0))
+
+    raw_mcap = MCAP_MAGIC + header_rec + schema_ts + chan_ts + msg_ts + footer_rec + MCAP_MAGIC
+    mcap_path = tmp_path / "timesync_test.mcap"
+    mcap_path.write_bytes(raw_mcap)
+
+    assert verify_mcap_integrity(mcap_path) == raw_mcap
+
+    res = _parse_mcap_native(mcap_path)
+    assert res is not None
+    parsed, verified_schemas = res
+    assert "px4_msgs/msg/TimesyncStatus" in verified_schemas
+    assert len(parsed["timesync_status"]) == 1
+    item = parsed["timesync_status"][0]
+    assert item["timestamp_us"] == ts_us
+    assert item["remote_timestamp_us"] == remote_ts_us
+    assert item["observed_offset_us"] == observed_offset_us
+    assert item["estimated_offset_us"] == estimated_offset_us
+    assert item["round_trip_time_us"] == rtt_us
+

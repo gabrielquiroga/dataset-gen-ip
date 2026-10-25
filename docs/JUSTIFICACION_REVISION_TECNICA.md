@@ -20,7 +20,7 @@ Este documento registra **qué se cambió, por qué, bajo qué hipótesis y qué
 | Componente | Qué hace hoy | Qué **no** hace todavía |
 |---|---|---|
 | `validation_geometry.py` | Punto único de verdad geométrico (`PROTECTED_VOLUME_MODEL = "sphere_3d_around_base_link"`), mediciones trazables del SDF `x500`/`x500_base` (`UAV_PHYSICAL_RADIUS_XY = 0.25 m`, `UAV_SAFETY_MARGIN_XY = 0.05 m`, `UAV_COLLISION_RADIUS_XY = 0.30 m`), derivación de tolerancias (`derive_validation_tolerances()`) y especificación 1 a 1 de los 16 cilindros de `circular_gate` (`get_circular_gate_cylinders_spec()`). | El radio de `0.25 m` cubre la caja de colisión de `base_link` y los ejes de motores; el barrido completo de las puntas de hélice (`0.3857 m`) se documenta como hipótesis y parámetro revisable antes de la campaña si se modelan contactos de pala. |
-| `validate_episode.py` | Valida offline `waypoints.yaml`, grabación MCAP (sin degradación silenciosa entre `rosbags` y parser nativo, verificando stream completo y CRC32 de chunks sin comprimir), reloj estructurado, `VehicleOdometry` obligatoria para aceptación y geometría/misión progresiva con cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$. | `data_collector.py` sigue marcando el éxito por `returncode` del piloto. La integración cierre → lectura → validación → aceptación es **Fase 2**. |
+| `validate_episode.py` | Valida offline o en línea (`data_collector.py`) `waypoints.yaml`, grabación MCAP (sin degradación silenciosa entre `rosbags` y parser nativo, verificando stream completo y CRC32 de chunks sin comprimir), reloj estructurado con desambiguación analítica de `/fmu/out/timesync_status`, `VehicleOdometry` obligatoria para aceptación y geometría/misión progresiva con cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$. | Integrado con `data_collector.py` (Fase 2 completada); los intentos fallidos se conservan intactos y los reintentos se guardan en `episode_XX_attempt_YY`. |
 | `waypoint_controller.py` / `base_pilot.py` | Tolerancias de paso por `center` importadas de `validation_geometry.py` distinguiendo abertura rectangular (`|y| ≤ 0.33 m`, `|z| ≤ 0.38 m`) y circular (`r ≤ 0.3656 m`); aterrizaje con frescura de mensajes, posición XY en pad, `z ≤ 0.25 m`, `landed == True` y persistencia continua (`3.0 s`), saliendo con código `1` propagado al proceso si vence `10.0 s`. | El piloto sigue siendo una máquina de estados cinemática por waypoints; la validación independiente posterior al vuelo sigue siendo indispensable. |
 | `world_generator.py` | Usa `get_circular_gate_cylinders_spec()` de `validation_geometry.py` para construir la puerta circular en el SDF y ejecuta el filtro previo de transiciones (`start_pose → pre_1` e interferencia con landmarks de terceros). | No es una garantía de que el vuelo sea factible: es una heurística que descarta escenarios degenerados. |
 | Tests | 56 tests en 8 módulos (`test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py`, `test_mcap_reader.py`, `test_validation_geometry.py`, `test_primitive_validation.py`, `test_synthetic_lidar.py`), cubriendo `C1–C9`. | Los tests sobre bags reales se **omiten** (`pytest.skip`) si `datasets/` no está presente. |
@@ -173,8 +173,8 @@ La segunda revisión (`respuesta.md`) y el plan quirúrgico de cierre (`plan_f1.
 4. **Evidencia disponible.**
    - `test_validation_clock.py` (6 tests): `test_unix_delivery_backlog_does_not_erase_source_gap` (700 ms en ráfaga no se convierte en 16 ms), visibilidad de duplicados y retrocesos, preservación del intervalo entre vecinos en Patrón A, rechazo de relojes ausentes/no finitos y rechazo de extremo a extremo en `validate_episode_data()`.
    - Al evaluar los 12 episodios históricos de `datasets/task_0000`–`task_0003` con este criterio más estricto, los 12 quedan rechazados en `recording_status` porque contienen 1–2 escalones de offset UNIX de `uxrce_dds_client` de $\sim 0.27\text{–}0.48\text{ s}$ (Patrón B o Patrón A con salto entre vecinos). No se relajaron los umbrales para forzar su aceptación.
-5. **Limitación residual.** En la configuración actual de `uxrce_dds_client` + PX4 SITL, los reajustes de offset UNIX durante el vuelo provocan rechazos conservadores bajo Patrón B porque el mensaje `VehicleOdometry` exportado no separa el reloj monotónico de PX4 del offset UNIX estimado por el puente.
-6. **Condición para revisarla.** Si en el piloto de Fase 2/3 los reajustes de `Timesync` de `uxrce_dds_client` siguen provocando rechazos frecuentes en vuelos físicamente limpios, grabar también el tópico `/fmu/out/timesync_status` para verificar analíticamente el cambio de offset antes de reparar un escalón.
+5. **Limitación residual y resolución (Fase 2).** En la configuración estándar de `uxrce_dds_client` + PX4 SITL, los reajustes periódicos de offset UNIX durante el vuelo provocaban rechazos conservadores bajo Patrón B porque `VehicleOdometry` no separaba el reloj monotónico del offset UNIX. En la Fase 2 se resolvió formalmente: `data_collector.py` graba `/fmu/out/timesync_status` (`px4_msgs/msg/TimesyncStatus`) y `validate_episode.py` implementa la desambiguación analítica: si un salto en `VehicleOdometry.timestamp` correlaciona en $\pm 0.05\text{ s}$ con un salto de `estimated_offset` de igual magnitud, se repara el reloj (`timesync_offset_adjustment_repaired`) y se acepta para validación (`usable_for_validation = True`).
+6. **Condición para revisarla.** Si en vuelos reales de hardware o simulaciones con otra versión de DDS se observan desfases no correlacionados, mantener el rechazo estricto por `ambiguous_clock_step_pattern_b`.
 
 ### 4.6 Secuencia temporal progresiva de primitivas y condiciones de validez (`respuesta.md` §3.6, `plan_f1.md` C8)
 
@@ -241,9 +241,17 @@ La segunda revisión (`respuesta.md`) y el plan quirúrgico de cierre (`plan_f1.
 
 ---
 
-## 6. Pendientes antes de la generación masiva
+## 6. Estado de los Componentes y Próximos Pasos
 
-1. **Fase 2:** integrar el validador en `data_collector.py`, conservar los intentos fallidos con sus `rejection_reasons`, congelar los umbrales y reportar el éxito por intento original (sin contar reintentos con otra semilla como éxito).
-2. **Fase 2/3:** decidir si se graba `/fmu/out/timesync_status` en `data_collector.py` para desambiguar analíticamente los escalones de offset UNIX de `uxrce_dds_client` (§4.5) y calibrar `landing_window_s` (§4.1).
-3. **Evaluación de holgura de palas en el piloto pre-campaña (Fase 3):** verificar en los 50 vuelos del piloto pre-campaña si `min_obstacle_clearance_m` se mantiene por encima de `X500_FULL_ROTOR_TIP_RADIUS_M = 0.3857 m` (§4.2) o si conviene adoptar directamente ese radio como `UAV_PHYSICAL_RADIUS_XY`.
+1. **Fase 2 (Hito 2.5) — [COMPLETADO]:**
+   - Integración en línea del validador en `data_collector.py` con cierre limpio de bag vía `SIGINT`.
+   - Grabación de `/fmu/out/timesync_status` y desambiguación analítica del Patrón B en `validate_episode.py`.
+   - Conservación estricta de intentos fallidos y reintentos no destructivos en `episode_XX_attempt_YY`.
+   - Congelamiento de versión a `VALIDATOR_VERSION = "1.2.0"` y registro de parámetros en `episode_meta.json`.
+   - Remuestreo uniforme a 10 Hz ($\Delta t = 0.1\text{ s}$) con `valid_mask` $(T, 8)$ y Tube Augmentation en esfera euclídea sólida $\|\delta p\|_2 \le 0.60\text{ m}$ con clearance $\ge 0.30\text{ m}$ en `bag_to_heterodata.py`.
+   - Auditoría en 3 capas en `audit_dataset.py` (vuelos crudos, tensores .pt, particionado oficial con $\ge 5$ episodios válidos por tarea).
+2. **Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [PENDIENTE]:**
+   - Ejecutar la campaña piloto preliminar con `data_collector.py`.
+   - Reportar la tasa de aceptación por intento original por separado de la tasa post-reintentos.
+   - Evaluación de holgura de palas: verificar si `min_obstacle_clearance_m` se mantiene por encima de `X500_FULL_ROTOR_TIP_RADIUS_M = 0.3857 m` (§4.2) o si conviene adoptar directamente ese radio como `UAV_PHYSICAL_RADIUS_XY`.
 

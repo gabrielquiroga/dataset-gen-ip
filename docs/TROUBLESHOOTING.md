@@ -65,3 +65,21 @@ Aislar la simulación al loopback:
 export GZ_IP=127.0.0.1
 export GZ_PARTITION=sim
 ```
+
+---
+
+## 5. Episodio Rechazado por Salto de Reloj o Ambigüedad (`ambiguous_clock_step_pattern_b`)
+
+**Síntoma:** `validate_episode.py` o `data_collector.py` rechazan un episodio con `recording_status: invalid` y la causa `ambiguous_clock_step_pattern_b` o `telemetry_dropout_gap`.
+
+**Causa:**
+En PX4 SITL, el cliente micro-XRCE (`uxrce_dds_client`) recalibra periódicamente el offset UNIX durante el vuelo (habitualmente cada 15–17 s), introduciendo saltos de $0.25\text{–}0.48\text{ s}$ en los timestamps exportados por `VehicleOdometry`.
+
+**Solución y Diagnóstico:**
+1. A partir de la Fase 2, `data_collector.py` graba automáticamente `/fmu/out/timesync_status` (`px4_msgs/msg/TimesyncStatus`).
+2. El validador `validate_episode.py` desambigua analíticamente: si el salto en odometría coincide en una ventana de $\pm 0.05\text{ s}$ con un salto equivalente en `TimesyncStatus.estimated_offset`, el reloj se repara automáticamente (`timesync_offset_adjustment_repaired`) y el episodio se acepta (`usable_for_validation = True`).
+3. Si el episodio sigue rechazado con `ambiguous_clock_step_pattern_b`:
+   - Verifica que `/fmu/out/timesync_status` esté presente en el rosbag (`ros2 bag info <bag_dir>`).
+   - Los episodios grabados antes de Fase 1.1/Fase 2 carecen de este tópico y deben ser re-recolectados.
+   - Si no se debe a un ajuste de offset de red sino a una congelación genuina de la simulación o caída de telemetría superior a $0.15\text{ s}$, el rechazo es legítimo y `data_collector.py` lanzará un reintento no destructivo (`episode_XX_attempt_01`).
+

@@ -62,7 +62,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 | **`base_pilot.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ciclo de vida ROS 2, pre-flujo de 50 setpoints a 50 Hz para armado Offboard seguro, suscripción a `/fmu/out/vehicle_land_detected`, registro de frescura de mensajes y conversión base NED/ENU. |
 | **`waypoint_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Ejecuta `traverse`, `slalom`, `overfly`, `orbit` con velocidad *feed-forward* en `center`/arcos, tolerancias de paso derivadas de `validation_geometry.py` (`|y| ≤ 0.33m, |z| ≤ 0.38m` en cuadrada y `r ≤ 0.3656m` en circular) y aterrizaje confirmado por persistencia continua (`3.0 s`) de `landed` (código 1 propagado si vence `10.0 s`). |
 | **`tracking_controller.py`** | `src/uav_ip/uav_ip/` | **Completado** | Conversión consistente entre coordenadas Gazebo ENU y PX4 NED en el cálculo de rumbo. |
-| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado y variación de pose inicial (integración en línea del validador pendiente en Fase 2). |
+| **`data_collector.py`** | `src/uav_ip/scripts/` | **Completado** | Orquestador multi-tarea/episodio robusto con `PX4_GZ_MODEL_POSE` unificado, espera activa de tópicos PX4, grabación de `timesync_status`, validación post-vuelo en línea sin sobrescribir intentos originales (`episode_XX_attempt_YY`) y congelamiento de versión/parámetros del validador. |
 | **`validation_geometry.py`** | `src/uav_ip/uav_ip/` | **Completado** | Fuente única de verdad geométrica, mediciones trazables del SDF `x500` (`UAV_COLLISION_RADIUS_XY = 0.30 m`), derivación de tolerancias (`derive_validation_tolerances()`) y especificación 1 a 1 de los 16 cilindros de `circular_gate`. |
 | **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador de configuración, grabación y misión independiente del piloto (sin degradación silenciosa entre `rosbags` y parser nativo MCAP/CDR, verificación de CRC32, `VehicleOdometry` obligatoria, reloj estructurado `C3`, aterrizaje en ventana temporal común `C4`, cota inferior de discretización `C7` y secuencia progresiva de primitivas `C8`). |
 | **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR 360° en marco *Horizontal FLU* ($s=0.1$, FPS 2048 determinista acelerado ~7x con kernel C SIMD), cuota acotada en `landing_pad` y *thin wrapper* en `scripts/`. |
@@ -244,20 +244,23 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 - [x] **Suite modular de pruebas y trazabilidad documental (`C9 + C10`):**
   * 56 tests en 8 módulos (`test_validation_cli.py`, `test_validation_contract.py`, `test_validation_clock.py`, `test_landing_validation.py`, `test_mcap_reader.py`, `test_validation_geometry.py`, `test_primitive_validation.py`, `test_synthetic_lidar.py`).
 
-#### Fase 2: Integración en la Recolección, Filtrado de Postproceso y Auditoría en 3 Capas — [ ] PENDIENTE
-- [ ] **Tarea 2.5.4: Integrar el validador en `data_collector.py`:**
-  * Esperar *topics* activos antes de lanzar el piloto e invocar `validate_episode_directory(..., update_meta=True)` al cerrar el bag.
-  * **Conservar los intentos fallidos** con sus `rejection_reasons`.
-  * Si hay reintentos con semilla derivada, registrarlos como intentos nuevos y no sobrescribir el original.
-- [ ] **Tarea 2.5.5: Filtrado y re-muestreo en `bag_to_heterodata.py`:**
-  * Ignorar los episodios `rejected` y usar el reloj reconstruido.
-  * Interpolar uniformemente en el tiempo (10 Hz) en lugar de diezmar por índice.
-  * Verificar la distancia a obstáculos en las poses perturbadas del *Tube Augmentation*.
-- [ ] **Tarea 2.5.6: Auditoría en 3 capas (`audit_dataset.py`):**
-  * Vuelos crudos: tasas de aceptación y rechazo por causa.
-  * Tensores `.pt`: finitud, formas, ortogonalidad $SO(3)$ y horizonte $T=8$.
-  * Mínimo de episodios aceptados por tarea antes de incluirla en los *splits*.
-- [ ] **Congelar los umbrales del validador** (con versión registrada en `episode_meta.json`) antes de medir el lote de evaluación.
+#### Fase 2: Integración en la Recolección, Filtrado de Postproceso y Auditoría en 3 Capas — [x] COMPLETADO
+- [x] **Tarea 2.5.4: Integrar el validador en `data_collector.py` y desambiguación analítica del reloj (`validate_episode.py`):**
+  * `RECORD_TOPICS` incluye `/fmu/out/timesync_status` (`px4_msgs/msg/TimesyncStatus`) y `validate_episode.py` deserializa el mensaje tanto en el parser nativo XCDR1 como en `rosbags`.
+  * Espera activa de tópicos PX4 (`_wait_for_px4_topics`) antes de armar/despegar.
+  * Desambiguación analítica del reloj en `reconstruct_simulation_clock`: si un escalón en `VehicleOdometry.timestamp` correlaciona en $\pm 0.05\text{ s}$ con un salto en `TimesyncStatus.estimated_offset` ($\Delta t_{\text{odom}} \approx -\Delta \text{estimated\_offset}$ dentro de $0.05\text{ s}$), se repara el reloj y se clasifica como `timesync_offset_adjustment_repaired` con `usable_for_validation = True`.
+  * Invocación automática de `validate_episode_directory(..., update_meta=True)` tras cierre limpio del bag con `SIGINT`.
+  * **Conservación estricta de intentos fallidos:** los reintentos con semilla derivada se guardan en `episode_XX_attempt_YY` sin sobrescribir jamás el intento original `episode_XX`.
+- [x] **Tarea 2.5.5: Filtrado y re-muestreo en `bag_to_heterodata.py`:**
+  * `discover_dataset_episodes` ignora estrictamente episodios con `validation_status != "accepted"` cuando `include_failed=False`.
+  * Remuestreo temporal uniforme a 10 Hz ($\Delta t = 0.1\text{ s}$) sobre `reconstructed_time_s` (`resample_trajectory_10hz`) para poses $SE(3)$ y LiDAR, desenvolviendo la fase (`np.unwrap`) de `yaw_enu` e interpolando cuaterniones con SLERP.
+  * Tensor booleano `data['agent'].valid_mask` de forma `(T, 8)` para discernir horizonte físico real ($0.8\text{ s}$) de pasos terminales clampeados.
+  * *Tube Augmentation* con cota esférica sólida $\|\delta p\|_2 \le 0.60\text{ m}$, filtrado de colisiones mediante `compute_landmark_clearance()` ($\ge 0.30\text{ m}$) y verificación de transitabilidad/cuerda en puertas `traverse`.
+- [x] **Tarea 2.5.6: Auditoría en 3 capas (`audit_dataset.py`):**
+  * Capa 1: tasas de aceptación en intento original vs. post-reintentos y desglose de `rejection_reasons`.
+  * Capa 2: auditoría de tensores `.pt` (finitud, formas `(T, 2048, 3)`, `(T, 8, 4, 4)`, `(T, 8)`, ortogonalidad estricta $SO(3)$ y horizonte $0.8\text{ s}$).
+  * Capa 3: umbral mínimo de episodios aceptados ($\ge 5$) por tarea para particionado oficial en `train_tasks.json`, `val_tasks.json` y `held_out_tasks.json`.
+- [x] **Congelamiento de umbrales del validador:** `VALIDATOR_VERSION = "1.2.0"` y parámetros efectivos registrados en `episode_meta.json` antes de iniciar la campaña.
 
 #### Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [ ] PENDIENTE
 - [ ] **Tarea 2.5.7: Ejecución y reporte del piloto pre-campaña:**
