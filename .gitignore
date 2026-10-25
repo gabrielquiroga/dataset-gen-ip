@@ -11,6 +11,7 @@ COLCON_IGNORE
 # Datasets, Rosbags & Large Files (CRITICO)
 # ==========================================
 dataset_*/
+datasets_*/
 datasets/
 *.mcap
 *.db3

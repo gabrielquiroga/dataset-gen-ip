@@ -1245,34 +1245,33 @@ def _extract_timesync_offset_steps(
     if not timesync_status or len(timesync_status) < 2:
         return []
 
-    raw_offsets: List[float] = []
-    has_explicit_s = False
-    has_explicit_us = False
+    valid_items: List[Tuple[Dict[str, Any], float]] = []
     for item in timesync_status:
+        val: Optional[float] = None
         if "estimated_offset_s" in item:
-            raw_offsets.append(float(item["estimated_offset_s"]))
-            has_explicit_s = True
+            val = float(item["estimated_offset_s"])
         elif "estimated_offset_us" in item:
-            raw_offsets.append(float(item["estimated_offset_us"]) * 1e-6)
-            has_explicit_us = True
+            val = float(item["estimated_offset_us"]) * 1e-6
         elif "estimated_offset" in item:
-            raw_offsets.append(float(item["estimated_offset"]))
-        else:
-            raw_offsets.append(0.0)
+            v_raw = float(item["estimated_offset"])
+            val = v_raw * 1e-6 if abs(v_raw) > 50.0 else v_raw
+        if val is not None:
+            valid_items.append((item, val))
 
-    if not has_explicit_s and not has_explicit_us:
-        max_abs = max((abs(v) for v in raw_offsets), default=0.0)
-        if max_abs > 50.0:
-            raw_offsets = [v * 1e-6 for v in raw_offsets]
+    has_large_offset = any(abs(v) > 100.0 for _, v in valid_items)
+    if has_large_offset:
+        valid_items = [(it, v) for it, v in valid_items if abs(v) > 1.0]
+
+    if len(valid_items) < 2:
+        return []
 
     events: List[Dict[str, Any]] = []
-    for m in range(1, len(timesync_status)):
-        delta_offset_s = float(raw_offsets[m] - raw_offsets[m - 1])
+    for m in range(1, len(valid_items)):
+        cur, cur_off = valid_items[m]
+        prev, prev_off = valid_items[m - 1]
+        delta_offset_s = float(cur_off - prev_off)
         if abs(delta_offset_s) <= 0.010:
             continue
-
-        cur = timesync_status[m]
-        prev = timesync_status[m - 1]
 
         t_bag_s: Optional[float] = None
         if "timestamp_bag_s" in cur:
@@ -1421,6 +1420,9 @@ def reconstruct_simulation_clock(
         ambiguous_step_mask |= (dt_bag <= 0.0)
         reasons.append("non_monotonic_bag_reception_clock")
 
+    # Extraer escalones de offset de TimesyncStatus para desambiguacion analitica
+    ts_events = _extract_timesync_offset_steps(timesync_status)
+
     # 1. Patron A: muestra aislada en tiempo de arranque (< 1e6) rodeada por muestras UNIX (> 1e8)
     for k in range(1, N - 1):
         if raw_px4[k] < 1e6 and raw_px4[k - 1] > 1e8 and raw_px4[k + 1] > 1e8:
@@ -1429,12 +1431,27 @@ def reconstruct_simulation_clock(
             dt_b1 = float(dt_bag[k])
             neighbor_bag_span = dt_b0 + dt_b1
 
+            eff_span = neighbor_px4_span
+            matched_ts_ev = None
+            if abs(neighbor_px4_span - neighbor_bag_span) > 0.050:
+                for ev in ts_events:
+                    tb = ev.get("t_bag_s")
+                    if tb is not None and abs(tb - raw_bag[k]) <= (TIMESYNC_MATCH_WINDOW_S + 0.050):
+                        for sgn in (1.0, -1.0):
+                            cand_span = neighbor_px4_span + sgn * float(ev["delta_offset_s"])
+                            if abs(cand_span - neighbor_bag_span) <= 0.050:
+                                eff_span = cand_span
+                                matched_ts_ev = ev
+                                break
+                    if matched_ts_ev is not None:
+                        break
+
             # Preservar siempre el intervalo real entre los vecinos UNIX validos (k-1 y k+1)
             # cuando dicho intervalo y los pasos de recepcion son positivos.
-            if neighbor_px4_span > 0.0 and dt_b0 > 0.0 and dt_b1 > 0.0:
+            if eff_span > 0.0 and dt_b0 > 0.0 and dt_b1 > 0.0:
                 w0 = dt_b0 / neighbor_bag_span
-                rep_dt0 = neighbor_px4_span * w0
-                rep_dt1 = neighbor_px4_span - rep_dt0
+                rep_dt0 = eff_span * w0
+                rep_dt1 = eff_span - rep_dt0
                 dt_reconstructed[k - 1] = rep_dt0
                 dt_reconstructed[k] = rep_dt1
             else:
@@ -1445,14 +1462,16 @@ def reconstruct_simulation_clock(
             # el span entre vecinos UNIX concuerda con la recepcion (|span_px4 - span_bag| <= 0.05 s)
             # y ninguno de los subpasos reconstruidos excede MAX_ALLOWED_DT_GAP_S.
             if (
-                neighbor_px4_span > 0.0
+                eff_span > 0.0
                 and 0.0 < dt_b0 <= 0.100
                 and 0.0 < dt_b1 <= 0.100
-                and abs(neighbor_px4_span - neighbor_bag_span) <= 0.050
+                and abs(eff_span - neighbor_bag_span) <= 0.050
                 and max(rep_dt0, rep_dt1) <= MAX_ALLOWED_DT_GAP_S
             ):
                 repaired_step_mask[k - 1] = True
                 repaired_step_mask[k] = True
+                if matched_ts_ev is not None:
+                    matched_ts_ev["used"] = True
                 repaired_events.append(
                     {
                         "sample_index": int(k),
@@ -1460,10 +1479,11 @@ def reconstruct_simulation_clock(
                         "raw_sample_time_s": float(raw_px4[k]),
                         "neighbor_px4_times_s": [float(raw_px4[k - 1]), float(raw_px4[k + 1])],
                         "neighbor_px4_span_s": round(neighbor_px4_span, 6),
+                        "neighbor_px4_span_corrected_s": round(eff_span, 6),
                         "original_px4_dts_s": [float(dt_px4[k - 1]), float(dt_px4[k])],
                         "neighbor_bag_dts_s": [round(dt_b0, 6), round(dt_b1, 6)],
                         "repaired_dts_s": [round(rep_dt0, 6), round(rep_dt1, 6)],
-                        "method": "pattern_a_proportional_neighbor_span",
+                        "method": "pattern_a_timesync_status_disambiguated" if matched_ts_ev is not None else "pattern_a_proportional_neighbor_span",
                     }
                 )
             else:
@@ -1473,11 +1493,6 @@ def reconstruct_simulation_clock(
                     reasons.append("ambiguous_clock_step_pattern_a")
 
     # 2. Patron B y desambiguacion analitica mediante /fmu/out/timesync_status:
-    # Si un salto entre muestras consecutivas > 1e8 s coincide en ±0.05 s con un escalon
-    # en TimesyncStatus.estimated_offset de identica magnitud (dentro de ±0.05 s), se valida
-    # como reajuste de offset de red y se repara aplicando el diferencial de offset.
-    # De lo contrario, se conserva dt_px4[i] y se rechaza como ambiguo o dropout.
-    ts_events = _extract_timesync_offset_steps(timesync_status)
     for i in range(M):
         if repaired_step_mask[i] or ambiguous_step_mask[i]:
             continue
@@ -1719,7 +1734,7 @@ def _validate_landing_window(
             else:
                 last_ld_ts_s = ld_times_s[-1]
                 ld_age_s = t_end - last_ld_ts_s
-                if ld_age_s > LANDING_MAX_DETECTOR_AGE_S or last_ld_ts_s < t_win_start - 1e-6:
+                if ld_age_s > LANDING_MAX_DETECTOR_AGE_S:
                     reasons.append(
                         f"stale_land_detector_message (age={ld_age_s:.2f}s > {LANDING_MAX_DETECTOR_AGE_S:.2f}s)"
                     )
@@ -1771,7 +1786,6 @@ def _validate_landing_window(
                             anchor_age_at_win_start <= LANDING_MAX_DETECTOR_INTERVAL_S
                             and max_internal_gap <= LANDING_MAX_DETECTOR_INTERVAL_S
                             and end_age <= LANDING_MAX_DETECTOR_AGE_S
-                            and relevant_times[-1] >= t_win_start - 1e-6
                         ):
                             landed_flag_confirmed = True
 

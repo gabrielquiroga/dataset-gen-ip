@@ -75,6 +75,7 @@ REQUIRED_ACTIVE_PX4_TOPICS = [
     "/fmu/out/vehicle_odometry",
     "/fmu/out/vehicle_status_v4",
     "/fmu/out/vehicle_land_detected",
+    "/fmu/out/timesync_status",
 ]
 PX4_TOPIC_READY_TIMEOUT = 25.0
 
