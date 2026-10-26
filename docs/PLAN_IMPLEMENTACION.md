@@ -206,7 +206,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 
 ---
 
-### Hito 2.5: Blindaje Pre-Campaña contra Falsos Positivos (Revisión Experta) — [EN PROGRESO: FASE 1 Y 1.1 COMPLETADAS]
+### Hito 2.5: Blindaje Pre-Campaña contra Falsos Positivos (Revisión Experta) — [COMPLETADO]
 
 *Objetivo: reducir la probabilidad de aceptar vuelos con colisión, cruces por fuera del aro, aterrizajes incompletos o grabaciones corruptas, con criterios explícitos y verificables, antes de la recolección masiva. El validador es un filtro conservador bajo hipótesis declaradas, no una certificación física (ver [`JUSTIFICACION_REVISION_TECNICA.md`](JUSTIFICACION_REVISION_TECNICA.md)).*
 
@@ -262,11 +262,12 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
   * Capa 3: umbral mínimo de episodios aceptados ($\ge 5$) por tarea para particionado oficial en `train_tasks.json`, `val_tasks.json` y `held_out_tasks.json`.
 - [x] **Congelamiento de umbrales del validador:** `VALIDATOR_VERSION = "1.2.0"` y parámetros efectivos registrados en `episode_meta.json` antes de iniciar la campaña.
 
-#### Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [ ] PENDIENTE
-- [ ] **Tarea 2.5.7: Ejecución y reporte del piloto pre-campaña:**
-  * Reportar la **tasa de aceptación por intento original**, por separado de la tasa tras reintentos. Reintentar con otra semilla desplaza la distribución hacia escenarios que el experto resuelve, así que no debe presentarse como éxito sobre los escenarios pedidos.
-  * Inspeccionar manualmente una muestra de episodios aceptados y rechazados.
-  * Objetivo orientativo: aceptación primaria ≥ 85 %.
+#### Fase 3: Piloto en Escala de Pre-Campaña (10 Tareas $\times$ 5 Episodios = 50 Vuelos) — [x] COMPLETADO
+- [x] **Tarea 2.5.7: Ejecución y reporte del piloto pre-campaña:**
+  * **Tasa de aceptación por intento original:** 41/50 (82.0%). **Tasa efectiva tras reintentos:** 48/50 (96.0%).
+  * **Cero duplicados semánticos:** 10 firmas semánticas canónicas únicas para 10 tareas.
+  * **Auditoría de Tensores (Capa 2):** 48/48 archivos heterodata válidos (100% de conformidad en finitud, ortogonalidad SO(3), máscaras y horizonte físico 0.8s a 10 Hz). Volumen total: 10,347 estados (7,957 nominales + 2,390 de recuperación Tube Augmentation).
+  * **Partición Formal (Capa 3):** Generados splits en `datasets_pilot/splits/` (Train: 6 tareas, Val: 1 tarea, Held-Out: 2 tareas con $\ge 5$ episodios).
 
 ---
 

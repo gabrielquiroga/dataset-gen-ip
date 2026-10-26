@@ -7,9 +7,9 @@ Este proyecto implementa un *pipeline* automatizado de recolección de datos en 
 El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot** para simular un VANT (Vehículo Aéreo No Tripulado) que navega procedimentalmente a través de circuitos dinámicos de landmarks (aros cuadrados, toroides, postes cilíndricos y plataformas de aterrizaje).
 
 <p align="center">
-   <img src='docs\assets\vuelo_animado.gif' width="850" alt="Animación de vuelo y LiDAR sintético" />
+   <img src='docs\assets\preview_flight.png' width="850" alt="Animación de vuelo y LiDAR sintético" />
    <br>
-   <em>Figura 1: Visualización sincronizada del vuelo en 3D (izquierda), proyección egocéntrica del LiDAR en plano XY (centro) y perfil vertical en plano XZ (derecha) mostrando la maniobra de sobrepaso.</em>
+   <em>Figura 1: Visualización sincronizada del vuelo en 3D (izquierda), proyección egocéntrica del LiDAR en plano XY (centro) y perfil vertical en plano XZ (derecha) mostrando la maniobra de sobrepaso. Escala en X reducida (ENU).</em>
 </p>
 
 ---
