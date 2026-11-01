@@ -38,6 +38,8 @@ from uav_ip.validation_geometry import (
     GATE_HALF_HEIGHT,
     GATE_HALF_WIDTH,
     get_circular_gate_cylinders_spec,
+    get_overfly_altitude_offset,
+    get_slalom_lateral_offset,
 )
 
 # ============================================================================
@@ -253,6 +255,7 @@ def compute_primitive_anchor_waypoints(
     cy = float(landmark["y"])
     cz = float(landmark["z"])
     yaw = float(landmark.get("yaw", 0.0))
+    lm_type = str(landmark.get("type", "square_gate")).lower()
     fwd_x = math.cos(yaw)
     fwd_y = math.sin(yaw)
     right_x = math.sin(yaw)
@@ -261,21 +264,23 @@ def compute_primitive_anchor_waypoints(
     p_type = str(primitive.get("type", "traverse")) if primitive else "traverse"
 
     if p_type == "overfly":
+        overfly_z = get_overfly_altitude_offset(lm_type)
         pre = (
             cx - APPROACH_OFFSET_M * fwd_x,
             cy - APPROACH_OFFSET_M * fwd_y,
-            cz + OVERFLY_Z_OFFSET_M,
+            cz + overfly_z,
         )
         post = (
             cx + APPROACH_OFFSET_M * fwd_x,
             cy + APPROACH_OFFSET_M * fwd_y,
-            cz + OVERFLY_Z_OFFSET_M,
+            cz + overfly_z,
         )
     elif p_type == "slalom":
         side = str(primitive.get("side", "right")).lower() if primitive else "right"
         sign = 1.0 if side == "right" else -1.0
-        rx = right_x * sign * SLALOM_LAT_OFFSET_M
-        ry = right_y * sign * SLALOM_LAT_OFFSET_M
+        lat_offset = get_slalom_lateral_offset(lm_type)
+        rx = right_x * sign * lat_offset
+        ry = right_y * sign * lat_offset
         pre = (
             cx - APPROACH_OFFSET_M * fwd_x + rx,
             cy - APPROACH_OFFSET_M * fwd_y + ry,
@@ -287,14 +292,16 @@ def compute_primitive_anchor_waypoints(
             cz,
         )
     elif p_type == "orbit":
+        direction = str(primitive.get("direction", "ccw")).strip().lower() if primitive else "ccw"
+        orb_sign = -1.0 if direction == "cw" else 1.0
         pre = (
             cx - ORBIT_RADIUS_M * fwd_x,
             cy - ORBIT_RADIUS_M * fwd_y,
             cz,
         )
         post = (
-            cx + ORBIT_RADIUS_M * fwd_x - ORBIT_RADIUS_M * right_x,
-            cy + ORBIT_RADIUS_M * fwd_y - ORBIT_RADIUS_M * right_y,
+            cx + ORBIT_RADIUS_M * fwd_x - orb_sign * ORBIT_RADIUS_M * right_x,
+            cy + ORBIT_RADIUS_M * fwd_y - orb_sign * ORBIT_RADIUS_M * right_y,
             cz,
         )
     else:

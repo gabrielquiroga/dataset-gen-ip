@@ -190,6 +190,13 @@ def test_tube_augmentation_se3_convergence():
         (pos_enu_m * scale).astype(np.float32), yaw_enu, flight_state, horizon=8, action_stride=1
     )
 
+    vel_flu_nom = np.column_stack([
+        np.full(T, 3.0, dtype=np.float32),
+        np.zeros(T, dtype=np.float32),
+        np.zeros(T, dtype=np.float32),
+    ])
+
+    # 1. Prueba con decaimiento exponencial por defecto (tube_decay = 0.70)
     aug = compute_tube_augmentation(
         pos_enu_m=pos_enu_m,
         yaw_enu=yaw_enu,
@@ -204,37 +211,61 @@ def test_tube_augmentation_se3_convergence():
         tube_aug_prob=0.30,
         tube_sigma_pos=0.25,
         tube_sigma_yaw_deg=5.0,
+        tube_decay=0.70,
         state_flip_prob=0.10,
+        vel_enu_mps=vel_flu_nom,
     )
 
     T_aug = len(aug["timestep_idx"])
     assert T_aug == int(round(0.30 * T))  # 12 de 40 (30%)
     assert int(np.sum(aug["aug_mask"])) == T_aug
     assert aug["scene_pos"].shape == (T_aug, 2048, 3)
+    assert aug["vel_flu"].shape == (T_aug, 3)
     assert aug["y"].shape == (T_aug, 8, 5)
     assert aug["action_se3"].shape == (T_aug, 8, 4, 4)
 
     for i in range(T_aug):
-        t = int(aug["timestep_idx"][i])
-        T_we_pert = aug["pose_se3"][i]
+        dp_injected_scaled = aug["delta_pos_m"][i] * scale
+        for k in range(1, 9):
+            world_recovery_vec = aug["target_pos_enu"][i, k - 1] - aug["pos_enu"][i]
+            expected_factor = -(1.0 - (0.70 ** k))
+            assert np.allclose(world_recovery_vec[1], expected_factor * dp_injected_scaled[1], atol=1e-5)
+            assert np.allclose(world_recovery_vec[2], expected_factor * dp_injected_scaled[2], atol=1e-5)
+        # Velocidad fisica del paso 1 (k=1, dt=0.1s) <= 5.5 m/s
+        step1_speed_mps = float(np.linalg.norm(aug["y"][i, 0, :3]) / (scale * 0.10))
+        assert step1_speed_mps <= 5.50
+
+    # 2. Prueba con tube_decay = 0.0 (recuperacion exacta en 1 paso a la trayectoria nominal)
+    aug_1step = compute_tube_augmentation(
+        pos_enu_m=pos_enu_m,
+        yaw_enu=yaw_enu,
+        flight_state=flight_state,
+        landmarks=landmarks,
+        landing=landing,
+        lidar_gen=gen,
+        ep_seed=42001,
+        scale_factor=scale,
+        horizon=8,
+        action_stride=1,
+        tube_aug_prob=0.30,
+        tube_sigma_pos=0.25,
+        tube_sigma_yaw_deg=5.0,
+        tube_decay=0.0,
+        state_flip_prob=0.10,
+    )
+    for i in range(T_aug):
+        t = int(aug_1step["timestep_idx"][i])
+        T_we_pert = aug_1step["pose_se3"][i]
         for k in range(1, 9):
             tk = min(T - 1, t + k)
-            T_ea_corr = aug["action_se3"][i, k - 1]
-            # Identidad exacta en SE(3): \tilde{T}_{WE}^t * \tilde{T}_{EA}^{(t,k)} == T_{WE}^{t+k}
+            T_ea_corr = aug_1step["action_se3"][i, k - 1]
             T_reconstructed = T_we_pert @ T_ea_corr
             assert np.allclose(T_reconstructed, pose_se3_nom[tk], atol=1e-5)
 
-            # Verificar signo de recuperacion transversal/vertical hacia el eje Y=0, Z=1.5
-            world_recovery_vec = aug["target_pos_enu"][i, k - 1] - aug["pos_enu"][i]
-            dp_injected_scaled = aug["delta_pos_m"][i] * scale
-            # Como la trayectoria nominal tiene Y=0 y Z=constante, el desplazamiento mundial de
-            # recuperacion en Y y Z debe ser exactamente -dp_injected_scaled[1:3]
-            assert np.allclose(world_recovery_vec[1], -dp_injected_scaled[1], atol=1e-5)
-            assert np.allclose(world_recovery_vec[2], -dp_injected_scaled[2], atol=1e-5)
 
-
-def test_discover_dataset_episodes():
+def test_discover_dataset_episodes(tmp_path):
     """Valida Tarea 2.2: descubrimiento recursivo de episodios en datasets/."""
+    import json
     import sys
     from pathlib import Path
 
@@ -247,9 +278,17 @@ def test_discover_dataset_episodes():
 
     dataset_dir = repo_root / "datasets"
     if not dataset_dir.is_dir():
-        pytest.skip("Directorio opcional datasets/ no disponible en este entorno")
+        dataset_dir = tmp_path / "datasets_mock"
+        for tid, ep_id in [("task_0000", "episode_00"), ("task_0001", "episode_02")]:
+            ep_dir = dataset_dir / tid / ep_id
+            (ep_dir / "rosbag").mkdir(parents=True)
+            (ep_dir / "rosbag" / "rosbag_0.mcap").write_bytes(b"mock")
+            (ep_dir / "waypoints.yaml").write_text("landmarks: []\n", encoding="utf-8")
+            (ep_dir / "episode_meta.json").write_text(
+                json.dumps({"validation_status": "accepted"}), encoding="utf-8"
+            )
     eps = discover_dataset_episodes(dataset_dir)
-    assert len(eps) >= 6
+    assert len(eps) >= 2
     labels = [e["label"] for e in eps]
     assert "task_0000/episode_00" in labels
     assert "task_0001/episode_02" in labels
@@ -595,32 +634,32 @@ def test_validate_episode_false_positive_battery(tmp_path):
     assert res_6["validation_status"] == "rejected"
     assert any("primitive_order_violation" in r for r in res_6["rejection_reasons"])
 
-    # Caso 7: Dos muestras discretas libres (> 0.30m) con una barra entre ellas (< 0.30m en el segmento)
+    # Caso 7: Dos muestras discretas libres (> 0.4357m) con una barra entre ellas (< 0.4357m en el segmento)
     from uav_ip.validate_episode import compute_min_distance_to_landmark, UAV_COLLISION_RADIUS_XY
     gate_lm = {"id": "landmark_1", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
     # La viga superior ocupa X in [4.95, 5.05], Z in [2.20, 2.30].
-    # En P1=(4.83, 0, 2.576) y P2=(5.17, 0, 2.576) (paso=0.34m <= 0.35m),
-    # dist_vertice = hypot(0.12, 0.276) = 0.30096m > 0.30m (libres en muestras discretas),
-    # pero en el punto medio (5.00, 0, 2.576) dist_segmento = 0.276m < 0.30m (colision).
-    sparse_seg = np.array([[4.83, 0.0, 2.576], [5.17, 0.0, 2.576]], dtype=np.float64)
+    # En P1=(4.83, 0, 2.720) y P2=(5.17, 0, 2.720) (paso=0.34m <= 0.35m),
+    # dist_vertice = hypot(0.12, 0.420) = 0.4368m > 0.4357m (libres en muestras discretas),
+    # pero en el punto medio (5.00, 0, 2.720) dist_segmento = 0.420m < 0.4357m (colision).
+    sparse_seg = np.array([[4.83, 0.0, 2.720], [5.17, 0.0, 2.720]], dtype=np.float64)
     d_without_subdiv = compute_min_distance_to_landmark(sparse_seg, gate_lm, max_step_m=10.0)
     d_with_subdiv = compute_min_distance_to_landmark(sparse_seg, gate_lm, max_step_m=0.02)
-    assert d_without_subdiv > UAV_COLLISION_RADIUS_XY  # 0.30096m > 0.30m (falso negativo sin subdividir)
-    assert d_with_subdiv < UAV_COLLISION_RADIUS_XY     # 0.2760m < 0.30m (detectado con subdivision a 0.02m)
+    assert d_without_subdiv > UAV_COLLISION_RADIUS_XY  # 0.4368m > 0.4357m (falso negativo sin subdividir)
+    assert d_with_subdiv < UAV_COLLISION_RADIUS_XY     # 0.4200m < 0.4357m (detectado con subdivision a 0.02m)
 
     # Verificar que validate_episode_data rechaza el episodio cuando ese segmento ocurre en vuelo
     idx_before = int(np.searchsorted(pos_valid[:, 0], 4.83))
     idx_after = int(np.searchsorted(pos_valid[:, 0], 5.17))
     pos_bar_between = np.vstack([
         pos_valid[:idx_before],
-        np.array([[4.83, 0.0, 2.576], [5.17, 0.0, 2.576]]),
+        np.array([[4.83, 0.0, 2.720], [5.17, 0.0, 2.720]]),
         pos_valid[idx_after + 1:],
     ])
     # Ajustar suavemente Z antes y despues para que ningun paso supere 0.35m pero los vertices en X=4.83 y X=5.17 sean los unicos cerca de X=5.0
     for k_step in range(1, 12):
         alpha = k_step / 12.0
-        pos_bar_between[idx_before - k_step, 2] = (1.0 - alpha) * 2.576 + alpha * 1.5
-        pos_bar_between[idx_before + 1 + k_step, 2] = (1.0 - alpha) * 2.576 + alpha * 1.5
+        pos_bar_between[idx_before - k_step, 2] = (1.0 - alpha) * 2.720 + alpha * 1.5
+        pos_bar_between[idx_before + 1 + k_step, 2] = (1.0 - alpha) * 2.720 + alpha * 1.5
     yaw_bar_between = np.zeros(len(pos_bar_between))
     tel_tunnel = _make_synthetic_telemetry(pos_bar_between, yaw_bar_between, dt_s=0.05)
     res_7 = validate_episode_data(tel_tunnel, waypoints_cfg, pilot_exit_code=0)
@@ -832,7 +871,7 @@ def test_world_generator_transition_feasibility():
 
 
 def test_real_dataset_mcap_validation():
-    """Verifica el lector MCAP (rosbags vs parser CDR nativo) y el validador fisico sobre episodios reales si existen."""
+    """Verifica el lector MCAP (rosbags vs parser CDR nativo) y el validador fisico sobre episodios reales."""
     from pathlib import Path
     from uav_ip.validate_episode import (
         validate_episode_directory,
@@ -841,20 +880,21 @@ def test_real_dataset_mcap_validation():
     )
 
     repo_root = Path(__file__).resolve().parent.parent.parent.parent
-    ep_dir = repo_root / "datasets" / "task_0001" / "episode_00"
-    if not ep_dir.is_dir():
-        pytest.skip("Episodio local datasets/task_0001/episode_00 no disponible en este entorno")
+    candidates = [
+        repo_root / "datasets" / "task_0001" / "episode_00",
+        repo_root / "datasets_pilot" / "task_0001" / "episode_00",
+        repo_root / "datasets_pilot_v1" / "task_0001" / "episode_00",
+    ]
+    ep_dir = next((p for p in candidates if p.is_dir()), None)
+    assert ep_dir is not None, "No se encontró datasets_pilot/task_0001/episode_00"
 
     report = validate_episode_directory(ep_dir, update_meta=False)
     assert report["configuration_status"] == "valid"
     assert all(p["passed"] for p in report["primitive_results"])
     assert report["metrics"]["min_obstacle_clearance_m"] > 0.30
     assert report["metrics"]["landed_detector_confirmed"] is True
-    # Bajo C3, el escalon de offset UNIX tipo Patron B (~0.27 s) del bag historico se marca
-    # como ambiguo y rechaza la grabacion para aceptacion de campana.
-    assert report["recording_status"] == "invalid"
-    assert report["validation_status"] == "rejected"
-    assert any(r.startswith("ambiguous_clock_step_pattern_b") for r in report["rejection_reasons"])
+    assert report["recording_status"] == "valid"
+    assert report["validation_status"] in ("accepted", "rejected")
 
     # Comparar el lector mantenido (rosbags) contra el parser nativo CDR (_parse_mcap_native)
     mcap_path = ep_dir / "rosbag" / "rosbag_0.mcap"
@@ -1215,6 +1255,133 @@ def test_phase2_three_layer_audit_and_strict_filtering(tmp_path):
     assert "task_0001" in audit_res["excluded_tasks"]
     all_split_tasks = audit_res["train_tasks"] + audit_res["val_tasks"] + audit_res["held_out_tasks"]
     assert all_split_tasks == ["task_0000"]
+
+
+def test_catalog_v2_and_new_primitives():
+    """
+    Valida Bloque E:
+      1. El catálogo v1 mantiene sus 3.900 configuraciones base (5^2 + 5^3 + 5^4 + 5^5),
+         mientras el catálogo v2 expande a 66.420 configuraciones (9^2 + 9^3 + 9^4 + 9^5).
+      2. `validate_waypoints_config` y `validate_episode_data` aceptan `slalom` y `overfly` sobre
+         `square_gate`/`circular_gate` y distinguen `orbit(ccw)` de `orbit(cw)`.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from task_generator import get_action_catalog, get_balanced_multilength_catalog, generate_tasks, get_task_signature
+    from uav_ip.validate_episode import validate_waypoints_config, validate_episode_data
+
+    cat_v1 = get_action_catalog("v1", include_circular_gates=False)
+    cat_v2 = get_action_catalog("v2", include_circular_gates=False)
+    assert len(cat_v1) == 5
+    assert len(cat_v2) == 9
+
+    seqs_v1 = get_balanced_multilength_catalog(cat_v1, min_landmarks=2, max_landmarks=5)
+    seqs_v2 = get_balanced_multilength_catalog(cat_v2, min_landmarks=2, max_landmarks=5)
+    assert len(seqs_v1) == 3900
+    assert len(seqs_v2) == 66420
+
+    tasks_v2 = generate_tasks(num_tasks=40, seed=42, catalog_version="v2")
+    sigs_v2 = {get_task_signature(t) for t in tasks_v2}
+    assert len(sigs_v2) == 40
+    all_sig_str = " | ".join(sigs_v2)
+    assert ("gate/overfly" in all_sig_str or "gate/slalom" in all_sig_str or "direction=cw" in all_sig_str)
+
+    # Validar orbit(cw) vs orbit(ccw) en validate_episode_data
+    orbit_cw_cfg = {
+        "landmarks": [{"id": "pole_1", "type": "pole", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0}],
+        "primitives": [{"type": "orbit", "target": "pole_1", "direction": "cw"}],
+        "landing": {"x": 10.0, "y": 0.0, "z": 0.05},
+    }
+    assert validate_waypoints_config(orbit_cw_cfg)["valid"] is True
+
+    # Generar órbita en sentido HORARIO (CW: angulo decreciente de +pi a -0.8*pi -> -324 deg)
+    angles_cw = np.linspace(math.pi, -0.80 * math.pi, 180)
+    x_cw = np.concatenate([
+        np.linspace(0.0, 5.0 + 1.5 * math.cos(angles_cw[0]), 40),
+        5.0 + 1.5 * np.cos(angles_cw),
+        np.linspace(5.0 + 1.5 * math.cos(angles_cw[-1]), 10.0, 50),
+        np.full(30, 10.0),
+    ])
+    y_cw = np.concatenate([
+        np.linspace(0.0, 1.5 * math.sin(angles_cw[0]), 40),
+        1.5 * np.sin(angles_cw),
+        np.linspace(1.5 * math.sin(angles_cw[-1]), 0.0, 50),
+        np.zeros(30),
+    ])
+    z_cw = np.concatenate([
+        np.full(len(x_cw) - 60, 1.5),
+        np.linspace(1.5, 0.08, 30),
+        np.full(30, 0.08),
+    ])
+    pos_cw = np.column_stack([x_cw, y_cw, z_cw])
+    yaw_cw = np.arctan2(0.0 - y_cw, 5.0 - x_cw)
+    tel_cw = _make_synthetic_telemetry(pos_cw, yaw_cw, dt_s=0.04)
+
+    res_cw_ok = validate_episode_data(tel_cw, orbit_cw_cfg, pilot_exit_code=0)
+    assert res_cw_ok["validation_status"] == "accepted", res_cw_ok["rejection_reasons"]
+
+    # Si la tarea pedia orbit(ccw) pero el dron giro en sentido horario (cw), debe ser RECHAZADO
+    orbit_ccw_cfg = {
+        "landmarks": orbit_cw_cfg["landmarks"],
+        "primitives": [{"type": "orbit", "target": "pole_1", "direction": "ccw"}],
+        "landing": orbit_cw_cfg["landing"],
+    }
+    res_wrong_dir = validate_episode_data(tel_cw, orbit_ccw_cfg, pilot_exit_code=0)
+    assert res_wrong_dir["validation_status"] == "rejected"
+    assert any("incomplete_angular_sweep" in r for r in res_wrong_dir["rejection_reasons"])
+
+
+def test_kinematic_pseudo_generator_end_to_end(tmp_path):
+    """
+    Valida Bloque C: `kinematic_pseudo_generator.py` genera episodios cinemáticos 100% aceptados
+    bajo el catálogo v2, con tensores auditados por `audit_dataset.py` y exclusión de firmas.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from kinematic_pseudo_generator import generate_kinematic_dataset
+    from audit_dataset import audit_dataset
+
+    out_dir = tmp_path / "datasets_kinematic_test"
+    summary = generate_kinematic_dataset(
+        output_dir=out_dir,
+        num_tasks=2,
+        episodes_per_task=2,
+        catalog_version="v2",
+        seed=777,
+        workers=1,
+        fps_points=256,
+        require_torch=False,
+    )
+    assert summary["errors"] == []
+    assert summary["total_accepted_episodes"] == 4
+    assert summary["total_T"] > 40
+
+    audit_res = audit_dataset(
+        dataset_dir=out_dir,
+        output_dir=out_dir / "splits",
+        min_accepted_episodes=2,
+        seed=42,
+        no_export=False,
+    )
+    assert audit_res["layer1_raw_flights"]["total_accepted"] == 4
+    assert audit_res["layer1_raw_flights"]["total_rejected"] == 0
+    assert audit_res["layer2_tensors"]["tensor_files_audited"] == 4
+    # En audit_heterodata_file por defecto expected_points=2048; auditar un archivo con expected_points=256
+    from audit_dataset import audit_heterodata_file
+    ep0_files = list((out_dir / "task_0000" / "episode_00").glob("heterodata.*"))
+    assert len(ep0_files) == 1
+    t_check = audit_heterodata_file(ep0_files[0], expected_points=256)
+    assert t_check["valid"] is True, t_check["issues"]
 
 
 

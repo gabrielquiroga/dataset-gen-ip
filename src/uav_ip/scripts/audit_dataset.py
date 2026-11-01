@@ -70,6 +70,8 @@ EXPECTED_HORIZON_DURATION_S: float = 0.80
 EXPECTED_LIDAR_POINTS: int = 2048
 SO3_ORTHOGONALITY_TOL: float = 1e-4
 TUBE_AUG_SPHERE_RADIUS_M: float = 0.60
+MAX_STEP1_CORRECTIVE_VELOCITY_MPS: float = 6.50
+DEFAULT_SCALE_FACTOR: float = 0.10
 
 
 def _parse_episode_slot_and_attempt(dir_name: str, meta: Optional[Dict[str, Any]] = None) -> Tuple[str, int]:
@@ -124,15 +126,18 @@ def audit_heterodata_file(
     expected_horizon: int = EXPECTED_HORIZON_STEPS,
     expected_points: int = EXPECTED_LIDAR_POINTS,
     expected_dt_s: float = EXPECTED_DT_S,
+    require_pt: bool = False,
 ) -> Dict[str, Any]:
     """
     Capa 2: Audita un archivo `.pt` (`HeteroData`) o `.npz` verificando:
       1. Finitud estricta (cero NaNs / Infs en todos los tensores).
       2. Dimensiones exactas: `scene.pos` `(T, 2048, 3)`, `agent.pose_se3` `(T, 4, 4)`,
-         `agent.action_se3` `(T, 8, 4, 4)`, `agent.y` `(T, 8, 5)`, `agent.valid_mask` `(T, 8)`.
+         `agent.action_se3` `(T, 8, 4, 4)`, `agent.y` `(T, 8, 5)`, `agent.valid_mask` `(T, 8)`,
+         y `agent.vel_flu` `(T, 3)` si está presente.
       3. Ortogonalidad estricta en SO(3) (`R^T R = I`, `det(R) = +1`) en todas las poses y acciones.
       4. Horizonte temporal físico `T = 8` a 10 Hz (`Δt = 0.1 s` -> `0.8 s` de horizonte).
-      5. Cota esférica euclídea `||δp||_2 <= 0.60 m` en los nodos `aug`.
+      5. Cota esférica euclídea `||δp||_2 <= 0.60 m` y velocidad correctiva de paso 1
+         `||Δp_1|| / (s * Δt) <= 6.5 m/s` en los nodos `aug`.
     """
     path = Path(tensor_path)
     issues: List[str] = []
@@ -147,8 +152,12 @@ def audit_heterodata_file(
             "issues": ["missing_tensor_file"],
         }
 
+    if require_pt and path.suffix != ".pt":
+        issues.append(f"non_pt_tensor_format_rejected ({path.suffix})")
+
     tensors_np: Dict[str, np.ndarray] = {}
     dt_s_val: Optional[float] = None
+    scale_val: float = DEFAULT_SCALE_FACTOR
 
     try:
         if path.suffix == ".pt":
@@ -170,12 +179,16 @@ def audit_heterodata_file(
             tensors_np["agent_pose_se3"] = data["agent"].pose_se3.detach().cpu().numpy()
             tensors_np["agent_action_se3"] = data["agent"].action_se3.detach().cpu().numpy()
             tensors_np["agent_y"] = data["agent"].y.detach().cpu().numpy()
+            if hasattr(data["agent"], "vel_flu") and data["agent"].vel_flu is not None:
+                tensors_np["agent_vel_flu"] = data["agent"].vel_flu.detach().cpu().numpy()
             if hasattr(data["agent"], "valid_mask") and data["agent"].valid_mask is not None:
                 tensors_np["valid_mask"] = data["agent"].valid_mask.detach().cpu().numpy()
             if hasattr(data["agent"], "timestamps_s") and data["agent"].timestamps_s is not None:
                 tensors_np["timestamps_s"] = data["agent"].timestamps_s.detach().cpu().numpy()
             if hasattr(data["agent"], "dt_s") and data["agent"].dt_s is not None:
                 dt_s_val = float(data["agent"].dt_s.detach().cpu().item())
+            if hasattr(data["agent"], "scale_factor") and data["agent"].scale_factor is not None:
+                scale_val = float(data["agent"].scale_factor.detach().cpu().item())
 
             if "aug" in data.node_types and hasattr(data["aug"], "timestep_idx"):
                 tensors_np["aug_timestep_idx"] = data["aug"].timestep_idx.detach().cpu().numpy()
@@ -185,6 +198,8 @@ def audit_heterodata_file(
                 tensors_np["aug_action_se3"] = data["aug"].action_se3.detach().cpu().numpy()
                 tensors_np["aug_delta_pos_m"] = data["aug"].delta_pos_m.detach().cpu().numpy()
                 tensors_np["aug_y"] = data["aug"].y.detach().cpu().numpy()
+                if hasattr(data["aug"], "vel_flu") and data["aug"].vel_flu is not None:
+                    tensors_np["aug_vel_flu"] = data["aug"].vel_flu.detach().cpu().numpy()
         else:
             with np.load(path, allow_pickle=False) as npz:
                 tensors_np["scene_pos"] = npz["scene_pos"]
@@ -194,12 +209,16 @@ def audit_heterodata_file(
                 tensors_np["agent_pose_se3"] = npz["pose_se3"]
                 tensors_np["agent_action_se3"] = npz["action_se3"]
                 tensors_np["agent_y"] = npz["agent_y"]
+                if "vel_flu" in npz:
+                    tensors_np["agent_vel_flu"] = npz["vel_flu"]
                 if "valid_mask" in npz:
                     tensors_np["valid_mask"] = npz["valid_mask"]
                 if "timestamps_s" in npz:
                     tensors_np["timestamps_s"] = npz["timestamps_s"]
                 if "dt_s" in npz:
                     dt_s_val = float(npz["dt_s"])
+                if "scale_factor" in npz:
+                    scale_val = float(npz["scale_factor"])
                 if "aug_timestep_idx" in npz:
                     tensors_np["aug_timestep_idx"] = npz["aug_timestep_idx"]
                     tensors_np["aug_scene_pos"] = npz["aug_scene_pos"]
@@ -208,6 +227,8 @@ def audit_heterodata_file(
                     tensors_np["aug_action_se3"] = npz["aug_action_se3"]
                     tensors_np["aug_delta_pos_m"] = npz["aug_delta_pos_m"]
                     tensors_np["aug_y"] = npz["aug_y"]
+                    if "aug_vel_flu" in npz:
+                        tensors_np["aug_vel_flu"] = npz["aug_vel_flu"]
     except Exception as exc:
         return {
             "path": str(path),
@@ -245,6 +266,8 @@ def audit_heterodata_file(
         issues.append(f"invalid_action_se3_shape ({action_se3.shape} != {(T, expected_horizon, 4, 4)})")
     if agent_y.shape != (T, expected_horizon, 5):
         issues.append(f"invalid_agent_y_shape ({agent_y.shape} != {(T, expected_horizon, 5)})")
+    if "agent_vel_flu" in tensors_np and tensors_np["agent_vel_flu"].shape != (T, 3):
+        issues.append(f"invalid_agent_vel_flu_shape ({tensors_np['agent_vel_flu'].shape} != {(T, 3)})")
 
     if "valid_mask" not in tensors_np:
         issues.append("missing_valid_mask_tensor")
@@ -277,12 +300,14 @@ def audit_heterodata_file(
 
     # 4. Horizonte temporal físico (T=8 a 10 Hz -> 0.8 s)
     horizon_duration_s: Optional[float] = None
+    eff_dt_s = float(dt_s_val) if dt_s_val is not None else float(expected_dt_s)
     if "timestamps_s" in tensors_np and len(tensors_np["timestamps_s"]) >= 2:
         ts_arr = np.asarray(tensors_np["timestamps_s"], dtype=np.float64)
         dts = np.diff(ts_arr)
         # El ultimo punto de la grilla puede coincidir con el final exacto de la trayectoria
         interior_dts = dts[:-1] if len(dts) > 1 else dts
         median_dt = float(np.median(interior_dts))
+        eff_dt_s = median_dt
         horizon_duration_s = float(expected_horizon * median_dt)
         if abs(median_dt - expected_dt_s) > 0.015:
             issues.append(
@@ -309,6 +334,8 @@ def audit_heterodata_file(
                 issues.append(f"invalid_aug_action_se3_shape ({tensors_np['aug_action_se3'].shape})")
             else:
                 issues.extend(_check_so3_batch(tensors_np["aug_action_se3"][:, :, :3, :3], "aug.action_se3"))
+            if "aug_vel_flu" in tensors_np and tensors_np["aug_vel_flu"].shape != (T_aug, 3):
+                issues.append(f"invalid_aug_vel_flu_shape ({tensors_np['aug_vel_flu'].shape})")
 
             dp_norms = np.linalg.norm(tensors_np["aug_delta_pos_m"], axis=1)
             max_dp_norm = float(np.max(dp_norms))
@@ -317,6 +344,16 @@ def audit_heterodata_file(
                     f"aug.delta_pos_m:exceeds_euclidean_sphere_bound "
                     f"(max_norm={max_dp_norm:.4f}m > {TUBE_AUG_SPHERE_RADIUS_M:.2f}m)"
                 )
+
+            if "aug_y" in tensors_np and tensors_np["aug_y"].shape == (T_aug, expected_horizon, 5):
+                denom = max(1e-6, float(scale_val) * max(1e-3, eff_dt_s))
+                step1_disp_scaled = np.linalg.norm(tensors_np["aug_y"][:, 0, :3], axis=1)
+                max_step1_vel_mps = float(np.max(step1_disp_scaled / denom))
+                if max_step1_vel_mps > MAX_STEP1_CORRECTIVE_VELOCITY_MPS:
+                    issues.append(
+                        f"aug.y:step1_corrective_velocity_exceeds_bound "
+                        f"(max_v={max_step1_vel_mps:.2f}m/s > {MAX_STEP1_CORRECTIVE_VELOCITY_MPS:.2f}m/s)"
+                    )
 
     return {
         "path": str(path),
@@ -338,6 +375,7 @@ def audit_dataset(
     seed: int = 42,
     min_accepted_episodes: int = DEFAULT_MIN_ACCEPTED_EPISODES,
     no_export: bool = False,
+    require_pt: bool = False,
 ) -> Dict[str, Any]:
     """Ejecuta la auditoría completa en 3 capas del dataset y genera las particiones."""
     dataset_dir = Path(dataset_dir)
@@ -491,7 +529,7 @@ def audit_dataset(
             tensor_target = pt_candidate if pt_candidate.is_file() else (npz_candidate if npz_candidate.is_file() else None)
             if tensor_target is not None:
                 tensor_files_audited += 1
-                t_res = audit_heterodata_file(tensor_target)
+                t_res = audit_heterodata_file(tensor_target, require_pt=require_pt)
                 tensor_audit_details.append(t_res)
                 if t_res["valid"]:
                     tensor_files_valid += 1
@@ -516,7 +554,7 @@ def audit_dataset(
             "episode_slots_accepted": sum(1 for s in slots_status.values() if s["any_accepted"]),
             "eligible_for_split": bool(ep_accepted >= int(min_accepted_episodes)),
             "logic": cfg.get("logic", "A1_DIRECT"),
-            "profile": cfg.get("profile", "B1_LINEAR"),
+            "profile": cfg.get("profile", "B1_CONTINUOUS"),
         }
 
         if ep_accepted >= int(min_accepted_episodes):
@@ -727,6 +765,11 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Semilla determinista para barajar las firmas")
     parser.add_argument("--no-export", action="store_true", help="Solo audita en terminal sin escribir archivos")
+    parser.add_argument(
+        "--require-pt",
+        action="store_true",
+        help="Rechaza archivos .npz como inválidos (exige formato PyTorch Geometric .pt)",
+    )
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -741,6 +784,7 @@ def main():
         seed=args.seed,
         min_accepted_episodes=args.min_accepted_episodes,
         no_export=args.no_export,
+        require_pt=args.require_pt,
     )
 
 

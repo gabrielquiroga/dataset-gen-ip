@@ -59,19 +59,20 @@ def test_x500_sdf_measurement_traceability_and_derived_tolerances():
     """
     C7.A + C7.B:
       - Verifica que `X500_SDF_MEASUREMENT` documenta trazablemente el archivo SDF, commit y medidas del `x500`.
-      - Verifica la separacion explicita entre `UAV_PHYSICAL_RADIUS_XY` (0.25 m) y `UAV_SAFETY_MARGIN_XY` (0.05 m).
+      - Verifica la separacion explicita entre `UAV_PHYSICAL_RADIUS_XY` (0.385689 m, punta de helice completa)
+        y `UAV_SAFETY_MARGIN_XY` (0.05 m).
       - Verifica que cambiar el radio físico en `derive_validation_tolerances()` recalcula automáticamente
         todos los umbrales derivados del validador y del piloto sin ediciones manuales.
     """
     assert PROTECTED_VOLUME_MODEL == "sphere_3d_around_base_link"
-    assert PROTECTED_VOLUME_REFERENCE == "x500_base_collision_box_and_motor_hubs"
+    assert PROTECTED_VOLUME_REFERENCE == "x500_full_rotor_tip_envelope"
     assert len(X500_SDF_MEASUREMENT["px4_git_commit"]) == 40
     assert math.isclose(X500_SDF_MEASUREMENT["base_link_collision_half_diagonal_xy_m"], 0.25, abs_tol=1e-6)
     assert math.isclose(X500_FULL_ROTOR_TIP_RADIUS_M, 0.385689, abs_tol=1e-5)
 
-    assert math.isclose(UAV_PHYSICAL_RADIUS_XY, 0.25, abs_tol=1e-9)
+    assert math.isclose(UAV_PHYSICAL_RADIUS_XY, X500_FULL_ROTOR_TIP_RADIUS_M, abs_tol=1e-9)
     assert math.isclose(UAV_SAFETY_MARGIN_XY, 0.05, abs_tol=1e-9)
-    assert math.isclose(UAV_COLLISION_RADIUS_XY, 0.30, abs_tol=1e-9)
+    assert math.isclose(UAV_COLLISION_RADIUS_XY, X500_FULL_ROTOR_TIP_RADIUS_M + 0.05, abs_tol=1e-9)
 
     # Cambiar el radio fisico de 0.25 m a 0.30 m recalcula todos los limites derivados
     tols_default = derive_validation_tolerances(uav_physical_radius_m=0.25, uav_safety_margin_m=0.05, pilot_buffer_m=0.02)
@@ -88,14 +89,14 @@ def test_x500_sdf_measurement_traceability_and_derived_tolerances():
 
 def test_pilot_and_validator_distinguish_rectangular_vs_circular_gate_corner():
     """
-    C7.B: Un punto en la esquina `(y = 0.31 m, z = 0.31 m)` tiene:
-      - `|y| = 0.31 <= PILOT_TRAVERSE_SQUARE_MAX_Y (0.33 m)` y `|z| = 0.31 <= PILOT_TRAVERSE_SQUARE_MAX_Z (0.38 m)`
+    C7.B: Un punto en la esquina `(y = 0.185 m, z = 0.185 m)` bajo envolvente completa de hélices tiene:
+      - `|y| = 0.185 <= PILOT_TRAVERSE_SQUARE_MAX_Y (0.1943 m)` y `|z| = 0.185 <= PILOT_TRAVERSE_SQUARE_MAX_Z (0.2443 m)`
         -> ACEPTADO por el piloto y por el validador en `square_gate`.
-      - `r = sqrt(0.31^2 + 0.31^2) = 0.4384 m > TRAVERSE_CIRC_MAX_R (0.3856 m) > PILOT_TRAVERSE_CIRC_MAX_R (0.3656 m)`
+      - `r = sqrt(0.185^2 + 0.185^2) = 0.2616 m > TRAVERSE_CIRC_MAX_R (0.2499 m) > PILOT_TRAVERSE_CIRC_MAX_R (0.2299 m)`
         -> RECHAZADO por el piloto (`is_traverse_center_reached`) y por el validador en `circular_gate`.
     """
-    y_corner = 0.31
-    z_corner = 0.31
+    y_corner = 0.185
+    z_corner = 0.185
     r_corner = math.hypot(y_corner, z_corner)
     assert r_corner > TRAVERSE_CIRC_MAX_R > PILOT_TRAVERSE_CIRC_MAX_R
     assert y_corner <= PILOT_TRAVERSE_SQUARE_MAX_Y <= TRAVERSE_MAX_ABS_Y

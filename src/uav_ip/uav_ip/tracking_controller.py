@@ -11,9 +11,17 @@ class TrackingController(BasePilot):
     """
     TrackingController implements continuous Feedback + Feed-Forward velocity control
     for circular orbit primitives, maintaining strict ENU <-> NED frame consistency.
+
+    NOTA: Prototipo experimental de órbita pura de un solo landmark (con apagado por
+    SystemExit tras 20 s). No apto para circuitos multi-primitiva ni aterrizaje; el piloto
+    experto de producción para campañas de dataset es `WaypointController`.
     """
     def __init__(self):
         super().__init__("tracking_controller")
+        self.get_logger().warning(
+            "TrackingController es un prototipo experimental de orbita aislada (sin aterrizaje). "
+            "Para recoleccion de datasets use waypoint_controller."
+        )
 
         self.declare_parameter("waypoints_file", "")
         wp_file = self.get_parameter("waypoints_file").get_parameter_value().string_value

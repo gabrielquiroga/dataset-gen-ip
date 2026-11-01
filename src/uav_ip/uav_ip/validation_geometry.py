@@ -67,7 +67,7 @@ X500_SDF_MEASUREMENT: Dict[str, Any] = {
 # los solidos de cada obstaculo contra un unico radio escalar, el volumen protegido es una
 # ESFERA 3D centrada en `base_link`.
 PROTECTED_VOLUME_MODEL: str = "sphere_3d_around_base_link"
-PROTECTED_VOLUME_REFERENCE: str = "x500_base_collision_box_and_motor_hubs"
+PROTECTED_VOLUME_REFERENCE: str = "x500_full_rotor_tip_envelope"
 
 X500_CHASSIS_AND_HUBS_RADIUS_M: float = 0.25  # Medido de base_link_collision_0 (0.35355339 / sqrt(2))
 X500_FULL_ROTOR_TIP_RADIUS_M: float = float(X500_SDF_MEASUREMENT["full_rotor_tip_xy_radius_m"])
@@ -105,7 +105,7 @@ DISCRETIZATION_MARGIN_M: float = 0.5 * COLLISION_SEGMENT_MAX_STEP_M  # 0.01 m
 # 3. Envolvente por Defecto y Derivacion Dinamica de Tolerancias
 # ============================================================================
 
-UAV_PHYSICAL_RADIUS_XY: float = X500_CHASSIS_AND_HUBS_RADIUS_M  # 0.25 m (medido del SDF)
+UAV_PHYSICAL_RADIUS_XY: float = X500_FULL_ROTOR_TIP_RADIUS_M   # 0.385689 m (envolvente con palas)
 UAV_SAFETY_MARGIN_XY: float = 0.05                              # 0.05 m
 PILOT_APERTURE_BUFFER_M: float = 0.02                           # Margen adicional del controlador respecto al validador
 PILOT_BUFFER_M: float = PILOT_APERTURE_BUFFER_M
@@ -159,22 +159,80 @@ def derive_validation_tolerances(
 
 _DEFAULT_TOLS = derive_validation_tolerances()
 
-UAV_COLLISION_RADIUS_XY: float = _DEFAULT_TOLS["uav_collision_radius_xy_m"]          # 0.30 m
-UAV_SAFE_POLE_CENTER_DIST: float = _DEFAULT_TOLS["uav_safe_pole_center_dist_m"]      # 0.40 m
-TRAVERSE_MAX_ABS_Y: float = _DEFAULT_TOLS["traverse_max_abs_y_m"]                    # 0.35 m
-TRAVERSE_MAX_ABS_Z: float = _DEFAULT_TOLS["traverse_max_abs_z_m"]                    # 0.40 m
-TRAVERSE_CIRC_MAX_R: float = _DEFAULT_TOLS["traverse_circ_max_r_m"]                  # 0.3856 m
-PILOT_TRAVERSE_SQUARE_MAX_Y: float = _DEFAULT_TOLS["pilot_traverse_square_max_y_m"]  # 0.33 m
-PILOT_TRAVERSE_SQUARE_MAX_Z: float = _DEFAULT_TOLS["pilot_traverse_square_max_z_m"]  # 0.38 m
-PILOT_TRAVERSE_CIRC_MAX_R: float = _DEFAULT_TOLS["pilot_traverse_circ_max_r_m"]      # 0.3656 m
-SLALOM_MIN_LATERAL: float = _DEFAULT_TOLS["slalom_min_lateral_m"]                    # 0.47 m
+UAV_COLLISION_RADIUS_XY: float = _DEFAULT_TOLS["uav_collision_radius_xy_m"]          # ~0.4357 m
+UAV_SAFE_POLE_CENTER_DIST: float = _DEFAULT_TOLS["uav_safe_pole_center_dist_m"]      # ~0.5357 m
+TRAVERSE_MAX_ABS_Y: float = _DEFAULT_TOLS["traverse_max_abs_y_m"]                    # ~0.2143 m
+TRAVERSE_MAX_ABS_Z: float = _DEFAULT_TOLS["traverse_max_abs_z_m"]                    # ~0.2643 m
+TRAVERSE_CIRC_MAX_R: float = _DEFAULT_TOLS["traverse_circ_max_r_m"]                  # ~0.2499 m
+PILOT_TRAVERSE_SQUARE_MAX_Y: float = _DEFAULT_TOLS["pilot_traverse_square_max_y_m"]  # ~0.1943 m
+PILOT_TRAVERSE_SQUARE_MAX_Z: float = _DEFAULT_TOLS["pilot_traverse_square_max_z_m"]  # ~0.2443 m
+PILOT_TRAVERSE_CIRC_MAX_R: float = _DEFAULT_TOLS["pilot_traverse_circ_max_r_m"]      # ~0.2299 m
+SLALOM_MIN_LATERAL: float = _DEFAULT_TOLS["slalom_min_lateral_m"]                    # ~0.6057 m
 SLALOM_MAX_LATERAL: float = 2.60
 OVERFLY_MIN_ALT_M: float = POLE_HEIGHT + 0.30                                        # 3.30 m
 OVERFLY_MAX_LAT_M: float = 0.85
 ORBIT_MIN_SWEEP_DEG: float = 240.0
 ORBIT_MAX_RADIUS_M: float = 3.20
 ORBIT_MAX_MEAN_YAW_ERR_DEG: float = 45.0
-LANDING_MAX_XY_ERR_M: float = _DEFAULT_TOLS["landing_max_xy_err_m"]                  # 0.75 m
+LANDING_MAX_XY_ERR_M: float = _DEFAULT_TOLS["landing_max_xy_err_m"]                  # ~0.6143 m
+
+
+# ---------------------------------------------------------------------------
+# Helpers para soporte multi-landmark y catalogo v2 (slalom/overfly en gates)
+# ---------------------------------------------------------------------------
+
+def get_landmark_outer_half_width(lm_type: str) -> float:
+    """Retorna la semianchura lateral exterior maxima del obstaculo en metros."""
+    t = str(lm_type).strip().lower()
+    if "circ" in t or "torus" in t:
+        return CIRCULAR_MAJOR_RADIUS + CIRCULAR_TUBE_RADIUS  # 0.80 m
+    if "gate" in t:
+        return GATE_HALF_WIDTH + 0.5 * GATE_BAR_THICKNESS    # 0.75 m
+    return POLE_RADIUS                                       # 0.10 m
+
+
+def get_slalom_lateral_bounds(
+    lm_type: str,
+    tolerances: Optional[Dict[str, float]] = None
+) -> Tuple[float, float]:
+    """
+    Retorna el rango (min_lateral, max_lateral) admisible para una maniobra de slalom
+    segun el tipo de landmark, garantizando despeje continuo respecto al contorno exterior.
+    """
+    tols = tolerances or _DEFAULT_TOLS
+    col_r = float(tols["uav_collision_radius_xy_m"])
+    outer_w = get_landmark_outer_half_width(lm_type)
+    min_lat = round(outer_w + col_r + 0.07, 4)
+    max_lat = 3.20 if ("gate" in str(lm_type).lower()) else 2.60
+    return min_lat, max_lat
+
+
+def get_slalom_lateral_offset(lm_type: str) -> float:
+    """Offset lateral comandado al piloto experto para la maniobra de slalom."""
+    if "gate" in str(lm_type).lower():
+        return 2.00  # Aro tiene semi-ancho 0.75-0.80m; offset a 2.0m da ~1.2m de despeje
+    return 1.50      # Poste tiene radio 0.10m; offset a 1.5m da ~1.4m de despeje
+
+
+def get_overfly_altitude_offset(lm_type: str) -> float:
+    """Offset de altitud Z sobre el centro del landmark comandado al piloto experto."""
+    if "gate" in str(lm_type).lower():
+        return 1.80  # Centro cz ~ 1.5m, barra superior cz + 0.80m -> vuelo a cz + 1.80m (1.0m sobre barra)
+    return 2.50      # Poste apoyado en suelo (h=3m, cz=1.5m) -> vuelo a cz + 2.50m = 4.0m
+
+
+def get_overfly_min_alt_m(landmark: Dict[str, Any]) -> float:
+    """Altitud minima absoluta Z validada para considerar exitoso un sobrepaso."""
+    lm_t = str(landmark.get("type", "pole")).strip().lower()
+    if "gate" in lm_t:
+        cz = float(landmark.get("z", 1.5))
+        top_half = (
+            (CIRCULAR_MAJOR_RADIUS + CIRCULAR_TUBE_RADIUS)
+            if ("circ" in lm_t or "torus" in lm_t)
+            else (GATE_HALF_HEIGHT + 0.5 * GATE_BAR_THICKNESS)
+        )
+        return round(cz + top_half + 0.30, 4)
+    return OVERFLY_MIN_ALT_M  # 3.30 m en poste de 3.0 m
 
 
 def is_traverse_center_reached(

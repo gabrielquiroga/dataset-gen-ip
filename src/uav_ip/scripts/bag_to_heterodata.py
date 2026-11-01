@@ -432,7 +432,7 @@ def find_flight_trim_indices(
             x = float(pos[1])
             y = float(pos[0])
         else:
-            z = float(item["z"])
+            z = -float(item["z"])   # NED Down -> ENU Up
             x = float(item["y"])
             y = float(item["x"])
         z_enu[i] = z
@@ -624,6 +624,7 @@ def resample_trajectory_10hz(
     pos_enu_m: np.ndarray,
     yaw_enu: np.ndarray,
     q_ned: Optional[np.ndarray] = None,
+    vel_enu_mps: Optional[np.ndarray] = None,
     target_hz: float = DEFAULT_RESAMPLE_HZ,
 ) -> Dict[str, np.ndarray]:
     """
@@ -634,6 +635,8 @@ def resample_trajectory_10hz(
         linealmente para evitar singularidades en ±pi, reajustando luego a [-pi, pi)
         y reconstruyendo analiticamente `rot_enu = R_z(yaw) in SO(3)`.
       - Cuaterniones (`q_ned`): SLERP antipodalmente continuo.
+      - Velocidades (`vel_enu_mps`, `vel_flu`): interpolacion lineal en ENU y proyeccion
+        al marco egocentrico estabilizado Horizontal FLU (T, 3).
     """
     t_raw = np.asarray(reconstructed_time_s, dtype=np.float64).reshape(-1)
     pos_raw = np.asarray(pos_enu_m, dtype=np.float64)
@@ -648,6 +651,8 @@ def resample_trajectory_10hz(
             "yaw_enu": np.zeros((0, 1), dtype=np.float32),
             "rot_enu": np.zeros((0, 3, 3), dtype=np.float32),
             "q_ned": np.zeros((0, 4), dtype=np.float32),
+            "vel_enu_mps": np.zeros((0, 3), dtype=np.float32),
+            "vel_flu": np.zeros((0, 3), dtype=np.float32),
             "dt_s": np.float32(dt_s),
         }
 
@@ -690,12 +695,26 @@ def resample_trajectory_10hz(
             half_y = 0.5 * float(yaw_wrapped[k])
             q_interp[k] = [math.cos(half_y), 0.0, 0.0, math.sin(half_y)]
 
+    vel_enu_interp = np.zeros((T_grid, 3), dtype=np.float64)
+    if vel_enu_mps is not None and len(vel_enu_mps) == N:
+        vel_raw = np.asarray(vel_enu_mps, dtype=np.float64)
+        for d in range(3):
+            vel_enu_interp[:, d] = np.interp(t_grid, t_rel, vel_raw[:, d])
+    elif T_grid >= 2:
+        vel_enu_interp = np.gradient(pos_interp, dt_s, axis=0)
+
+    vel_flu = np.zeros((T_grid, 3), dtype=np.float32)
+    for k in range(T_grid):
+        vel_flu[k] = (rot_interp[k].T @ vel_enu_interp[k]).astype(np.float32)
+
     return {
         "timestamps_s": t_grid,
         "pos_enu_m": pos_interp,
         "yaw_enu": yaw_wrapped.reshape(-1, 1).astype(np.float32),
         "rot_enu": rot_interp,
         "q_ned": q_interp,
+        "vel_enu_mps": vel_enu_interp.astype(np.float32),
+        "vel_flu": vel_flu,
         "dt_s": np.float32(dt_s),
     }
 
@@ -864,6 +883,8 @@ def compute_tube_augmentation(
     tube_sigma_pos: float = 0.25,
     tube_sigma_yaw_deg: float = 5.0,
     state_flip_prob: float = 0.10,
+    tube_decay: float = 0.70,
+    vel_enu_mps: Optional[np.ndarray] = None,
     max_pos_dev: float = 0.60,
     max_yaw_dev_deg: float = 15.0,
     min_safe_alt: float = 0.20,
@@ -875,14 +896,14 @@ def compute_tube_augmentation(
     Para una fraccion p_aug = tube_aug_prob (default: 0.30) de los instantes t de la trayectoria:
       1. Muestrea por rechazo una perturbacion local de posicion \delta p ~ N(0, \sigma_p^2 I)
          (\sigma_p = 0.25 m) dentro de la esfera euclidea solida ||\delta p||_2 <= max_pos_dev (0.60 m),
-         verificando clearance >= UAV_COLLISION_RADIUS_XY (0.30 m) contra todos los landmarks
+         verificando clearance >= UAV_COLLISION_RADIUS_XY contra todos los landmarks
          (`compute_landmark_clearance`) y transitabilidad libre en maniobras `traverse` de puertas.
       2. Muestrea orientacion \delta \psi ~ N(0, \sigma_\psi^2) (\sigma_\psi = 5 deg), y con probabilidad
          state_flip_prob = 0.10 invierte el estado binario de entrada \tilde{s}_t = 1 - s_t.
       3. Sintetiza analiticamente la observacion LiDAR 360° en la pose perturbada \tilde{T}_{WE}^t.
-      4. Calcula el horizonte de acciones correctivas hacia las poses futuras nominales:
-             \tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t + k * stride},   k = 1, ..., horizon
-         garantizando que el flujo de accion apunte convergentemente de regreso a la trayectoria experta.
+      4. Calcula el horizonte de acciones correctivas con convergencia exponencial suave (\gamma = tube_decay):
+             \tilde{p}_{target}^{(t, k)} = p_{t + k * stride} + \gamma^k \delta p,   k = 1, ..., horizon
+         garantizando factibilidad dinamica (v_max < 5.0 m/s) y convergencia monótona al tubo nominal.
     """
     T = len(pos_enu_m)
     fps_pts = int(lidar_gen.target_points)
@@ -895,6 +916,7 @@ def compute_tube_augmentation(
             "yaw_enu": np.zeros((0, 1), dtype=np.float32),
             "rot_enu": np.zeros((0, 3, 3), dtype=np.float32),
             "pose_se3": np.zeros((0, 4, 4), dtype=np.float32),
+            "vel_flu": np.zeros((0, 3), dtype=np.float32),
             "delta_pos_m": np.zeros((0, 3), dtype=np.float32),
             "delta_yaw": np.zeros((0, 1), dtype=np.float32),
             "flight_state_in": np.zeros((0, 1), dtype=np.float32),
@@ -937,9 +959,17 @@ def compute_tube_augmentation(
     pos_scaled = (pos_enu_m * float(scale_factor)).astype(np.float64)
     full_valid_mask = compute_action_valid_mask(T, horizon=horizon, action_stride=action_stride)
 
+    if vel_enu_mps is not None and len(vel_enu_mps) == T:
+        vel_enu_arr = np.asarray(vel_enu_mps, dtype=np.float64)
+    elif T >= 2:
+        vel_enu_arr = np.gradient(pos_enu_m, 0.1, axis=0)
+    else:
+        vel_enu_arr = np.zeros((T, 3), dtype=np.float64)
+
     sigma_yaw_rad = math.radians(float(tube_sigma_yaw_deg))
     max_yaw_rad = math.radians(float(max_yaw_dev_deg))
     max_r = float(max_pos_dev)
+    gamma = max(0.0, min(1.0, float(tube_decay)))
 
     accepted_indices: List[int] = []
     aug_scene_pos_list: List[np.ndarray] = []
@@ -947,6 +977,7 @@ def compute_tube_augmentation(
     aug_yaw_enu_list: List[np.ndarray] = []
     aug_rot_enu_list: List[np.ndarray] = []
     aug_pose_se3_list: List[np.ndarray] = []
+    aug_vel_flu_list: List[np.ndarray] = []
     aug_delta_pos_m_list: List[np.ndarray] = []
     aug_delta_yaw_list: List[np.ndarray] = []
     aug_flight_state_in_list: List[np.ndarray] = []
@@ -962,7 +993,7 @@ def compute_tube_augmentation(
         yaw_nom = float(yaw_flat[t])
 
         # Muestreo por rechazo en esfera euclidea solida ||dp||_2 <= max_pos_dev (0.60 m)
-        # con verificacion de clearance >= UAV_COLLISION_RADIUS_XY (0.30 m) y apertura de puertas.
+        # con verificacion de clearance >= UAV_COLLISION_RADIUS_XY y apertura de puertas.
         found_safe = False
         dp_m = np.zeros(3, dtype=np.float64)
         tilde_p_m = p_nom_m.copy()
@@ -990,6 +1021,7 @@ def compute_tube_augmentation(
                 if float(np.linalg.norm(cand_dp)) > max_r:
                     continue
 
+            p_target_1_m = p_next_m + gamma * cand_dp
             if _is_perturbation_safe(
                 p_nom_m=p_nom_m,
                 tilde_p_m=cand_tilde_p,
@@ -997,6 +1029,16 @@ def compute_tube_augmentation(
                 landmarks=landmarks,
                 max_pos_dev=max_r,
                 min_clearance_m=UAV_COLLISION_RADIUS_XY,
+            ) and (
+                gamma <= 0.0
+                or _is_perturbation_safe(
+                    p_nom_m=p_nom_m,
+                    tilde_p_m=cand_tilde_p,
+                    p_next_m=p_target_1_m,
+                    landmarks=landmarks,
+                    max_pos_dev=max_r,
+                    min_clearance_m=UAV_COLLISION_RADIUS_XY,
+                )
             ):
                 dp_m = cand_dp
                 tilde_p_m = cand_tilde_p
@@ -1011,10 +1053,13 @@ def compute_tube_augmentation(
         tilde_yaw = _wrap_angle(yaw_nom + dyaw_pert)
         tilde_R = rot_z(tilde_yaw)
         tilde_p_scaled = tilde_p_m * float(scale_factor)
+        dp_scaled = tilde_p_scaled - pos_scaled[t]
 
         T_we_pert = np.eye(4, dtype=np.float64)
         T_we_pert[:3, :3] = tilde_R
         T_we_pert[:3, 3] = tilde_p_scaled
+
+        v_flu_pert = (tilde_R.T @ vel_enu_arr[t]).astype(np.float32)
 
         # Perturbacion del 10% del estado binario de entrada s_t (Apendice D/E)
         s_nom = float(s_flat[t])
@@ -1039,13 +1084,15 @@ def compute_tube_augmentation(
         act_se3_step = np.zeros((horizon, 4, 4), dtype=np.float32)
         target_pos_step = np.zeros((horizon, 3), dtype=np.float32)
 
-        # Accion correctiva relativa \tilde{T}_{EA}^{(t, k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t+k}
+        # Accion correctiva relativa con decaimiento exponencial suave \gamma^k
         for k in range(1, horizon + 1):
             tk = min(T - 1, t + k * max(1, action_stride))
-            p_tk = pos_scaled[tk]
+            decay_k = (gamma ** k) if gamma > 0.0 else 0.0
+            p_tk = pos_scaled[tk] + decay_k * dp_scaled
             dp_world = p_tk - tilde_p_scaled
             dp_flu = tilde_R.T @ dp_world
-            dyaw_corr = _wrap_angle(float(yaw_flat[tk] - tilde_yaw))
+            target_yaw_k = _wrap_angle(float(yaw_flat[tk] + decay_k * dyaw_pert))
+            dyaw_corr = _wrap_angle(float(target_yaw_k - tilde_yaw))
             R_rel_corr = rot_z(dyaw_corr)
 
             T_ea_corr = np.eye(4, dtype=np.float32)
@@ -1064,6 +1111,7 @@ def compute_tube_augmentation(
         aug_yaw_enu_list.append(np.array([float(tilde_yaw)], dtype=np.float32))
         aug_rot_enu_list.append(tilde_R.astype(np.float32))
         aug_pose_se3_list.append(T_we_pert.astype(np.float32))
+        aug_vel_flu_list.append(v_flu_pert)
         aug_delta_pos_m_list.append(dp_m.astype(np.float32))
         aug_delta_yaw_list.append(np.array([float(dyaw_pert)], dtype=np.float32))
         aug_flight_state_in_list.append(np.array([float(s_in)], dtype=np.float32))
@@ -1086,6 +1134,7 @@ def compute_tube_augmentation(
             "yaw_enu": np.zeros((0, 1), dtype=np.float32),
             "rot_enu": np.zeros((0, 3, 3), dtype=np.float32),
             "pose_se3": np.zeros((0, 4, 4), dtype=np.float32),
+            "vel_flu": np.zeros((0, 3), dtype=np.float32),
             "delta_pos_m": np.zeros((0, 3), dtype=np.float32),
             "delta_yaw": np.zeros((0, 1), dtype=np.float32),
             "flight_state_in": np.zeros((0, 1), dtype=np.float32),
@@ -1103,6 +1152,7 @@ def compute_tube_augmentation(
         "yaw_enu": np.stack(aug_yaw_enu_list, axis=0),
         "rot_enu": np.stack(aug_rot_enu_list, axis=0),
         "pose_se3": np.stack(aug_pose_se3_list, axis=0),
+        "vel_flu": np.stack(aug_vel_flu_list, axis=0),
         "delta_pos_m": np.stack(aug_delta_pos_m_list, axis=0),
         "delta_yaw": np.stack(aug_delta_yaw_list, axis=0),
         "flight_state_in": np.stack(aug_flight_state_in_list, axis=0),
@@ -1298,6 +1348,8 @@ def build_heterodata_from_synthetic_lidar(
     tube_sigma_pos: float = 0.25,
     tube_sigma_yaw_deg: float = 5.0,
     state_flip_prob: float = 0.10,
+    tube_decay: float = 0.70,
+    require_torch: bool = False,
     target_hz: float = DEFAULT_RESAMPLE_HZ,
     verbose: bool = True,
 ) -> Dict[str, Any]:
@@ -1308,6 +1360,12 @@ def build_heterodata_from_synthetic_lidar(
     con su mascara terminal `valid_mask` (T, 8), extrae L=10 keyframes geometricos
     e inyecta el 30% de Tube Augmentation filtrado por esfera euclidea y clearance de colision.
     """
+    if require_torch and (HeteroData is None or torch is None):
+        raise RuntimeError(
+            "PyTorch / torch_geometric no estan disponibles y se especifico --require-torch. "
+            "Ejecute con ~/venv_ip/bin/python3."
+        )
+
     with open(waypoints_file, "r") as f:
         wp_cfg = yaml.safe_load(f)
 
@@ -1358,9 +1416,11 @@ def build_heterodata_from_synthetic_lidar(
             print(f"  Recorte de vuelo util aplicado: [{start_idx}:{end_idx}] "
                   f"({len(odom_list)} de {total_raw} muestras conservadas).")
 
-    # Extraer poses crudas y reconstruir el reloj de simulacion
+    # Extraer poses y velocidades crudas y reconstruir el reloj de simulacion
     N_raw = len(odom_list)
     raw_pos_enu = np.zeros((N_raw, 3), dtype=np.float64)
+    raw_vel_enu = np.zeros((N_raw, 3), dtype=np.float64)
+    has_valid_vel = True
     raw_yaw_enu = np.zeros(N_raw, dtype=np.float64)
     raw_q_ned = np.zeros((N_raw, 4), dtype=np.float64)
 
@@ -1370,12 +1430,22 @@ def build_heterodata_from_synthetic_lidar(
             q_ned = [float(item["q"][0]), float(item["q"][1]), float(item["q"][2]), float(item["q"][3])]
             p_enu, R_full = px4_odometry_to_gazebo_enu(pos_ned, q_ned, gravity_aligned=False)
             yaw_val = extract_yaw_from_rot_matrix(R_full)
+            v_ned = item.get("velocity", [0.0, 0.0, 0.0])
+            if len(v_ned) >= 3 and all(math.isfinite(float(c)) for c in v_ned[:3]):
+                raw_vel_enu[i] = ned_to_gazebo_enu(v_ned[:3])
+            else:
+                has_valid_vel = False
         else:
             p_ned = [item["x"], item["y"], item["z"]]
             p_enu = ned_to_gazebo_enu(p_ned)
             yaw_val = _wrap_angle(yaw_ned_to_gazebo_enu(item["heading"]))
             half_yaw_ned = 0.5 * float(item["heading"])
             q_ned = [math.cos(half_yaw_ned), 0.0, 0.0, math.sin(half_yaw_ned)]
+            v_ned = [item.get("vx", 0.0), item.get("vy", 0.0), item.get("vz", 0.0)]
+            if all(math.isfinite(float(c)) for c in v_ned):
+                raw_vel_enu[i] = ned_to_gazebo_enu(v_ned)
+            else:
+                has_valid_vel = False
 
         raw_pos_enu[i] = p_enu
         raw_yaw_enu[i] = yaw_val
@@ -1392,6 +1462,7 @@ def build_heterodata_from_synthetic_lidar(
         pos_enu_m=raw_pos_enu,
         yaw_enu=raw_yaw_enu,
         q_ned=raw_q_ned,
+        vel_enu_mps=raw_vel_enu if has_valid_vel else None,
         target_hz=target_hz,
     )
     timestamps_s = resampled["timestamps_s"]
@@ -1400,6 +1471,8 @@ def build_heterodata_from_synthetic_lidar(
     agent_yaw = resampled["yaw_enu"]                             # (T, 1) rad en [-pi, pi)
     agent_rot = resampled["rot_enu"]                             # (T, 3, 3) R_z(yaw) in SO(3)
     agent_q_ned = resampled["q_ned"]                             # (T, 4)
+    agent_vel_enu = resampled["vel_enu_mps"]                     # (T, 3) m/s
+    agent_vel_flu = resampled["vel_flu"]                         # (T, 3) m/s en Horizontal FLU
     dt_s = float(resampled["dt_s"])
     T = len(pos_enu_m)
 
@@ -1479,6 +1552,8 @@ def build_heterodata_from_synthetic_lidar(
         tube_sigma_pos=tube_sigma_pos,
         tube_sigma_yaw_deg=tube_sigma_yaw_deg,
         state_flip_prob=state_flip_prob,
+        tube_decay=tube_decay,
+        vel_enu_mps=agent_vel_enu,
         gravity_aligned=gravity_aligned,
     )
     T_aug = len(aug_dict["timestep_idx"])
@@ -1513,6 +1588,7 @@ def build_heterodata_from_synthetic_lidar(
         data["agent"].rot_enu = torch.from_numpy(agent_rot)
         data["agent"].pose_se3 = torch.from_numpy(pose_se3)
         data["agent"].q_ned = torch.from_numpy(agent_q_ned)
+        data["agent"].vel_flu = torch.from_numpy(agent_vel_flu)
         data["agent"].flight_state = torch.from_numpy(flight_state)
         data["agent"].keypoints_body = torch.from_numpy(keypoints_body)
 
@@ -1532,6 +1608,7 @@ def build_heterodata_from_synthetic_lidar(
         data["aug"].yaw_enu = torch.from_numpy(aug_dict["yaw_enu"])
         data["aug"].rot_enu = torch.from_numpy(aug_dict["rot_enu"])
         data["aug"].pose_se3 = torch.from_numpy(aug_dict["pose_se3"])
+        data["aug"].vel_flu = torch.from_numpy(aug_dict["vel_flu"])
         data["aug"].delta_pos_m = torch.from_numpy(aug_dict["delta_pos_m"])
         data["aug"].delta_yaw = torch.from_numpy(aug_dict["delta_yaw"])
         data["aug"].flight_state_in = torch.from_numpy(aug_dict["flight_state_in"])
@@ -1565,6 +1642,7 @@ def build_heterodata_from_synthetic_lidar(
             rot_enu=agent_rot,
             pose_se3=pose_se3,
             q_ned=agent_q_ned,
+            vel_flu=agent_vel_flu,
             flight_state=flight_state,
             keypoints_body=keypoints_body,
             agent_y=action_local,
@@ -1581,6 +1659,7 @@ def build_heterodata_from_synthetic_lidar(
             aug_yaw_enu=aug_dict["yaw_enu"],
             aug_rot_enu=aug_dict["rot_enu"],
             aug_pose_se3=aug_dict["pose_se3"],
+            aug_vel_flu=aug_dict["vel_flu"],
             aug_delta_pos_m=aug_dict["delta_pos_m"],
             aug_delta_yaw=aug_dict["delta_yaw"],
             aug_flight_state_in=aug_dict["flight_state_in"],
@@ -1690,6 +1769,17 @@ def _process_episode_worker(job: Dict[str, Any]) -> Dict[str, Any]:
     wp_file: Path = job["wp_file"]
     out_file: Path = job["out_file"]
 
+    if job.get("require_torch", False) and (HeteroData is None or torch is None):
+        return {
+            "label": label,
+            "status": "error",
+            "elapsed_s": time.perf_counter() - t0,
+            "T": 0,
+            "T_aug": 0,
+            "saved_path": None,
+            "error": "PyTorch / torch_geometric no disponibles (--require-torch activo).",
+        }
+
     if job.get("skip_existing", False):
         expected_ext = ".pt" if (HeteroData is not None and torch is not None) else ".npz"
         candidate_existing = out_file.with_suffix(expected_ext)
@@ -1723,7 +1813,9 @@ def _process_episode_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             tube_aug_prob=job["tube_aug_prob"],
             tube_sigma_pos=job["tube_sigma_pos"],
             tube_sigma_yaw_deg=job["tube_sigma_yaw_deg"],
+            tube_decay=job.get("tube_decay", 0.70),
             state_flip_prob=job["state_flip_prob"],
+            require_torch=job.get("require_torch", False),
             verbose=False,
         )
         elapsed = time.perf_counter() - t0
@@ -1775,13 +1867,21 @@ def process_dataset_directory(
     tube_aug_prob: float = 0.30,
     tube_sigma_pos: float = 0.25,
     tube_sigma_yaw_deg: float = 5.0,
+    tube_decay: float = 0.70,
     state_flip_prob: float = 0.10,
     skip_existing: bool = False,
     include_failed: bool = False,
+    require_torch: bool = False,
 ) -> Dict[str, Any]:
     """
     Procesa en lote y en paralelo todos los episodios de un directorio de dataset.
     """
+    if require_torch and (HeteroData is None or torch is None):
+        raise RuntimeError(
+            "PyTorch y/o torch_geometric no estan instalados en el interprete actual "
+            "(--require-torch activo). Ejecuta con ../venv_ip/bin/python3."
+        )
+
     episodes = discover_dataset_episodes(
         dataset_dir, output_root=output_root, include_failed=include_failed
     )
@@ -1817,8 +1917,10 @@ def process_dataset_directory(
             "tube_aug_prob": tube_aug_prob,
             "tube_sigma_pos": tube_sigma_pos,
             "tube_sigma_yaw_deg": tube_sigma_yaw_deg,
+            "tube_decay": tube_decay,
             "state_flip_prob": state_flip_prob,
             "skip_existing": skip_existing,
+            "require_torch": require_torch,
         })
         jobs.append(job)
 
@@ -1828,7 +1930,10 @@ def process_dataset_directory(
     print(f"   Directorio dataset : {Path(dataset_dir).resolve()}")
     print(f"   Episodios hallados : {len(jobs)}")
     print(f"   Workers paralelos  : {num_workers} (de {cpu_cores} nucleos disponibles)")
-    print(f"   Tube Augmentation  : {tube_aug_prob * 100:.0f}% (sigma_p={tube_sigma_pos}m, sigma_yaw={tube_sigma_yaw_deg} deg)")
+    print(
+        f"   Tube Augmentation  : {tube_aug_prob * 100:.0f}% "
+        f"(sigma_p={tube_sigma_pos}m, sigma_yaw={tube_sigma_yaw_deg} deg, gamma={tube_decay:.2f})"
+    )
     print("=" * 72)
 
     t_start = time.perf_counter()
@@ -1926,9 +2031,19 @@ def main():
         help="Omitir episodios que ya posean su archivo heterodata generado"
     )
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Sobrescribir archivos existentes (comportamiento por defecto si no se pasa --skip-existing)"
+    )
+    parser.add_argument(
         "--include-failed",
         action="store_true",
         help="Procesar tambien episodios cuyo episode_meta.json no tenga status='success'"
+    )
+    parser.add_argument(
+        "--require-torch",
+        action="store_true",
+        help="Abortar con error si PyTorch o torch_geometric no estan disponibles (evita fallback .npz)"
     )
     parser.add_argument(
         "--scale",
@@ -1991,6 +2106,12 @@ def main():
         help="Desviacion estandar de yaw en grados para Tube Augmentation (default: 5.0)"
     )
     parser.add_argument(
+        "--tube-decay",
+        type=float,
+        default=0.70,
+        help="Factor de decaimiento exponencial gamma por paso para Tube Augmentation (default: 0.70; 0.0 = 1 paso)"
+    )
+    parser.add_argument(
         "--state-flip-prob",
         type=float,
         default=0.10,
@@ -2027,9 +2148,11 @@ def main():
             tube_aug_prob=args.tube_aug_prob,
             tube_sigma_pos=args.tube_sigma_pos,
             tube_sigma_yaw_deg=args.tube_sigma_yaw,
+            tube_decay=args.tube_decay,
             state_flip_prob=args.state_flip_prob,
             skip_existing=args.skip_existing,
             include_failed=args.include_failed,
+            require_torch=args.require_torch,
         )
         if summary["errors"] > 0 or summary["total"] == 0:
             sys.exit(1)
@@ -2065,7 +2188,9 @@ def main():
         tube_aug_prob=args.tube_aug_prob,
         tube_sigma_pos=args.tube_sigma_pos,
         tube_sigma_yaw_deg=args.tube_sigma_yaw,
+        tube_decay=args.tube_decay,
         state_flip_prob=args.state_flip_prob,
+        require_torch=args.require_torch,
     )
     if not res.get("ok", False):
         sys.exit(1)

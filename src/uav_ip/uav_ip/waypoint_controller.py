@@ -12,6 +12,8 @@ from uav_ip.validation_geometry import (
     PILOT_TRAVERSE_CIRC_MAX_R,
     PILOT_TRAVERSE_SQUARE_MAX_Y,
     PILOT_TRAVERSE_SQUARE_MAX_Z,
+    get_overfly_altitude_offset,
+    get_slalom_lateral_offset,
     is_traverse_center_reached,
 )
 
@@ -39,7 +41,7 @@ class WaypointController(BasePilot):
     LANDING_MAX_POS_AGE_S = 0.5
     LANDING_MAX_DETECTOR_AGE_S = 1.5
     LANDING_PERSISTENCE_REQUIRED_S = 3.0
-    LANDING_TIMEOUT_S = 10.0
+    LANDING_TIMEOUT_S = 18.0
     LANDING_MAX_Z_ENU_M = 0.25
     LANDING_MAX_XY_ERR_M = GEOM_LANDING_MAX_XY_ERR_M
     TRAVERSE_SQUARE_MAX_Y = PILOT_TRAVERSE_SQUARE_MAX_Y
@@ -184,12 +186,13 @@ class WaypointController(BasePilot):
                     "vel_ff": None,
                 })
             elif p_type == "overfly":
-                OVER_Z = 2.5
+                OVER_Z = get_overfly_altitude_offset(lm_type)
                 wps.append({
                     "pos": [cx - OFFSET * fwd_x, cy - OFFSET * fwd_y, cz + OVER_Z],
                     "type": "pre",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -198,6 +201,7 @@ class WaypointController(BasePilot):
                     "type": "center",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
@@ -206,6 +210,7 @@ class WaypointController(BasePilot):
                     "type": "post",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -214,12 +219,13 @@ class WaypointController(BasePilot):
                 sign = 1.0 if side == "right" else -1.0
                 right_x = math.sin(yaw) * sign
                 right_y = -math.cos(yaw) * sign
-                LAT_OFFSET = 1.5
+                LAT_OFFSET = get_slalom_lateral_offset(lm_type)
                 wps.append({
                     "pos": [cx - OFFSET * fwd_x + right_x * LAT_OFFSET, cy - OFFSET * fwd_y + right_y * LAT_OFFSET, cz],
                     "type": "pre",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -228,6 +234,7 @@ class WaypointController(BasePilot):
                     "type": "center",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": v_pass_enu,
                 })
@@ -236,36 +243,31 @@ class WaypointController(BasePilot):
                     "type": "post",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
             elif p_type == "orbit":
                 R = 1.5
+                direction = str(prim.get("direction", "ccw")).strip().lower()
+                orb_sign = -1.0 if direction == "cw" else 1.0
                 right_x = math.sin(yaw)
                 right_y = -math.cos(yaw)
-                # Discretización suave del arco de 270° (de ángulo local pi a -pi/2 pasando por -pi/2, 0, +pi/2)
-                # En la base local (fwd, right):
-                #   s = 0.0 -> (-R*fwd)              [frente al poste, mirando a +fwd]
-                #   s = 1/3 -> (+R*right)            [flanco derecho, mirando a -right]
-                #   s = 2/3 -> (+R*fwd)              [detrás del poste, mirando a -fwd]
-                #   s = 1.0 -> (-R*right)            [flanco izquierdo, mirando a +right]
+                # Discretización suave del arco de 270°
+                # Para CCW (orb_sign=+1): -fwd -> +right -> +fwd -> -right
+                # Para CW  (orb_sign=-1): -fwd -> -right -> +fwd -> +right
                 num_steps = self.ORBIT_ARC_STEPS
                 total_sweep = 1.5 * math.pi  # 270 grados
                 for k in range(num_steps + 1):
                     alpha = (k / float(num_steps)) * total_sweep
-                    # Vector radial desde el centro del poste:
-                    # k=0 (alpha=0) -> -fwd
-                    # alpha=pi/2    -> +right
-                    # alpha=pi      -> +fwd
-                    # alpha=3pi/2   -> -right
                     rad_fwd = -math.cos(alpha)
-                    rad_right = math.sin(alpha)
+                    rad_right = orb_sign * math.sin(alpha)
                     px = cx + R * (rad_fwd * fwd_x + rad_right * right_x)
                     py = cy + R * (rad_fwd * fwd_y + rad_right * right_y)
 
                     # Tangente unitaria de avance a lo largo de la órbita (derivada respecto a alpha)
                     tan_fwd = math.sin(alpha)
-                    tan_right = math.cos(alpha)
+                    tan_right = orb_sign * math.cos(alpha)
                     tx = tan_fwd * fwd_x + tan_right * right_x
                     ty = tan_fwd * fwd_y + tan_right * right_y
 
@@ -273,7 +275,6 @@ class WaypointController(BasePilot):
                     centripetal_yaw = math.atan2(cy - py, cx - px)
 
                     wp_kind = "pre" if k == 0 else "orbit_arc"
-                    # El punto de entrada pre no lleva feed-forward para posicionamiento exacto
                     vel_ff_enu = None if k == 0 else [
                         self.ORBIT_SPEED_FF * tx,
                         self.ORBIT_SPEED_FF * ty,
@@ -284,16 +285,25 @@ class WaypointController(BasePilot):
                         "type": wp_kind,
                         "primitive": p_type,
                         "target": target_id,
+                        "landmark_type": lm_type,
+                        "direction": direction,
+                        "tangent": [tx, ty],
                         "yaw": centripetal_yaw,
                         "vel_ff": vel_ff_enu,
                     })
 
                 # Salida tangencial progresiva hacia +X reanudando orientación del pasillo
                 wps.append({
-                    "pos": [cx + R * fwd_x - right_x * R, cy + R * fwd_y - right_y * R, cz],
+                    "pos": [
+                        cx + R * fwd_x - orb_sign * right_x * R,
+                        cy + R * fwd_y - orb_sign * right_y * R,
+                        cz,
+                    ],
                     "type": "post",
                     "primitive": p_type,
                     "target": target_id,
+                    "landmark_type": lm_type,
+                    "direction": direction,
                     "yaw": yaw,
                     "vel_ff": None,
                 })
@@ -365,23 +375,18 @@ class WaypointController(BasePilot):
                     lm_type = str(wp_info.get("landmark_type", "square_gate")).lower()
                     if "circ" in lm_type or "torus" in lm_type:
                         wp_reached = (
-                            dist_3d < 0.50
-                            or (along_track > -0.15 and math.hypot(cross_track, alt_err) <= self.TRAVERSE_CIRC_MAX_R)
+                            along_track > -0.20
+                            and math.hypot(cross_track, alt_err) <= self.TRAVERSE_CIRC_MAX_R
                         )
                     else:
                         wp_reached = (
-                            dist_3d < 0.50
-                            or (
-                                along_track > -0.15
-                                and cross_track <= self.TRAVERSE_SQUARE_MAX_Y
-                                and alt_err <= self.TRAVERSE_SQUARE_MAX_Z
-                            )
+                            along_track > -0.20
+                            and cross_track <= self.TRAVERSE_SQUARE_MAX_Y
+                            and alt_err <= self.TRAVERSE_SQUARE_MAX_Z
                         )
                 else:
                     wp_reached = (dist_3d < 0.60 or (along_track > -0.15 and cross_track < 0.60 and alt_err < 0.50))
             elif wp_type == "center":
-                # Para traverse, distinguir ventana rectangular (square_gate: |y| <= 0.33m, |z| <= 0.38m)
-                # y ventana radial (circular_gate: r <= 0.3656m) derivadas de validation_geometry.py.
                 if wp_prim == "traverse":
                     wp_reached = is_traverse_center_reached(
                         along_track=along_track,
@@ -396,7 +401,17 @@ class WaypointController(BasePilot):
                 else:
                     wp_reached = ((dist_3d < 0.65 or along_track >= -0.08) and cross_track < 0.65 and alt_err < 0.55)
             elif wp_type == "orbit_arc":
-                wp_reached = (dist_3d < 0.60 and alt_err < 0.50)
+                tan_vec = wp_info.get("tangent")
+                if tan_vec is not None:
+                    tx, ty = float(tan_vec[0]), float(tan_vec[1])
+                    tan_along = dx_enu * tx + dy_enu * ty
+                    rad_cross = abs(-dx_enu * ty + dy_enu * tx)
+                    wp_reached = (
+                        (dist_3d < 0.60 and alt_err < 0.50)
+                        or (tan_along >= 0.0 and rad_cross < 0.80 and alt_err < 0.50)
+                    )
+                else:
+                    wp_reached = (dist_3d < 0.60 and alt_err < 0.50)
             elif wp_type == "post":
                 if wp_prim == "traverse":
                     wp_reached = (dist_3d < 0.65 or (along_track >= -0.05 and cross_track < 0.55 and alt_err < 0.55))

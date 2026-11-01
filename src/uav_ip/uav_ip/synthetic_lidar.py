@@ -417,23 +417,47 @@ def generate_canonical_circular_gate(
     seed: Optional[int] = 42
 ) -> np.ndarray:
     """
-    Genera nube canonica para un aro circular / toroide centrado en (0, 0, 0)
-    en el plano Y-Z, con eje de cruce a lo largo de X.
-    Ecuaciones parametricas:
-      x = r * sin(theta)
-      y = (R + r * cos(theta)) * cos(phi)
-      z = (R + r * cos(theta)) * sin(phi)
+    Genera nube canonica para un aro circular centrado en (0, 0, 0) en el plano Y-Z,
+    muestreando exactamente la union de los 16 cilindros rectos finitos definidos en
+    `get_circular_gate_cylinders_spec()` (compartidos con el SDF de Gazebo y el validador).
     """
+    try:
+        from uav_ip.validation_geometry import get_circular_gate_cylinders_spec
+    except ImportError:
+        from validation_geometry import get_circular_gate_cylinders_spec
+
     rng = np.random.RandomState(seed)
-    theta = rng.uniform(0.0, 2.0 * math.pi, n_points)
-    phi = rng.uniform(0.0, 2.0 * math.pi, n_points)
+    cylinders = get_circular_gate_cylinders_spec(
+        major_radius=major_radius,
+        tube_radius=tube_radius,
+    )
+    num_seg = len(cylinders)
+    base_count = n_points // num_seg
+    rem = n_points % num_seg
 
-    x = tube_radius * np.sin(theta)
-    r_ring = major_radius + tube_radius * np.cos(theta)
-    y = r_ring * np.cos(phi)
-    z = r_ring * np.sin(phi)
+    chunks = []
+    for idx, cyl in enumerate(cylinders):
+        nk = base_count + (1 if idx < rem else 0)
+        if nk <= 0:
+            continue
+        phi = float(cyl["phi_rad"])
+        cx, cy, cz = cyl["center_xyz"]
+        r = float(cyl["radius_m"])
+        half_l = 0.5 * float(cyl["length_m"])
 
-    return np.column_stack([x, y, z]).astype(np.float32)
+        s = rng.uniform(-half_l, half_l, nk)
+        theta = rng.uniform(0.0, 2.0 * math.pi, nk)
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        cos_p = math.cos(phi)
+        sin_p = math.sin(phi)
+
+        x = cx + r * cos_t
+        y = cy - s * sin_p + (r * sin_t) * cos_p
+        z = cz + s * cos_p + (r * sin_t) * sin_p
+        chunks.append(np.column_stack([x, y, z]))
+
+    return np.vstack(chunks).astype(np.float32) if chunks else np.zeros((0, 3), dtype=np.float32)
 
 
 def generate_canonical_pole(

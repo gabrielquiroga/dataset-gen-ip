@@ -30,6 +30,46 @@ DEFAULT_ACTION_CATALOG: List[Tuple[str, str, Dict[str, Any]]] = [
 
 CIRCULAR_GATE_ACTION: Tuple[str, str, Dict[str, Any]] = ("circular_gate", "traverse", {})
 
+# Catálogo v2: desacopla objeto-acción sobre gates (traverse, overfly, slalom L/R)
+# y explicita sentido de giro orbital (direction=ccw | cw) sobre postes (9 acciones base).
+ACTION_CATALOG_V2: List[Tuple[str, str, Dict[str, Any]]] = [
+    ("gate", "traverse", {}),
+    ("gate", "overfly", {}),
+    ("gate", "slalom", {"side": "left"}),
+    ("gate", "slalom", {"side": "right"}),
+    ("pole", "overfly", {}),
+    ("pole", "slalom", {"side": "left"}),
+    ("pole", "slalom", {"side": "right"}),
+    ("pole", "orbit", {"direction": "ccw"}),
+    ("pole", "orbit", {"direction": "cw"}),
+]
+
+CIRCULAR_GATE_ACTIONS_V2: List[Tuple[str, str, Dict[str, Any]]] = [
+    ("circular_gate", "traverse", {}),
+    ("circular_gate", "overfly", {}),
+    ("circular_gate", "slalom", {"side": "left"}),
+    ("circular_gate", "slalom", {"side": "right"}),
+]
+
+
+def get_action_catalog(
+    catalog_version: str = "v1",
+    include_circular_gates: bool = False,
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Retorna la lista de acciones atómicas según versión ('v1' o 'v2') y flag de circular_gate."""
+    ver = str(catalog_version).strip().lower()
+    if ver == "v2":
+        cat = list(ACTION_CATALOG_V2)
+        if include_circular_gates:
+            cat.extend(CIRCULAR_GATE_ACTIONS_V2)
+        return cat
+    if ver == "v1":
+        cat = list(DEFAULT_ACTION_CATALOG)
+        if include_circular_gates:
+            cat.append(CIRCULAR_GATE_ACTION)
+        return cat
+    raise ValueError(f"catalog_version desconocida: {catalog_version!r} (use 'v1' o 'v2')")
+
 
 def _unpack_action_item(item: ActionItem) -> Tuple[str, str, Dict[str, Any]]:
     """Normaliza una tupla de acción de 2 o 3 elementos a (lm_type, prim_type, params)."""
@@ -135,6 +175,43 @@ def generate_task_dict(
     return config
 
 
+def generate_tasks(
+    num_tasks: int,
+    seed: int = 42,
+    catalog_version: str = "v2",
+    include_circular_gates: bool = False,
+    min_landmarks: int = 2,
+    max_landmarks: int = 5,
+    profile: str = "B1_CONTINUOUS",
+) -> List[Dict[str, Any]]:
+    """Genera una lista determinista sin reemplazo de `num_tasks` diccionarios de tareas únicas."""
+    active_catalog = get_action_catalog(
+        catalog_version=catalog_version,
+        include_circular_gates=include_circular_gates,
+    )
+    catalog = get_balanced_multilength_catalog(
+        action_catalog=active_catalog,
+        min_landmarks=min_landmarks,
+        max_landmarks=max_landmarks,
+        shuffle_seed=seed,
+    )
+    catalog_size = len(catalog)
+    tasks: List[Dict[str, Any]] = []
+    for i in range(int(num_tasks)):
+        seq = catalog[i % catalog_size]
+        t_cfg = generate_task_dict(
+            task_id=f"task_{i:04d}",
+            seed=int(seed + i),
+            action_sequence=seq,
+            logic="A1_DIRECT",
+            profile=profile,
+        )
+        t_cfg["catalog_version"] = catalog_version
+        t_cfg["catalog_size"] = catalog_size
+        tasks.append(t_cfg)
+    return tasks
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Genera la configuración de una pseudo-tarea (task_config.yaml) sin reemplazo."
@@ -166,6 +243,10 @@ def main():
         help="Incluye 'circular_gate' en el catálogo combinatorio además de puertas cuadradas"
     )
     parser.add_argument(
+        "--catalog-version", choices=["v1", "v2"], default="v1",
+        help="Versión del catálogo combinatorio: 'v1' (5 acciones base) o 'v2' (9 acciones: gate slalom/overfly + orbit ccw/cw)"
+    )
+    parser.add_argument(
         "--profile", type=str, default="B1_CONTINUOUS",
         help="Perfil cinemático de control (default: B1_CONTINUOUS)"
     )
@@ -183,9 +264,10 @@ def main():
     if min_l > max_l:
         raise ValueError(f"min_landmarks ({min_l}) no puede ser mayor que max_landmarks ({max_l})")
 
-    active_catalog = list(DEFAULT_ACTION_CATALOG)
-    if args.include_circular_gates:
-        active_catalog.append(CIRCULAR_GATE_ACTION)
+    active_catalog = get_action_catalog(
+        catalog_version=args.catalog_version,
+        include_circular_gates=args.include_circular_gates,
+    )
 
     # Generar espacio combinatorio balanceado e intercalado
     catalog = get_balanced_multilength_catalog(active_catalog, min_l, max_l, args.shuffle_seed)
@@ -211,6 +293,7 @@ def main():
         logic=logic,
         profile=profile,
     )
+    task_config["catalog_version"] = args.catalog_version
     task_config["catalog_size"] = catalog_size
     task_config["min_landmarks"] = min_l
     task_config["max_landmarks"] = max_l

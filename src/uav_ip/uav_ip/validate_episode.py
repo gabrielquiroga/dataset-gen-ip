@@ -96,6 +96,8 @@ from uav_ip.validation_geometry import (
     X500_SDF_MEASUREMENT,
     compute_landmark_clearance,
     derive_validation_tolerances,
+    get_overfly_min_alt_m,
+    get_slalom_lateral_bounds,
     points_to_aabb_distance as _points_to_aabb_distance,
     subdivide_trajectory_segments as _subdivide_trajectory_segments,
     world_to_landmark_local as _world_to_landmark_local,
@@ -112,6 +114,7 @@ GATE_LANDMARK_TYPES = frozenset({"gate", "square_gate", "circular_gate"})
 POLE_LANDMARK_TYPES = frozenset({"pole"})
 SUPPORTED_PRIMITIVE_TYPES = frozenset({"traverse", "slalom", "overfly", "orbit"})
 SUPPORTED_SLALOM_SIDES = frozenset({"left", "right"})
+SUPPORTED_ORBIT_DIRECTIONS = frozenset({"ccw", "cw"})
 
 # Criterios de despegue, continuidad temporal y ventana sincronizada de aterrizaje
 TAKEOFF_MIN_ALT_M: float = 0.95
@@ -955,23 +958,36 @@ def _verify_single_primitive(
         "start_time_s": None,
         "event_time_s": None,
         "completion_time_s": None,
+        "aperture_passed": False,
         "passed": False,
         "reason": None,
     }
 
     # 1. Comprobar colision contra la estructura del landmark usando la cota inferior conservadora
     # d_inferior = max(0, d_muestreada - h/2) < UAV_COLLISION_RADIUS_XY
+    collision_reason: Optional[str] = None
     if lower_bound_surf_dist < UAV_COLLISION_RADIUS_XY:
-        result["reason"] = (
+        collision_reason = (
             f"collision_with_{target_id} "
             f"(lower_bound_clearance={lower_bound_surf_dist:.4f}m [sampled={sampled_surf_dist:.4f}m, h/2={disc_margin:.3f}m] "
             f"< {UAV_COLLISION_RADIUS_XY:.2f}m)"
         )
+
+    def _fail_with(reason_str: str) -> Dict[str, Any]:
+        result["reason"] = collision_reason if collision_reason is not None else reason_str
+        return result
+
+    def _succeed() -> Dict[str, Any]:
+        result["aperture_passed"] = True
+        if collision_reason is not None:
+            result["passed"] = False
+            result["reason"] = collision_reason
+        else:
+            result["passed"] = True
         return result
 
     if N_total - start_idx_clamped < 2:
-        result["reason"] = f"{p_type}_{target_id}_no_samples_after_previous_primitive"
-        return result
+        return _fail_with(f"{p_type}_{target_id}_no_samples_after_previous_primitive")
 
     pts_loc = _world_to_landmark_local(pos_enu, cx, cy, cz, lm_yaw)
     x_loc = pts_loc[:, 0]
@@ -991,8 +1007,7 @@ def _verify_single_primitive(
             (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (dist_xy_sub[:-1] < 2.5)
         )[0]
         if len(cross_rel) == 0:
-            result["reason"] = f"traverse_{target_id}_no_plane_crossing"
-            return result
+            return _fail_with(f"traverse_{target_id}_no_plane_crossing")
 
         # Tomar el primer cruce cronologico a partir de `start_from_index`
         idx = int(start_idx_clamped + int(cross_rel[0]))
@@ -1018,41 +1033,37 @@ def _verify_single_primitive(
 
         if "circ" in lm_type or "torus" in lm_type:
             if r_c > TRAVERSE_CIRC_MAX_R:
-                result["reason"] = (
+                return _fail_with(
                     f"traverse_{target_id}_outside_circular_aperture (r={r_c:.3f}m > {TRAVERSE_CIRC_MAX_R:.4f}m)"
                 )
-                return result
         else:
             if abs(y_c) > TRAVERSE_MAX_ABS_Y or abs(z_c) > TRAVERSE_MAX_ABS_Z:
-                result["reason"] = (
+                return _fail_with(
                     f"traverse_{target_id}_outside_gate_aperture "
                     f"(|y|={abs(y_c):.3f}m vs {TRAVERSE_MAX_ABS_Y:.2f}m, "
                     f"|z|={abs(z_c):.3f}m vs {TRAVERSE_MAX_ABS_Z:.2f}m)"
                 )
-                return result
 
-        result["passed"] = True
-        return result
+        return _succeed()
 
     elif p_type == "slalom":
         side = str(prim.get("side", "right")).lower()
         result["side"] = side
         min_center_dist_2d = float(np.min(dist_xy))
         result["min_pole_center_dist_2d_m"] = round(min_center_dist_2d, 4)
+        min_lat, max_lat = get_slalom_lateral_bounds(lm_type)
 
-        if min_center_dist_2d < UAV_SAFE_POLE_CENTER_DIST:
-            result["reason"] = (
+        if lm_type in POLE_LANDMARK_TYPES and min_center_dist_2d < UAV_SAFE_POLE_CENTER_DIST:
+            return _fail_with(
                 f"slalom_{target_id}_too_close_to_pole "
                 f"(min_dist_2d={min_center_dist_2d:.3f}m < {UAV_SAFE_POLE_CENTER_DIST:.2f}m)"
             )
-            return result
 
         cross_rel = np.where(
-            (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (np.abs(y_sub[:-1]) <= SLALOM_MAX_LATERAL + 0.5)
+            (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (np.abs(y_sub[:-1]) <= max_lat + 0.5)
         )[0]
         if len(cross_rel) == 0:
-            result["reason"] = f"slalom_{target_id}_no_longitudinal_pass"
-            return result
+            return _fail_with(f"slalom_{target_id}_no_longitudinal_pass")
 
         idx = int(start_idx_clamped + int(cross_rel[0]))
         dx_step = float(x_loc[idx + 1] - x_loc[idx])
@@ -1070,30 +1081,27 @@ def _verify_single_primitive(
         result["cross_y_m"] = round(y_c, 4)
 
         if side == "left":
-            if not (SLALOM_MIN_LATERAL <= y_c <= SLALOM_MAX_LATERAL):
-                result["reason"] = (
+            if not (min_lat <= y_c <= max_lat):
+                return _fail_with(
                     f"slalom_{target_id}_wrong_flank_or_offset_left "
-                    f"(y_cross={y_c:+.3f}m not in [+{SLALOM_MIN_LATERAL:.2f}, +{SLALOM_MAX_LATERAL:.2f}]m)"
+                    f"(y_cross={y_c:+.3f}m not in [+{min_lat:.2f}, +{max_lat:.2f}]m)"
                 )
-                return result
         else:  # 'right'
-            if not (-SLALOM_MAX_LATERAL <= y_c <= -SLALOM_MIN_LATERAL):
-                result["reason"] = (
+            if not (-max_lat <= y_c <= -min_lat):
+                return _fail_with(
                     f"slalom_{target_id}_wrong_flank_or_offset_right "
-                    f"(y_cross={y_c:+.3f}m not in [-{SLALOM_MAX_LATERAL:.2f}, -{SLALOM_MIN_LATERAL:.2f}]m)"
+                    f"(y_cross={y_c:+.3f}m not in [-{max_lat:.2f}, -{min_lat:.2f}]m)"
                 )
-                return result
 
-        result["passed"] = True
-        return result
+        return _succeed()
 
     elif p_type == "overfly":
+        req_min_alt = get_overfly_min_alt_m(landmark)
         cross_rel = np.where(
             (x_sub[:-1] <= 0.0) & (x_sub[1:] > 0.0) & (np.abs(y_sub[:-1]) <= OVERFLY_MAX_LAT_M + 1.0)
         )[0]
         if len(cross_rel) == 0:
-            result["reason"] = f"overfly_{target_id}_no_longitudinal_pass"
-            return result
+            return _fail_with(f"overfly_{target_id}_no_longitudinal_pass")
 
         idx = int(start_idx_clamped + int(cross_rel[0]))
         dx_step = float(x_loc[idx + 1] - x_loc[idx])
@@ -1119,54 +1127,66 @@ def _verify_single_primitive(
         result["min_z_over_pole_m"] = round(min_z_over, 4)
 
         if abs(y_c) > OVERFLY_MAX_LAT_M:
-            result["reason"] = (
+            return _fail_with(
                 f"overfly_{target_id}_excessive_lateral_offset (|y|={abs(y_c):.3f}m > {OVERFLY_MAX_LAT_M:.2f}m)"
             )
-            return result
 
-        if min_z_over < OVERFLY_MIN_ALT_M or z_world_c < OVERFLY_MIN_ALT_M:
-            result["reason"] = (
+        if min_z_over < req_min_alt or z_world_c < req_min_alt:
+            return _fail_with(
                 f"overfly_{target_id}_insufficient_clearance_above_pole "
-                f"(min_z={min(min_z_over, z_world_c):.3f}m < {OVERFLY_MIN_ALT_M:.2f}m)"
+                f"(min_z={min(min_z_over, z_world_c):.3f}m < {req_min_alt:.2f}m)"
             )
-            return result
 
-        result["passed"] = True
-        return result
+        return _succeed()
 
     elif p_type == "orbit":
+        direction = str(prim.get("direction", "ccw")).strip().lower()
+        orb_sign = -1.0 if direction == "cw" else 1.0
+        result["direction"] = direction
+
         min_center_dist_2d = float(np.min(dist_xy))
         result["min_pole_center_dist_2d_m"] = round(min_center_dist_2d, 4)
         if min_center_dist_2d < UAV_SAFE_POLE_CENTER_DIST:
-            result["reason"] = (
+            return _fail_with(
                 f"orbit_{target_id}_pole_collision_or_shortcut "
                 f"(min_dist_2d={min_center_dist_2d:.3f}m < {UAV_SAFE_POLE_CENTER_DIST:.2f}m)"
             )
-            return result
 
         near_rel = np.where(dist_xy_sub <= ORBIT_MAX_RADIUS_M)[0]
         if len(near_rel) < 10:
-            result["reason"] = f"orbit_{target_id}_never_entered_orbit_radius"
-            return result
+            return _fail_with(f"orbit_{target_id}_never_entered_orbit_radius")
 
         near_indices = near_rel + start_idx_clamped
         splits = np.where(np.diff(near_indices) > 5)[0]
         segments = [seg for seg in np.split(near_indices, splits + 1) if len(seg) >= 10]
         if not segments:
-            result["reason"] = f"orbit_{target_id}_never_entered_orbit_radius"
-            return result
+            return _fail_with(f"orbit_{target_id}_never_entered_orbit_radius")
 
-        # Elegir el primer segmento contiguo significativo a partir de start_from_index
+        # Seleccionar el primer segmento que alcance ORBIT_MIN_SWEEP_DEG en la direccion pedida;
+        # si ninguno alcanza el barrido minimo, elegir el segmento con mayor barrido acumulado.
         main_seg = segments[0]
-        angles = np.unwrap(np.arctan2(y_loc[main_seg], x_loc[main_seg]))
-        running_min = np.minimum.accumulate(angles)
-        ccw_prog_deg_arr = np.degrees(angles - running_min)
-        ccw_progression_deg = float(np.max(ccw_prog_deg_arr))
-        max_span_deg = math.degrees(float(np.max(angles) - np.min(angles)))
+        best_prog = -1.0
+        for cand_seg in segments:
+            c_angles = orb_sign * np.unwrap(np.arctan2(y_loc[cand_seg], x_loc[cand_seg]))
+            c_prog_arr = np.degrees(c_angles - np.minimum.accumulate(c_angles))
+            c_prog = float(np.max(c_prog_arr))
+            if c_prog >= ORBIT_MIN_SWEEP_DEG:
+                main_seg = cand_seg
+                break
+            if c_prog > best_prog:
+                best_prog = c_prog
+                main_seg = cand_seg
+
+        angles_raw = np.unwrap(np.arctan2(y_loc[main_seg], x_loc[main_seg]))
+        signed_angles = orb_sign * angles_raw
+        running_min = np.minimum.accumulate(signed_angles)
+        prog_deg_arr = np.degrees(signed_angles - running_min)
+        progression_deg = float(np.max(prog_deg_arr))
+        max_span_deg = math.degrees(float(np.max(angles_raw) - np.min(angles_raw)))
         mean_r = float(np.mean(dist_xy[main_seg]))
 
         start_i = int(main_seg[0])
-        reached_rel = np.where(ccw_prog_deg_arr >= ORBIT_MIN_SWEEP_DEG)[0]
+        reached_rel = np.where(prog_deg_arr >= ORBIT_MIN_SWEEP_DEG)[0]
         if len(reached_rel) > 0:
             reach_k = int(reached_rel[0])
             comp_i = int(main_seg[reach_k])
@@ -1192,31 +1212,28 @@ def _verify_single_primitive(
         yaw_diff = np.arctan2(np.sin(yaw_seg - desired_yaw), np.cos(yaw_seg - desired_yaw))
         mean_yaw_err_deg = math.degrees(float(np.mean(np.abs(yaw_diff))))
 
-        result["ccw_sweep_deg"] = round(ccw_progression_deg, 2)
+        result["sweep_deg"] = round(progression_deg, 2)
+        result["ccw_sweep_deg"] = round(progression_deg, 2)
         result["angular_span_deg"] = round(max_span_deg, 2)
         result["mean_orbit_radius_m"] = round(mean_r, 4)
         result["mean_centripetal_yaw_err_deg"] = round(mean_yaw_err_deg, 2)
 
-        if ccw_progression_deg < ORBIT_MIN_SWEEP_DEG:
-            result["reason"] = (
+        if progression_deg < ORBIT_MIN_SWEEP_DEG:
+            return _fail_with(
                 f"orbit_{target_id}_incomplete_angular_sweep "
-                f"(ccw_sweep={ccw_progression_deg:.1f}deg < {ORBIT_MIN_SWEEP_DEG:.1f}deg)"
+                f"(sweep={progression_deg:.1f}deg [{direction}] < {ORBIT_MIN_SWEEP_DEG:.1f}deg)"
             )
-            return result
 
         if mean_yaw_err_deg > ORBIT_MAX_MEAN_YAW_ERR_DEG:
-            result["reason"] = (
+            return _fail_with(
                 f"orbit_{target_id}_excessive_centripetal_yaw_error "
                 f"(mean_yaw_err={mean_yaw_err_deg:.1f}deg > {ORBIT_MAX_MEAN_YAW_ERR_DEG:.1f}deg)"
             )
-            return result
 
-        result["passed"] = True
-        return result
+        return _succeed()
 
     else:
-        result["reason"] = f"unsupported_primitive_type_{p_type}"
-        return result
+        return _fail_with(f"unsupported_primitive_type_{p_type}")
 
 
 class ClockReconstructionResult(dict):
@@ -1973,9 +1990,13 @@ def validate_waypoints_config(
                     errors.append(
                         f"invalid_configuration:incompatible_primitive_landmark ({p_type} requires gate, got {target_lm_type} on {target_id})"
                     )
-                elif p_type in {"slalom", "overfly", "orbit"} and target_lm_type not in POLE_LANDMARK_TYPES:
+                elif p_type == "orbit" and target_lm_type not in POLE_LANDMARK_TYPES:
                     errors.append(
                         f"invalid_configuration:incompatible_primitive_landmark ({p_type} requires pole, got {target_lm_type} on {target_id})"
+                    )
+                elif p_type in {"slalom", "overfly"} and target_lm_type not in SUPPORTED_LANDMARK_TYPES:
+                    errors.append(
+                        f"invalid_configuration:incompatible_primitive_landmark ({p_type} requires supported landmark, got {target_lm_type} on {target_id})"
                     )
 
         norm_prim: Dict[str, Any] = {"type": p_type, "target": target_id}
@@ -1985,6 +2006,12 @@ def validate_waypoints_config(
                 errors.append(f"invalid_configuration:invalid_or_missing_slalom_side ({target_id}:{raw_side})")
             else:
                 norm_prim["side"] = raw_side.strip().lower()
+        elif p_type == "orbit":
+            raw_dir = prim.get("direction", "ccw")
+            if not isinstance(raw_dir, str) or raw_dir.strip().lower() not in SUPPORTED_ORBIT_DIRECTIONS:
+                errors.append(f"invalid_configuration:invalid_orbit_direction ({target_id}:{raw_dir})")
+            else:
+                norm_prim["direction"] = raw_dir.strip().lower()
 
         primitives_list.append(norm_prim)
 
@@ -2473,7 +2500,7 @@ def validate_episode_data(
                 ts_sim_s=ts_sim_s,
             )
             early_start = early_res.get("start_index")
-            if early_start is not None and int(early_start) < prev_completion_idx:
+            if early_res.get("aperture_passed") and early_start is not None and int(early_start) < prev_completion_idx:
                 order_msg = (
                     f"primitive_order_violation "
                     f"({prev_target_label}_completion@{prev_completion_idx} > {tid}_start@{early_start})"
@@ -2640,6 +2667,9 @@ def validate_episode_data(
         "discretization_margin_m": round(DISCRETIZATION_MARGIN_M, 4),
         "min_obstacle_clearance_m": round(
             min_global_lower_bound_clearance if math.isfinite(min_global_lower_bound_clearance) else -1.0, 4
+        ),
+        "rotor_tip_clearance_warning": bool(
+            min_global_lower_bound_clearance < X500_FULL_ROTOR_TIP_RADIUS_M
         ),
         "landing_xy_error_m": round(landing_xy_err, 4),
         "final_altitude_m": round(float(landing_res["final_altitude_m"]), 4),

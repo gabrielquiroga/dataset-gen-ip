@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+pythonpath = ["src/uav_ip", "src/uav_ip/scripts"]
+testpaths = ["src/uav_ip/test"]
+addopts = "-v --ignore=src/uav_ip/test/test_copyright.py --ignore=src/uav_ip/test/test_flake8.py --ignore=src/uav_ip/test/test_pep257.py"

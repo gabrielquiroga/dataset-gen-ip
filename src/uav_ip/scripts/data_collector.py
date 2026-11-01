@@ -270,6 +270,7 @@ class DataCollector:
         min_landmarks: int = 2,
         max_landmarks: int = 5,
         include_circular_gates: bool = False,
+        catalog_version: str = "v1",
         max_retries: int = 2,
     ):
         self.num_tasks = num_tasks
@@ -284,6 +285,7 @@ class DataCollector:
         self.min_landmarks = min_landmarks
         self.max_landmarks = max_landmarks
         self.include_circular_gates = include_circular_gates
+        self.catalog_version = str(catalog_version)
         self.max_retries = max(0, int(max_retries))
         self.pm = ProcessManager()
 
@@ -521,6 +523,7 @@ class DataCollector:
             "--shuffle-seed", str(self.base_seed),
             "--min-landmarks", str(self.min_landmarks),
             "--max-landmarks", str(self.max_landmarks),
+            "--catalog-version", str(self.catalog_version),
         ]
         if self.num_landmarks is not None:
             cmd_task.extend(["--num-landmarks", str(self.num_landmarks)])
@@ -1127,13 +1130,13 @@ def main():
         help="Episodios por tarea. Default: 15.",
     )
     parser.add_argument(
-        "--base-seed", type=int, default=0,
-        help="Semilla base para la generacion de mundos. "
+        "--base-seed", "--seed", dest="base_seed", type=int, default=0,
+        help="Semilla base para la generacion de mundos (alias: --seed). "
         "Tarea N usa seed = base_seed + N. Default: 0.",
     )
     parser.add_argument(
-        "--dataset-dir", type=Path, default=DATASET_DIR,
-        help=f"Directorio de salida del dataset. Default: {DATASET_DIR}",
+        "--dataset-dir", "--output-dir", dest="dataset_dir", type=Path, default=DATASET_DIR,
+        help=f"Directorio de salida del dataset (alias: --output-dir). Default: {DATASET_DIR}",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -1170,6 +1173,10 @@ def main():
         help="Incluir aros circulares (circular_gate) en el catalogo de tareas.",
     )
     parser.add_argument(
+        "--catalog-version", choices=["v1", "v2"], default="v1",
+        help="Version del catalogo de tareas: 'v1' (5 acciones base) o 'v2' (9 acciones: gate slalom/overfly + orbit ccw/cw).",
+    )
+    parser.add_argument(
         "--max-retries", type=int, default=2,
         help="Maximo de reintentos con semilla derivada cuando un episodio es rechazado "
         "(guardados como episode_XX_attempt_YY sin sobrescribir el intento original). Default: 2.",
@@ -1193,6 +1200,7 @@ def main():
         min_landmarks=args.min_landmarks,
         max_landmarks=args.max_landmarks,
         include_circular_gates=args.include_circular_gates,
+        catalog_version=args.catalog_version,
         max_retries=args.max_retries,
     )
     
