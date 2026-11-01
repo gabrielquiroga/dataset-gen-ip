@@ -6,9 +6,15 @@
 
 ## 📖 Descripción del Proyecto
 
-Este repositorio implementa la infraestructura completa de generación, validación física y procesamiento de datos para entrenar un modelo de **Aprendizaje por Imitación en Contexto (*In-Context Imitation Learning* - ICIL)** basado en la arquitectura **Instant Policy** (Vosylius y Johns, ICLR 2025) adaptada a vehículos aéreos no tripulados (UAV).
+Este proyecto implementa la infraestructura completa de generación, validación física y procesamiento de datos para entrenar un modelo de **Aprendizaje por Imitación en Contexto (*In-Context Imitation Learning* - ICIL)** basado en la arquitectura **Instant Policy** (Vosylius y Johns, ICLR 2025) adaptada a vehículos aéreos no tripulados (UAV).
 
 El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot SITL** para simular cuadricópteros tipo x500 que navegan procedimentalmente circuitos 3D de obstáculos (*landmarks*: puertas cuadradas, aros circulares, postes y plataformas de aterrizaje), complementado con un generador cinemático ultrarrápido para pre-entrenamiento masivo en escala.
+
+<p align="center">
+   <img src="docs/assets/preview_flight.gif" width="850" alt="Animación de vuelo y LiDAR sintético" />
+   <br>
+   <em>Figura 1: Visualización sincronizada del vuelo en 3D (izquierda), proyección egocéntrica del LiDAR 360° en plano horizontal XY (centro) y perfil vertical en plano XZ (derecha) mostrando la maniobra de sobrepaso. Escala en X reducida (ENU).</em>
+</p>
 
 ```mermaid
 flowchart LR
@@ -68,6 +74,7 @@ ros2_ws/
 │       │   └── visualize_dataset.py   # Motor de renderizado 3D y animaciones GIF
 │       └── test/                  # Suite completa de pruebas unitarias e integradas (63 tests)
 ├── docs/                          # Documentación técnica canónica consolidada
+│   ├── assets/                    # Animaciones GIF y capturas de simulación
 │   ├── FUNDAMENTOS_Y_DISENO.md           # Teoría matemática, ADRs, envolventes y catálogo v2
 │   ├── AUDITORIA_CONSISTENCIA_Y_LITERATURA.md # Auditoría forense y bibliografía anotada
 │   ├── PLAN_IMPLEMENTACION.md            # Hoja de ruta activa e hitos del proyecto
@@ -151,6 +158,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 * **Para qué sirve:**
   Genera pseudo-demostraciones cinemáticas continuas a $50\text{ Hz}$ en Python puro, calculando la actitud analítica mediante dinámica diferencial plana ($\mathbf{a} - \mathbf{g}$) y perfil de aceleración trapezoidal. Cada episodio es evaluado en memoria por el mismo validador físico (`validate_episode_data()`) y exportado directamente a grafos `HeteroData` (.pt). Permite generar miles de episodios en minutos para pre-entrenamiento masivo en escala (*scaling laws*), excluyendo las firmas del dataset físico para garantizar cero fuga de datos (*zero data leakage*).
 
+<p align="center">
+   <img src="docs/assets/vuelo_kinematic.gif" width="850" alt="Vuelo cinemático generado" />
+   <br>
+   <em>Figura 2: Demostración cinemática continua generada a 50 Hz en Python puro con dinámica diferencial y actitud analítica, 100% conforme con el validador físico para pre-entrenamiento masivo.</em>
+</p>
+
 * **Parámetros Principales:**
   * `--num-tasks`: Cantidad de tareas únicas a sintetizar (default: 100).
   * `--episodes-per-task`: Episodios por tarea (default: 5).
@@ -184,6 +197,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 
 * **Para qué sirve:**
   Procesa los rosbags MCAP de los vuelos físicos de simulación para construir grafos heterogéneos `torch_geometric.data.HeteroData` (.pt). Remuestrea la telemetría a una grilla uniforme de $10\text{ Hz}$ con SLERP de cuaterniones, calcula el horizonte de acciones relativas futuras $T_{EA} \in SE(3)$ a horizonte $T=8$, computa las observaciones LiDAR 360° analíticas en marco *Horizontal FLU*, calcula el vector de velocidad propioceptiva `vel_flu` $(T, 3)$, y genera los nodos de recuperación por *Tube Augmentation* ($30\%$ de pasos con decaimiento exponencial $\gamma = 0.70$).
+
+<p align="center">
+   <img src="docs/assets/tube_recovery.png" width="850" alt="Inspección de Tube Augmentation" />
+   <br>
+   <em>Figura 3: Recuperación activa mediante Tube Augmentation: poses perturbadas fuera del eje nominal y vectores de acción correctiva reconvergentes hacia el centro de los obstáculos con decaimiento exponencial $\gamma = 0.70$ y cota física $\le 6.5\text{ m/s}$.</em>
+</p>
 
 * **Parámetros Principales:**
   * `--dataset-dir`: Directorio raíz del dataset con carpetas `task_XXXX` para procesamiento por lotes.
@@ -278,6 +297,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 * **Para qué sirve:**
   Toma la receta semántica de `task_config.yaml` e instancia poses aleatorias 3D para cada obstáculo a lo largo del pasillo en $+X$, garantizando separaciones mínimas, alineación de la plataforma de aterrizaje y verificando la factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`). Genera el archivo de mundo Gazebo `.sdf` y el archivo de navegación `waypoints.yaml`.
 
+<p align="center">
+   <img src="docs/assets/gazebo_world_init.png" width="65%" alt="Mundo procedural en Gazebo" />
+   <br>
+   <em>Figura 4: Entorno de simulación física en Gazebo Harmonic con landmarks procedurales (aros cuadrados, toroides circulares, postes cilíndricos y plataforma de aterrizaje).</em>
+</p>
+
 * **Modo de Uso:**
   Es invocado automáticamente por `data_collector.py` y `kinematic_pseudo_generator.py`. Para inspección manual:
   ```bash
@@ -319,6 +344,13 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 
 * **Para qué sirve:**
   Proporciona herramientas visuales interactivas en Matplotlib para inspeccionar las trayectorias de vuelo en 3D, proyecciones en planos horizontal (XY) y vertical (XZ), animaciones GIF y análisis gráfico de los vectores de recuperación de Tube Augmentation.
+
+<p align="center">
+   <img src="docs/assets/gazebo_world_1.png" width="31%" alt="Mundo en Gazebo" />
+   <img src="docs/assets/lidar_sintetico_1(t_110).png" width="67%" alt="LiDAR 360° en t=110" />
+   <br>
+   <em>Figura 5: Correspondencia 1-a-1 entre el entorno físico simulado en Gazebo (izquierda) y la observación LiDAR sintética 360° egocéntrica en marco Horizontal FLU (derecha).</em>
+</p>
 
 * **Ejemplo de Ejecución:**
   ```bash

@@ -98,7 +98,7 @@ Un error destructivo habitual es mezclar la telemetría de PX4 con las posicione
 ## 3. El Validador Físico y la Geometría Exacta
 
 ### 3.1 Los 5 Estados Ortogonales de Validación
-La verificación de un episodio no puede depender de una variable booleana ingenua (`pilot.returncode == 0`). El validador [`validate_episode.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validate_episode.py) desacopla la evaluación en cinco capas independientes:
+La verificación de un episodio no puede depender de una variable booleana ingenua (`pilot.returncode == 0`). El validador [`validate_episode.py`](/src/uav_ip/uav_ip/validate_episode.py) desacopla la evaluación en cinco capas independientes:
 1. `configuration_status`: Sintaxis y coherencia geométrica de `waypoints.yaml`.
 2. `recording_status`: Integridad del archivo `.mcap` (stream completo, CRC32 verificado y presencia de `VehicleOdometry`).
 3. `pilot_exit_code`: Código de retorno del proceso del piloto (0: éxito nominal, 1: timeout o aborto).
@@ -107,7 +107,7 @@ La verificación de un episodio no puede depender de una variable booleana ingen
 
 ### 3.2 Envolvente Física del x500 y Medición SDF
 * En fases tempranas se utilizó un radio simplificado de chasis ($0.25\text{ m}$).
-* A partir de la versión actual, [`validation_geometry.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/uav_ip/validation_geometry.py) implementa la envolvente física real medida del SDF `gz_x500`:
+* A partir de la versión actual, [`validation_geometry.py`](/src/uav_ip/uav_ip/validation_geometry.py) implementa la envolvente física real medida del SDF `gz_x500`:
   * Radio máximo del disco de hélices: $R_{\text{rotor\_tip}} = 0.385689\text{ m}$.
   * Margen de seguridad: $\delta_{\text{safe}} = 0.05\text{ m}$.
   * Radio de colisión operativo: $R_{\text{collision}} = 0.4357\text{ m}$.
@@ -119,6 +119,7 @@ La verificación de un episodio no puede depender de una variable booleana ingen
 3. **Puertas Circulares (`circular_gate`):**
    * Comparten exactamente la especificación de **16 cilindros finitos** devuelta por `get_circular_gate_cylinders_spec()`, idéntica en el SDF de Gazebo, en el validador de colisiones y en el generador de LiDAR sintético.
    * Incluyen las patas de soporte laterales (`leg_left` y `leg_right`) conectadas al suelo, eliminando falsos despejes por debajo del aro.
+   * Se pueden incluir opcionalmente, agregando el parámetro `include_circular_gates` al ejecutar alguno de los generadores masivos (`data_collector.py` o `kinematic_pseudo_generator.py`).
 4. **Plataforma de Aterrizaje (`landing_pad`):** Caja prismática de $2.0 \times 2.0 \times 0.10\text{ m}$.
 
 ### 3.4 Cota Inferior de Discretización Temporal ($h/2$)
@@ -186,7 +187,7 @@ $$v_{\text{salto}} = \frac{\|\mathbf{p}_{t+1} - (\mathbf{p}_t + \delta\mathbf{p}
 Un cuadricóptero subactuado no puede generar esa aceleración en $100\text{ ms}$, violando la física del vehículo y provocando oscilaciones divergentes si la red predice dicha acción.
 
 ### 5.2 Decaimiento Exponencial Suave ($\gamma = 0.70$)
-Se implementó en [`bag_to_heterodata.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/scripts/bag_to_heterodata.py) y [`kinematic_pseudo_generator.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/scripts/kinematic_pseudo_generator.py) una ley de convergencia exponencial geométrica de primer orden:
+Se implementó en [`bag_to_heterodata.py`](/src/uav_ip/scripts/bag_to_heterodata.py) y [`kinematic_pseudo_generator.py`](/src/uav_ip/scripts/kinematic_pseudo_generator.py) una ley de convergencia exponencial geométrica de primer orden:
 $$\tilde{\mathbf{p}}_{\text{target}}^{(t, k)} = \mathbf{p}_{t + k \cdot \text{stride}} + \gamma^k \delta\mathbf{p}, \quad k = 1, \dots, T, \quad \gamma = 0.70$$
 
 ```mermaid
@@ -207,7 +208,7 @@ El vector de velocidades en el marco Horizontal FLU se calcula por diferencias c
 
 ### 6.1 Por qué la Simulación Física Pura no Escala para la Especialización
 * Volar circuitos en PX4 SITL + Gazebo en tiempo real toma entre $45\text{ s}$ y $90\text{ s}$ por episodio.
-* Para generar $1.000$ episodios se requerirían más de **20 horas continuas de simulación**, con riesgos de degradación por consumo de memoria, cuelgues de WSL2 o desincronizaciones de microRTPS/XRCE.
+* Para generar $1.000$ episodios se requerirían más de **20 horas continuas de simulación**, con riesgos de degradación por consumo de memoria, cuelgues de WSL2 o desincronizaciones de microXRCE.
 * En el contexto de un proyecto de especialización, donde el **objetivo académico principal es el desarrollo, entrenamiento y evaluación de la red neuronal**, consumir semanas en recolección física es un costo de oportunidad ineficiente.
 
 ### 6.2 La Receta Canónica de Instant Policy (Vosylius & Johns, ICLR 2025)
@@ -219,7 +220,7 @@ En el paper original (§3.4 y Fig. 5), los autores **no generaron millones de de
 ### 6.3 Implementación Híbrida en este Repositorio
 Se proveen dos generadores completamente interoperables que comparten las mismas reglas geométricas y el mismo validador:
 
-| Característica | Generador Físico SITL ([`data_collector.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/scripts/data_collector.py)) | Generador Cinemático ([`kinematic_pseudo_generator.py`](file:///home/gabrielq/ros2_ws/src/uav_ip/scripts/kinematic_pseudo_generator.py)) |
+| Característica | Generador Físico SITL ([`data_collector.py`](/src/uav_ip/scripts/data_collector.py)) | Generador Cinemático ([`kinematic_pseudo_generator.py`](/src/uav_ip/scripts/kinematic_pseudo_generator.py)) |
 | :--- | :--- | :--- |
 | **Motor de Dinámica** | PX4 Autopilot + Motor ODE de Gazebo Harmonic | Dinámica diferencial plana ($\mathbf{a} - \mathbf{g}$) con actitud analítica |
 | **Velocidad de Generación** | $\sim 1\text{–}1.5\text{ min}$ por episodio | **$\sim 0.3\text{ segundos}$ por episodio** ($1.000$ demos en $\sim 5\text{ min}$) |
@@ -227,4 +228,4 @@ Se proveen dos generadores completamente interoperables que comparten las mismas
 | **Salida Producida** | Rosbag MCAP + `heterodata.pt` (offline) | `heterodata.pt` directo y pre-auditado |
 | **Rol en el Proyecto** | **Test Set Oficial (Held-Out) y Co-Fine-Tuning** | **Pre-entrenamiento Masivo y Ablaciones de Escala** |
 
-Esta arquitectura híbrida permite cumplir con los más altos estándares científicos de la literatura internacional, manteniendo los tiempos de cómputo dentro de los límites prácticos de una especialización académica.
+Esta arquitectura híbrida relativamente permite cumplir con estándares científicos, manteniendo los tiempos de cómputo dentro de los límites prácticos de una especialización académica.

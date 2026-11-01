@@ -550,6 +550,7 @@ def generate_kinematic_dataset(
     num_tasks: int = 100,
     episodes_per_task: int = 5,
     catalog_version: str = "v2",
+    include_circular_gates: bool = False,
     exclude_signatures_from: Optional[List[Path]] = None,
     seed: int = 1000,
     workers: int = 0,
@@ -584,6 +585,7 @@ def generate_kinematic_dataset(
         num_tasks=oversample,
         seed=seed,
         catalog_version=catalog_version,
+        include_circular_gates=include_circular_gates,
     )
 
     selected_tasks: List[Dict[str, Any]] = []
@@ -713,6 +715,11 @@ def main() -> None:
         default=None,
         help="Uno o más directorios o archivos de datasets cuyas firmas semánticas deben excluirse (alias: --exclude-tasks-from)",
     )
+    parser.add_argument(
+        "--include-circular-gates",
+        action="store_true",
+        help="Incluir aros circulares (circular_gate) en el catálogo de tareas.",
+    )
     parser.add_argument("--seed", type=int, default=1000, help="Semilla aleatoria base (default: 1000)")
     parser.add_argument("--workers", "-j", type=int, default=0, help="Procesos paralelos (default: 0 = todos los núcleos)")
     parser.add_argument("--tube-decay", type=float, default=0.70, help="Factor gamma de Tube Augmentation (default: 0.70)")
@@ -724,6 +731,7 @@ def main() -> None:
         num_tasks=args.num_tasks,
         episodes_per_task=args.episodes_per_task,
         catalog_version=args.catalog_version,
+        include_circular_gates=args.include_circular_gates,
         exclude_signatures_from=args.exclude_signatures_from,
         seed=args.seed,
         workers=args.workers,
