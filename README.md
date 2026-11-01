@@ -1,16 +1,36 @@
 # UAV Instant Policy: Data Collection & Synthetic LiDAR Pipeline
 
+*Pipeline de recolección de demostraciones, simulación física de alta fidelidad, generación cinemática masiva y preparación de grafos heterogéneos para In-Context Imitation Learning (ICIL) en cuadricópteros autónomos.*
+
+---
+
 ## 📖 Descripción del Proyecto
 
-Este proyecto implementa un *pipeline* automatizado de recolección de datos en simulación para entrenar un modelo de Aprendizaje por Imitación en Contexto (*In-Context Imitation Learning* - ICIL), basado en la arquitectura **Instant Policy** (Vosylius y Johns, ICLR 2025).
+Este repositorio implementa la infraestructura completa de generación, validación física y procesamiento de datos para entrenar un modelo de **Aprendizaje por Imitación en Contexto (*In-Context Imitation Learning* - ICIL)** basado en la arquitectura **Instant Policy** (Vosylius y Johns, ICLR 2025) adaptada a vehículos aéreos no tripulados (UAV).
 
-El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot** para simular un VANT (Vehículo Aéreo No Tripulado) que navega procedimentalmente a través de circuitos dinámicos de landmarks (aros cuadrados, toroides, postes cilíndricos y plataformas de aterrizaje).
+El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot SITL** para simular cuadricópteros tipo x500 que navegan procedimentalmente circuitos 3D de obstáculos (*landmarks*: puertas cuadradas, aros circulares, postes y plataformas de aterrizaje), complementado con un generador cinemático ultrarrápido para pre-entrenamiento masivo en escala.
 
-<p align="center">
-   <img src='docs\assets\preview_flight.png' width="850" alt="Animación de vuelo y LiDAR sintético" />
-   <br>
-   <em>Figura 1: Visualización sincronizada del vuelo en 3D (izquierda), proyección egocéntrica del LiDAR en plano XY (centro) y perfil vertical en plano XZ (derecha) mostrando la maniobra de sobrepaso. Escala en X reducida (ENU).</em>
-</p>
+```mermaid
+flowchart LR
+    subgraph Generacion ["1. Generación de Demostraciones"]
+        A1["PX4 SITL + Gazebo (data_collector.py)\n[Alta fidelidad dinámica / Test Set]"]
+        A2["Emulador Cinemático (kinematic_pseudo_generator.py)\n[1.000+ episodios en ~5 min / Pretrain]"]
+    end
+    subgraph Validacion ["2. Validación y Certificación"]
+        B["Juez Geométrico Independiente (validate_episode.py)\n- Envolvente x500 (0.4357 m)\n- Cota inferior h/2\n- Persistencia de aterrizaje (3.0s)"]
+    end
+    subgraph Postproceso ["3. Postproceso ML (HeteroData)"]
+        C1["LiDAR Sintético 360° (synthetic_lidar.py)\n[2048 pts FPS en Horizontal FLU, s=0.1]"]
+        C2["Conversor Batch PyG (bag_to_heterodata.py)\n[Horizonte T=8, Tube Aug gamma=0.70, vel_flu]"]
+    end
+    subgraph Auditoria ["4. Auditoría y Splits"]
+        D["Auditoría 3 Capas (audit_dataset.py)\n[Cota física <= 6.5 m/s, cero data leakage\nSplits: Train / Val / Held-Out]"]
+    end
+    A1 --> B
+    A2 --> B
+    B --> C1 --> C2
+    C2 --> D
+```
 
 ---
 
@@ -18,335 +38,405 @@ El sistema utiliza **ROS 2 Jazzy**, **Gazebo Harmonic** y **PX4 Autopilot** para
 
 ```text
 ros2_ws/
+├── pyproject.toml                 # Configuración canónica de pytest y pythonpath
 ├── src/
-│   ├── px4_msgs/                  # Definiciones de tópicos (VehicleOdometry, TrajectorySetpoint, etc.)
-│   ├── px4_offboard/              # Tutoriales y utilidades offboard de referencia
+│   ├── px4_msgs/                  # Definiciones de mensajes DDS de PX4 (VehicleOdometry, etc.)
+│   ├── px4_offboard/              # Ejemplos base y nodos de apoyo para modo Offboard
 │   └── uav_ip/
 │       ├── package.xml
 │       ├── setup.py
-│       ├── worlds/                # Plantillas SDF de Gazebo (circuito_aros_01.sdf)
-│       ├── generated_worlds/      # Tareas generadas procedimentalmente (.sdf + waypoints.yaml)
-│       ├── scripts/
-│       │   ├── setup_venv_ip.sh       # Configurador automatizado de virtualenv ML (~/venv_ip)
-│       │   ├── task_generator.py      # Generador de recetas semánticas de tareas (sin reemplazo)
-│       │   ├── world_generator.py     # Generador de mundos SDF y waypoints.yaml
-│       │   ├── synthetic_lidar.py     # Thin wrapper CLI para LiDAR sintético 360°
-│       │   ├── audit_dataset.py       # Auditoría semántica, métricas de vuelo y particionado Train/Val/Held-Out
-│       │   ├── bag_to_heterodata.py   # Conversor batch multiproceso a HeteroData PyG (.pt) con Tube Augmentation
-│       │   ├── visualize_dataset.py   # Thin wrapper CLI para visualización 3D y análisis de recuperación
-│       │   ├── data_collector.py      # Orquestador automático del dataset (doble bucle)
-│       │   ├── test_flight.sh         # Script rápido para vuelo de prueba
-│       │   └── kill_sim.sh            # Limpieza agresiva de procesos huérfanos
-│       └── uav_ip/                    # Módulo Python principal (Punto Único de Verdad)
-│           ├── __init__.py
-│           ├── base_pilot.py          # Máquina de estados, QoS y protocolo seguro de armado
-│           ├── waypoint_controller.py # Piloto experto feed-forward (traverse, overfly, slalom)
-│           ├── tracking_controller.py # Piloto experto feedback (orbit)
-│           ├── synthetic_lidar.py     # Generador LiDAR analítico (Horizontal FLU, kernel C SIMD FPS)
-│           ├── validation_geometry.py # Geometría compartida, mediciones SDF x500 y tolerancias derivadas
-│           ├── validate_episode.py    # Validador post-vuelo (configuración, reloj, MCAP/CDR, misión)
-│           └── visualize_dataset.py   # Visualizador 3D, animación GIF e inspección Tube Augmentation
-│   ├── datasets/                      # Salida del dataset estructurado por tarea y episodio
-├── docs/                          # Documentación técnica canónica
-│   ├── ESTRATEGIA_TEORICA.md      # Marco teórico, preservación de Markov, escala s=0.1 y taxonomía
-│   ├── PLAN_IMPLEMENTACION.md     # Hoja de ruta, hitos de desarrollo (0-4) y backlog operativo
-│   ├── DECISIONES_DISENO.md       # Registro de decisiones de arquitectura (ADRs) y enfoques descartados
-│   └── TROUBLESHOOTING.md         # Resolución de incidencias comunes (WSL2, PX4, Gazebo)
-├── build/
-├── install/
-└── log/
+│       ├── scripts/               # Scripts ejecutables y herramientas CLI
+│       │   ├── data_collector.py             # Orquestador de recolección SITL (PX4 + Gazebo)
+│       │   ├── kinematic_pseudo_generator.py # Generador cinemático ultrarrápido (50 Hz, PyG)
+│       │   ├── bag_to_heterodata.py          # Conversor por lotes a HeteroData (.pt) con Tube Aug
+│       │   ├── audit_dataset.py              # Auditoría en 3 capas y particionado Train/Val/Held-Out
+│       │   ├── task_generator.py             # Generador de configuraciones semánticas (v1 / v2)
+│       │   ├── world_generator.py            # Generador procedural de mundos SDF y waypoints.yaml
+│       │   ├── validate_episode.py           # CLI del validador físico de episodios
+│       │   ├── synthetic_lidar.py            # CLI de prueba para nubes de puntos 360°
+│       │   ├── visualize_dataset.py          # CLI de visualización 3D y análisis de recuperación
+│       │   ├── setup_venv_ip.sh              # Aprovisionamiento del entorno virtual ML (~/venv_ip)
+│       │   ├── kill_sim.sh                   # Limpieza agresiva de procesos huérfanos de simulación
+│       │   └── test_flight.sh                # Lanzador rápido de un vuelo de prueba aislado
+│       ├── uav_ip/                # Biblioteca central de lógica de negocio (Punto Único de Verdad)
+│       │   ├── base_pilot.py          # Ciclo de vida ROS 2 y protocolo de armado Offboard seguro
+│       │   ├── waypoint_controller.py # Piloto experto (feed-forward, cruce tangencial, orbit cw/ccw)
+│       │   ├── tracking_controller.py # Prototipo experimental de control continuo por seguimiento
+│       │   ├── validation_geometry.py # Geometría compartida, envolvente x500 (0.3857m) y obstáculos
+│       │   ├── validate_episode.py    # Motor de validación física, reloj, MCAP/CRC32 y misiones
+│       │   ├── synthetic_lidar.py     # Generador analítico LiDAR 360° (Horizontal FLU, kernel C SIMD)
+│       │   └── visualize_dataset.py   # Motor de renderizado 3D y animaciones GIF
+│       └── test/                  # Suite completa de pruebas unitarias e integradas (63 tests)
+├── docs/                          # Documentación técnica canónica consolidada
+│   ├── FUNDAMENTOS_Y_DISENO.md           # Teoría matemática, ADRs, envolventes y catálogo v2
+│   ├── AUDITORIA_CONSISTENCIA_Y_LITERATURA.md # Auditoría forense y bibliografía anotada
+│   ├── PLAN_IMPLEMENTACION.md            # Hoja de ruta activa e hitos del proyecto
+│   └── TROUBLESHOOTING.md                # Solución de problemas comunes en WSL2, ROS y PX4
+└── datasets/                      # Almacenamiento local de datasets y particiones
 ```
 
 ---
 
-## ⚙️ Prerrequisitos del Sistema
+## ⚙️ Prerrequisitos y Configuración del Entorno
 
-- **Sistema Operativo:** Ubuntu 24.04 LTS (o Windows 11 con WSL2).
-- **Simulación:** PX4 Autopilot (rama `main` compilada para SITL: `make px4_sitl gz_x500`).
-- **Middleware:** ROS 2 Jazzy con `MicroXRCEAgent` (`udp4 -p 8888`).
-- **Python:** Python 3.12+ con librerías:
-  - `rclpy`, `px4_msgs`, `sensor_msgs` (Ecosistema ROS 2 en el sistema)
-  - `numpy`, `yaml`, `scipy` (Generación geométrica y procedural)
-  - `rosbags`, `torch`, `torch_geometric` (Procesamiento offline a HeteroData)
+### 1. Requisitos del Sistema
+- **Sistema Operativo:** Ubuntu 24.04 LTS (nativo o bajo WSL2 en Windows 11).
+- **Simulador:** PX4 Autopilot (`make px4_sitl gz_x500`).
+- **Middleware:** ROS 2 Jazzy con agente de transporte `MicroXRCEAgent` (`udp4 -p 8888`).
 
-### Configuración del Entorno Virtual de Machine Learning (`~/venv_ip`)
-Para aislar las dependencias de PyTorch y PyTorch Geometric sin interferir con la instalación de ROS 2 ni con la política PEP 668 de Ubuntu 24.04:
-
+### 2. Entorno de Simulación ROS 2 (Python del Sistema)
+En la terminal donde vayas a compilar o lanzar vuelos de simulación:
 ```bash
-# Ejecutar el script automatizado de configuración:
-bash src/uav_ip/scripts/setup_venv_ip.sh
-
-# Activar el entorno virtual para procesamiento y entrenamiento ML:
-source ~/venv_ip/bin/activate
-```
-*(Nota: El script enlaza automáticamente el módulo `uav_ip` dentro del entorno virtual y soporta tanto instalaciones directas con `pip` como entornos base con `--system-site-packages`).*
-
----
-
-## 🚀 Procedimiento 1: Ejecución y Auditoría de una Demostración Individual
-
-Para validar y auditar una demostración de punta a punta (inspeccionando trayectorias, telemetría y el grafo generado), sigue estos pasos:
-
-### Paso 1: Compilar y Generar el Mundo Procedural
-En una terminal con ROS 2 configurado (`source /opt/ros/jazzy/setup.bash` y `export ROS_DOMAIN_ID=33`):
-
-```bash
-cd ~/ros2_ws
+source /opt/ros/jazzy/setup.bash
 colcon build --packages-select uav_ip --symlink-install
 source install/setup.bash
-
-# 1. Generar la receta semántica de la tarea
-python3 src/uav_ip/scripts/task_generator.py --task-id test_001 --seed 42
-
-# 2. Generar el mundo en Gazebo y exportar waypoints.yaml
-python3 src/uav_ip/scripts/world_generator.py --task-id test_001 --seed 42 --output-dir src/uav_ip/generated_worlds
-```
-
-<p align="center">
-   <img src='docs\assets\gazebo_world_init.png' width="60%">
-   <br>
-   <em>Figura 2: Mundo procedural generado con landmarks (aros cuadrados, toroides y postes cilíndricos).</em>
-</p>
-
-### Paso 2: Lanzar el Simulador PX4 SITL (Terminal 1)
-```bash
-cd ~/PX4-Autopilot
-export GZ_VERSION=harmonic
-export PX4_GZ_WORLD=test_001
-export PX4_GZ_MODEL_POSE="0,0,0.3,0,0,0"
-
-# Lanzar con el modelo estándar ligero gz_x500
-make px4_sitl gz_x500
-```
-
-### Paso 3: Lanzar el Agente XRCE-DDS (Terminal 2)
-```bash
 export ROS_DOMAIN_ID=33
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-MicroXRCEAgent udp4 -p 8888
 ```
-*(Nota: Con `gz_x500` y observación privilegiada, **ya no se necesita** ejecutar `ros_gz_bridge` para cámaras).*
 
-### Paso 4: Grabar Rosbag y Volar con el Piloto Experto (Terminal 3 y 4)
-En la **Terminal 3** (Grabador de rosbag ligero, $< 5\text{ MB}$):
+### 3. Entorno de Machine Learning (`~/venv_ip`)
+Para proteger el entorno de ROS 2 de conflictos de librerías bajo la política PEP 668 de Ubuntu 24.04, las dependencias pesadas de PyTorch y PyTorch Geometric residen en un virtualenv aislado:
 ```bash
-cd ~/ros2_ws && source install/setup.bash
-export ROS_DOMAIN_ID=33
+# Provisionar el entorno virtual (ejecutar una sola vez):
+bash src/uav_ip/scripts/setup_venv_ip.sh
 
-# Borrar rosbag previo si existe
-rm -rf rosbag_test_001
-
-# Grabar tópicos de telemetría compacta
-ros2 bag record -o rosbag_test_001 \
-  /fmu/out/vehicle_odometry \
-  /fmu/out/timesync_status \
-  /fmu/in/trajectory_setpoint \
-  /fmu/out/vehicle_land_detected \
-  /fmu/out/vehicle_status_v4 \
-  /fmu/out/vehicle_local_position_v1 \
-  /fmu/in/vehicle_command
+# El entorno queda listo en ~/venv_ip (también accesible como ../venv_ip desde ros2_ws)
 ```
-
-En la **Terminal 4** (Piloto experto modular):
-```bash
-cd ~/ros2_ws && source install/setup.bash
-export ROS_DOMAIN_ID=33
-
-# Ejecutar el controlador hacia los waypoints
-ros2 run uav_ip waypoint_controller --ros-args \
-  -p waypoints_file:=src/uav_ip/generated_worlds/test_001/waypoints.yaml
-```
-
-Cuando el dron aterrice en la plataforma verde, el piloto experto finalizará automáticamente con exit code 0. Detén el grabador en la Terminal 3 con `Ctrl+C`.
-
-### Paso 5: Generar el Grafo HeteroData con LiDAR Sintético 360°
-```bash
-cd ~/ros2_ws
-python3 src/uav_ip/scripts/bag_to_heterodata.py \
-  --bag-dir rosbag_test_001 \
-  --waypoints src/uav_ip/generated_worlds/test_001/waypoints.yaml \
-  --output test_001.pt \
-  --scale 0.1 \
-  --fps-points 2048
-```
-*(Nota: Por defecto, `bag_to_heterodata.py` recorta automáticamente los tiempos estáticos en tierra antes del despegue y tras el aterrizaje. Puedes desactivarlo con `--no-trim-idle` o cambiar el umbral con `--trim-start liftoff`).*
-
-El archivo `test_001.pt` resultante contendrá el grafo heterogéneo con:
-- `data['scene'].pos`: nubes de 2048 puntos de los landmarks visibles a $\le 10\text{ m}$ en marco egocéntrico **Horizontal FLU** (estabilizado por gravedad con roll=0, pitch=0), escaladas a $s = 0.1$.
-- `data['agent'].x`: poses $SE(3)$ del dron ($x, y, z$ escalados por $s = 0.1$, cuaternión $q_w, q_x, q_y, q_z$) más los 6 keypoints del cuadricóptero para visualización y aprendizaje geométrico.
-- `data['agent'].y`: horizonte de $T=8$ acciones relativas $T_{EA}^{(t,k)} \in SE(3)$ muestreadas de la trayectoria de vuelo real a $\sim 10\text{ Hz}$.
-- `data['aug']`: nodos de aumento sintético para recuperación (*30% Tube Augmentation*) con poses perturbadas $\tilde{T}_{WE}$, nubes sintéticas recalculadas $\tilde{P}_{\text{scene}}$, perturbación del 10% en el estado binario de vuelo $\tilde{s}_t$, y secuencias de acción correctivas orientadas a retornar a la trayectoria nominal.
-- Demos de contexto reducidas a $L=10$ keyframes temporales representativos.
-
-### Paso 6: Visualizar e Inspeccionar los Datos en 3D (Instantáneo, Animación y Recuperación)
-Para auditar visualmente tanto la nube LiDAR egocéntrica como la trayectoria del dron y las maniobras de recuperación:
-
-```bash
-cd ~/ros2_ws
-
-# 1. Reproducir el vuelo completo como ANIMACION tipo video (GUI o GIF):
-python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --animate --output vuelo_animado.gif
-
-# 2. Visualizar la recuperación y Tube Augmentation (poses perturbadas y trayectorias correctivas):
-python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --show-aug --output tube_recovery.png
-
-# 3. Visualizar un fotograma estático específico (ej. paso t=10):
-python3 src/uav_ip/scripts/visualize_dataset.py --file test_001.pt --step 10 --output vista_lidar.png
-
-# 4. O verificar directamente el LiDAR sintético sobre los waypoints sin necesidad de volar:
-python3 src/uav_ip/scripts/visualize_dataset.py \
-  --waypoints src/uav_ip/generated_worlds/test_001/waypoints.yaml \
-  --drone-pose 0.0 0.0 1.5 0.0 \
-  --output test_lidar.png
-
-# También puede verificarse eligiendo el step de la trayectoria
-python3 src/uav_ip/scripts/visualize_dataset.py \
-  --file test_001.pt \
-  --step 110 \
-  --output vista_lidar_t110.png
-
-```
-*(Si ejecutas en WSL2 con WSLg o servidor gráfico, `--animate` reproducirá el vuelo en una ventana interactiva continua; si estás en entorno headless o especificas `.gif`, guardará la animación completa en video GIF).*
-
-<p align="center">
-   <img src='docs\assets\gazebo_world_1.png' width=30% alt="Mundo en Gazebo" />
-   <img src='docs\assets\lidar_sintetico_1(t_110).png' width=68% alt="LiDAR 360° en t=110" />
-   <br>
-   <em>Figura 3: Correspondencia entre el entorno físico simulado en Gazebo (izquierda) y la observación LiDAR sintética procesada para la red neuronal (derecha).</em>
-
-</p>
-
------
-
-## 🤖 Procedimiento 2: Generación Automatizada del Dataset Completo
-
-Para generar cientos o miles de demostraciones de forma completamente autónoma ($N_{\text{tasks}} \times N_{\text{demos}}$), se utiliza el orquestador `data_collector.py`.
-
-### 1. Ejecución del Colector Automático
-En una única terminal:
-```bash
-cd ~/ros2_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-export ROS_DOMAIN_ID=33
-
-# Ejemplo: 5 pseudo-tareas distintas, con 10 episodios por tarea (50 vuelos en total)
-python3 src/uav_ip/scripts/data_collector.py \
-  --num-tasks 5 \
-  --episodes-per-task 10 \
-  --base-seed 100 \
-  --dataset-dir datasets
-```
-
-### Opciones Disponibles de `data_collector.py`
-- `--num-tasks <N>`: Número de pseudo-tareas únicas a generar (mundos con variaciones espaciales aleatorias).
-- `--episodes-per-task <M>`: Demostraciones por cada tarea (para conformar $N-1$ demos de contexto y 1 de query).
-- `--min-landmarks <min>`: Cantidad mínima de landmarks acotados por tarea (default: 2).
-- `--max-landmarks <max>`: Cantidad máxima de landmarks acotados por tarea (default: 5).
-- `--num-landmarks <K>`: Forzar cantidad exacta fija de landmarks en todas las tareas (anula min/max).
-- `--base-seed <S>`: Semilla base para reproducibilidad estricta.
-- `--resume`: Si se interrumpió la recolección, reanuda automáticamente omitiendo tareas y episodios ya completados con éxito.
-- `--episode-timeout <seg>`: Timeout de seguridad por vuelo (default: 360s).
-
-### Estructura de Salida del Dataset
-`data_collector.py` organiza los datos de forma limpia y autocontenida:
-```text
-datasets/
-├── task_0000/
-│   ├── waypoints.yaml             # Definición ground-truth de la tarea y landmarks
-│   ├── episode_00/
-│   │   ├── rosbag/                # Rosbag .mcap (< 5 MB con telemetría ligera)
-│   │   ├── waypoints.yaml         # Copia local para postproceso inmediato
-│   │   ├── episode_meta.json      # Metadatos del vuelo (timestamp, status, tópicos)
-│   │   └── logs/                  # Logs individuales de px4, pilot y xrce
-│   ├── episode_01/
-│   └── ...
-└── task_0001/
-    └── ...
-```
-
-### 2. Validación Post-Vuelo de Episodios (`validate_episode.py`)
-Verificador de configuración, grabación y geometría de misión independiente del piloto. Lee `waypoints.yaml`, `episode_meta.json` y el `.mcap` de cada episodio y decide `accepted`/`rejected` con estados desglosados (`configuration_status`, `recording_status`, `mission_status`, `validation_status`) y `rejection_reasons`, devolviendo código de salida `0` (todos aceptados), `1` (al menos un rechazo) o `2` (error de uso/argumentos):
-
-```bash
-# Reporte en terminal sobre todo el dataset (no modifica archivos)
-python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets
-# Validar un único episodio en formato JSON
-python3 src/uav_ip/scripts/validate_episode.py --episode-dir datasets/task_0001/episode_00 --json
-# Persistir resultados de forma atómica en cada episode_meta.json
-python3 src/uav_ip/scripts/validate_episode.py --dataset-dir datasets --update-meta
-```
-
-**Integración en línea y desambiguación analítica del reloj (Fase 2):**
-- **Invocación automática:** `data_collector.py` invoca automáticamente `validate_episode_directory(ep_dir, update_meta=True)` tras cerrar limpiamente el bag con `SIGINT`.
-- **Desambiguación del Patrón B:** Si `VehicleOdometry` experimenta un salto de reloj en SITL por recalibración periódica de offset UNIX de `uxrce_dds_client`, se correlaciona analíticamente en una ventana de $\pm 0.05\text{ s}$ contra `TimesyncStatus.estimated_offset`. Si la magnitud coincide, se repara el reloj en `reconstructed_time_s` (`timesync_offset_adjustment_repaired`) y el episodio se clasifica como válido (`usable_for_validation = True`).
-- **Conservación estricta de intentos:** Los intentos fallidos se conservan intactos con sus motivos de rechazo. Los reintentos con semilla derivada se guardan en `episode_XX_attempt_YY` sin sobrescribir jamás el intento original `episode_XX`.
-- **Filtro conservador bajo hipótesis explícitas:** Envolvente esférica 3D de 0,30 m (0,25 m de radio físico XY de chasis/motores `x500` + 0,05 m de margen de seguridad), cota inferior de discretización $d_{\text{inferior}} = \max(0, d_{\text{muestreada}} - h/2)$ con paso $h = 0,02\text{ m}$, y obstáculos estáticos. Criterios, hipótesis y limitaciones: [`docs/JUSTIFICACION_REVISION_TECNICA.md`](docs/JUSTIFICACION_REVISION_TECNICA.md).
-
-### 3. Auditoría en 3 Capas del Dataset y Partición Formal (`audit_dataset.py`)
-Una vez finalizada la recolección (o durante una pausa), se ejecuta el script de auditoría en 3 capas para verificar la integridad del dataset y generar las particiones oficiales:
-
-```bash
-python3 src/uav_ip/scripts/audit_dataset.py --dataset-dir datasets
-```
-
-Este comando realiza las siguientes validaciones estructuradas en 3 capas:
-- **Capa 1 (Vuelos crudos y metadatos):**
-  - Reporta tasas de aceptación por intento original (`original_attempt_acceptance_rate`) por separado de la tasa post-reintentos (`post_retry_slot_acceptance_rate`).
-  - Desglose exhaustivo de motivos de rechazo (`rejection_reasons`).
-  - Detección de colisiones de firmas semánticas y control de variabilidad espacial de waypoints.
-- **Capa 2 (Tensores de aprendizaje `.pt`):**
-  - Audita finitud estricta (cero NaNs e Infs en todos los tensores).
-  - Verificación dimensional: `scene.pos` $(T, 2048, 3)$, `agent.action_se3` $(T, 8, 4, 4)$, `agent.valid_mask` $(T, 8)$.
-  - Ortogonalidad estricta en $SO(3)$ ($R^\top R = I_3$, $\det R = +1.0$) en matrices de rotación y transformaciones relativas.
-  - Verificación del horizonte físico continuo de $0.8\text{ s}$ ($\Delta t = 0.1\text{ s}$) y cota esférica sólida $\|\delta p\|_2 \le 0.60\text{ m}$ en Tube Augmentation.
-- **Capa 3 (Particionado oficial y splits):**
-  - Exige un umbral mínimo de episodios aceptados ($\ge 5$, configurable con `--min-accepted-episodes`) antes de incluir una tarea en los splits.
-  - Genera particiones mutuamente excluyentes en `datasets/splits/`:
-    - `train_tasks.json` ($\sim 70\%$ de las firmas semánticas).
-    - `val_tasks.json` ($\sim 15\%$ de las firmas).
-    - `held_out_tasks.json` ($\sim 15\%$ de firmas nunca vistas en entrenamiento, para evaluar generalización *in-context*).
-    - `dataset_summary.json` (resumen estadístico global de las 3 capas).
-
-*(Para realizar un chequeo rápido en terminal sin generar archivos JSON, puedes agregar el flag `--no-export`).*
-
-### 4. Conversión por Lotes a Formato PyTorch Geometric
-Una vez validado el dataset, puedes convertir automáticamente los episodios aceptados a grafos `HeteroData` (`data.pt`) utilizando el modo batch multiproceso de `bag_to_heterodata.py`:
-
-```bash
-# Activar entorno ML
-source ~/venv_ip/bin/activate
-
-# Conversión masiva en paralelo (ej. 8 trabajadores / núcleos):
-python3 src/uav_ip/scripts/bag_to_heterodata.py \
-  --dataset-dir datasets \
-  --workers 8 \
-  --fps-points 2048 \
-  --scale 0.1
-```
-
-**Ventajas y Características del Procesamiento por Lotes (Fase 2):**
-- **Filtrado Estricto de Postproceso:** Ignora por defecto cualquier episodio con `validation_status != "accepted"` en `episode_meta.json` (desactivable con `--include-failed`).
-- **Remuestreo Temporal Uniforme a 10 Hz:** Interpola poses y observaciones a $\Delta t = 0.1\text{ s}$ exactos sobre `reconstructed_time_s`, desenvolviendo el ángulo de guiñada (`np.unwrap`) para evitar singularidades en $\pm \pi$, garantizando que el horizonte $T=8$ cubra exactamente $0.8\text{ s}$ físicos.
-- **Máscara de Validez de Acción (`valid_mask`):** Incorpora un tensor booleano $(T, 8)$ que marca como válidos los pasos con trayectoria futura real y distingue los últimos 7 timesteps donde el horizonte queda clampeado al aterrizaje estacionario.
-- **Tube Augmentation con Seguridad Geométrica:** Muestreo en esfera euclídea sólida $\|\delta p\|_2 \le 0.60\text{ m}$, descartando perturbaciones que violen el clearance de colisión ($\ge 0.30\text{ m}$) contra landmarks o que salgan de la apertura libre en maniobras `traverse` de aros.
-- **Procesamiento Multiproceso y Aceleración SIMD C:** Distribuye los episodios uniformemente entre núcleos (`--workers`), con submuestreo FPS compilado con SIMD vectorizado (`-O3 -march=native -ffast-math`).
-- **Keyframes de Contexto:** Extrae automáticamente $L=10$ hitos temporales para estructurar el condicionamiento *in-context*.
-
----
-### 🎯 Embodiment y Observación Privilegiada (LiDAR 360°)
-- **Embodiment:** El dron se modela conceptualmente con un sensor **LiDAR 3D omnidireccional 360°** (análogo en el mundo real a un *Livox Mid-360*), implementado mediante **observación privilegiada** en modo `range` ($R_{\text{max}} = 10.0\text{ m}$).
-- **Preservación de la Hipótesis de Markov:** La visión 360° elimina la ceguera retrospectiva (*backward blindness*) al cruzar aros o superar obstáculos, reteniendo simultáneamente referencias espaciales al frente y detrás sin requerir modelos recurrentes en Fase 1.
-- **Simulación Ligera (`gz_x500`):** Se utiliza el modelo estándar `gz_x500` de PX4 en lugar de `gz_x500_depth`, acelerando drásticamente el *Real-Time Factor* (RTF) al eliminar el renderizado de cámaras de profundidad en Gazebo.
-- **Eficiencia de Almacenamiento:** Los rosbags registran exclusivamente telemetría ligera de PX4 (**$< 5\text{ MB}$ por demo**, frente a los 5–6 GB del enfoque obsoleto con cámara).
-- **Escala Métrica ($s = 0.1$):** Se aplica $s = 0.1$ a coordenadas y deltas para evitar el aliasing espacial en la codificación posicional sinusoidal de Instant Policy.
 
 ---
 
-## 📚 Documentación y Decisiones Arquitectónicas
+## 🛠️ Manual de Referencia de Scripts (Guía Operativa Detallada)
 
-Para profundizar en los fundamentos teóricos y evitar reabrir discusiones de diseño resueltas, consulta:
-- [ESTRATEGIA_TEORICA.md](/docs/ESTRATEGIA_TEORICA.md): Marco teórico, preservación de Markov, formulación de grafos y taxonomía de pseudo-tareas.
-- [PLAN_IMPLEMENTACION.md](/docs/PLAN_IMPLEMENTACION.md): Hoja de ruta por hitos (0 a 4), estado de componentes de software y criterios de aceptación.
-- [DECISIONES_DISENO.md](/docs/DECISIONES_DISENO.md): Registro de decisiones arquitectónicas (ADRs), descarte de cámara de profundidad, marcos de referencia NED/ENU y escala métrica $s = 0.1$.
-- [TROUBLESHOOTING.md](/docs/TROUBLESHOOTING.md): Guía de solución para errores de EKF2, penetración de spawn en Gazebo y puertos XRCE-DDS.
+A continuación se detalla el propósito, parámetros y modo de uso de cada script del proyecto:
+
+---
+
+### 1. `data_collector.py` — Orquestador de Recolección SITL
+
+* **Para qué sirve:**
+  Automatiza la recolección masiva de vuelos en el simulador físico. Para cada tarea y episodio: lanza `MicroXRCEAgent`, arranca PX4 SITL con Gazebo Harmonic (`gz_x500`), graba el rosbag en formato MCAP, ejecuta el piloto experto autónomo (`waypoint_controller`), valida el vuelo post-cierre y, si el episodio es rechazado, lanza reintentos limpios con semilla derivada (`episode_XX_attempt_YY`) sin sobrescribir el intento original.
+
+* **Parámetros Principales (con alias unificados):**
+  * `--num-tasks`: Número de tareas procedurales únicas a generar (default: 2).
+  * `--episodes-per-task`: Episodios con variación espacial intra-tarea por cada tarea (default: 15).
+  * `--catalog-version {v1, v2}`: Versión del catálogo de acciones (`v1`: 5 acciones base; `v2`: 9 acciones con desacople objeto-acción y giros horarios/antihorarios).
+  * `--seed` (alias: `--base-seed`): Semilla aleatoria base (default: 0).
+  * `--output-dir` (alias: `--dataset-dir`): Directorio raíz de salida (default: `datasets`).
+  * `--max-retries`: Máximo de reintentos permitidos ante episodios rechazados (default: 2).
+  * `--resume`: Reanudar una campaña interrumpida desde el último episodio incompleto.
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  python3 src/uav_ip/scripts/data_collector.py \
+    --num-tasks 10 \
+    --episodes-per-task 5 \
+    --catalog-version v2 \
+    --seed 42 \
+    --output-dir datasets_sitl_v2
+  ```
+
+* **Qué esperar y cómo verificar:**
+  * En consola observará el ciclo de arranque, vuelo y validación de cada episodio.
+  * Al finalizar, el script imprime un resumen consolidado con las tasas de aceptación de intentos primarios y post-reintentos.
+  * Cada carpeta `datasets_sitl_v2/task_XXXX/episode_YY` contendrá:
+    * `rosbag/`: Bolsa MCAP con telemetría de odometría, comandos y reloj.
+    * `waypoints.yaml`: Poses geométricas de los obstáculos y plataforma.
+    * `validation_report.json`: Dictamen exhaustivo del juez físico (`validation_status: "accepted"`).
+    * `episode_meta.json`: Metadatos del vuelo y tiempos de ejecución.
+
+---
+
+### 2. `kinematic_pseudo_generator.py` — Generador Cinemático Masivo Ultrarrápido
+
+* **Para qué sirve:**
+  Genera pseudo-demostraciones cinemáticas continuas a $50\text{ Hz}$ en Python puro, calculando la actitud analítica mediante dinámica diferencial plana ($\mathbf{a} - \mathbf{g}$) y perfil de aceleración trapezoidal. Cada episodio es evaluado en memoria por el mismo validador físico (`validate_episode_data()`) y exportado directamente a grafos `HeteroData` (.pt). Permite generar miles de episodios en minutos para pre-entrenamiento masivo en escala (*scaling laws*), excluyendo las firmas del dataset físico para garantizar cero fuga de datos (*zero data leakage*).
+
+* **Parámetros Principales:**
+  * `--num-tasks`: Cantidad de tareas únicas a sintetizar (default: 100).
+  * `--episodes-per-task`: Episodios por tarea (default: 5).
+  * `--catalog-version {v1, v2}`: Versión del catálogo combinatorio (default: `v2`).
+  * `--exclude-signatures-from` (alias: `--exclude-tasks-from`): Uno o más directorios de datasets físicos (o archivos JSON) cuyas firmas semánticas deben excluirse estrictamente.
+  * `--output-dir`: Directorio donde guardar el dataset cinemático (default: `datasets_kinematic`).
+  * `--workers` (`-j`): Procesos paralelos a utilizar (default: todos los núcleos CPU).
+  * `--tube-decay`: Factor $\gamma$ de convergencia exponencial en Tube Augmentation (default: 0.70).
+  * `--require-torch`: Exigir exportación en formato PyTorch Geometric `.pt` (requiere `venv_ip`).
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/kinematic_pseudo_generator.py \
+    --num-tasks 200 \
+    --episodes-per-task 5 \
+    --catalog-version v2 \
+    --exclude-signatures-from datasets_sitl_v2 \
+    --output-dir datasets_kinematic \
+    --workers 8 \
+    --require-torch
+  ```
+
+* **Qué esperar y cómo verificar:**
+  * Genera $1.000$ episodios ($200 \times 5$) en aproximadamente **5 a 8 minutos**.
+  * Tasa de aceptación del **100%**: el script reintenta internamente variando la semilla geométrica hasta que cada episodio satisface todas las restricciones físicas del validador.
+  * Cada carpeta contendrá directamente `heterodata.pt`, `task_config.yaml`, `waypoints.yaml` y `validation_report.json`.
+
+---
+
+### 3. `bag_to_heterodata.py` — Conversor Batch a Grafos HeteroData
+
+* **Para qué sirve:**
+  Procesa los rosbags MCAP de los vuelos físicos de simulación para construir grafos heterogéneos `torch_geometric.data.HeteroData` (.pt). Remuestrea la telemetría a una grilla uniforme de $10\text{ Hz}$ con SLERP de cuaterniones, calcula el horizonte de acciones relativas futuras $T_{EA} \in SE(3)$ a horizonte $T=8$, computa las observaciones LiDAR 360° analíticas en marco *Horizontal FLU*, calcula el vector de velocidad propioceptiva `vel_flu` $(T, 3)$, y genera los nodos de recuperación por *Tube Augmentation* ($30\%$ de pasos con decaimiento exponencial $\gamma = 0.70$).
+
+* **Parámetros Principales:**
+  * `--dataset-dir`: Directorio raíz del dataset con carpetas `task_XXXX` para procesamiento por lotes.
+  * `--require-torch`: Abortar con error si PyTorch no está disponible, evitando caídas silenciosas a `.npz`.
+  * `--tube-decay`: Factor de decaimiento geométrico por paso en Tube Augmentation (default: 0.70).
+  * `--overwrite`: Sobrescribir archivos `heterodata` previamente generados.
+  * `--skip-existing`: Omitir episodios que ya tengan su archivo `heterodata.pt`.
+  * `--workers` (`-j`): Número de procesos paralelos para acelerar la conversión (default: todos los núcleos).
+  * `--scale`: Factor de escala métrica $s$ aplicado a posiciones y nubes (default: 0.1).
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/bag_to_heterodata.py \
+    --dataset-dir datasets_sitl_v2 \
+    --require-torch \
+    --tube-decay 0.70 \
+    --workers 8 \
+    --overwrite
+  ```
+
+* **Qué esperar y estructura del grafo resultante:**
+  * Cada episodio aceptado tendrá su archivo `heterodata.pt`.
+  * Estructura de tensores en `HeteroData`:
+    * `data['scene'].pos`: $(T, 2048, 3)$ nube de puntos egocéntrica en Horizontal FLU (escala $s=0.1$).
+    * `data['agent'].x` / `pos_enu`: $(T, 3)$ posiciones escaladas.
+    * `data['agent'].pose_se3`: $(T, 4, 4)$ matriz homogénea $T_{WE}^t \in SE(3)$.
+    * `data['agent'].vel_flu`: $(T, 3)$ velocidad lineal en Horizontal FLU a $10\text{ Hz}$.
+    * `data['agent'].y` / `action_se3`: $(T, 8, 5)$ y $(T, 8, 4, 4)$ horizonte de $T=8$ acciones relativas futuras.
+    * `data['agent'].valid_mask`: $(T, 8)$ máscara booleana de horizonte temporal válido.
+    * `data['aug']`: nodos de perturbación de recuperación por Tube Augmentation.
+
+---
+
+### 4. `audit_dataset.py` — Auditoría en 3 Capas y Particionado Oficial
+
+* **Para qué sirve:**
+  Ejecuta una auditoría estricta en tres capas sobre un dataset existente y genera las particiones oficiales disjuntas `train`, `val` y `held_out`:
+  * **Capa 1 (Vuelos Brutos):** Verifica conteo de episodios, tasas de éxito primario vs. reintentos y distribución de motivos de rechazo.
+  * **Capa 2 (Tensores ML):** Inspecciona cada archivo `.pt`, verificando finitud de valores, dimensiones exactas, ortogonalidad en $SO(3)$ y comprobando que ninguna acción de recuperación de Tube Augmentation supere la velocidad física admisible ($\le 6.5\text{ m/s}$).
+  * **Capa 3 (Partición Formal):** Filtra tareas con al menos $N$ episodios aceptados y baraja deterministamente las firmas semánticas para garantizar que ninguna tarea de `held_out` comparta firma con `train` (cero fuga de datos).
+
+* **Parámetros Principales:**
+  * `--dataset-dir`: Directorio del dataset a auditar.
+  * `--require-pt`: Exige formato PyTorch Geometric `.pt` (rechaza archivos `.npz` como inválidos).
+  * `--min-accepted-episodes`: Mínimo de episodios aceptados por tarea para entrar a los splits (default: 5).
+  * `--seed`: Semilla determinista para barajar las firmas (default: 42).
+  * `--train-ratio` / `--val-ratio` / `--held-out-ratio`: Proporciones de partición (default: 0.70 / 0.15 / 0.15).
+  * `--no-export`: Modo solo lectura en terminal sin escribir archivos JSON.
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
+    --dataset-dir datasets_sitl_v2 \
+    --require-pt
+  ```
+
+* **Qué esperar:**
+  * Si el dataset cumple todas las restricciones, concluye con:
+    `🎉 OVERALL AUDIT STATUS: PASS (0 errors)`
+  * Genera en `datasets_sitl_v2/splits/`:
+    * `train_tasks.json`, `val_tasks.json`, `held_out_tasks.json`.
+    * `dataset_summary.json`: Reporte estadístico completo auditable.
+
+---
+
+### 5. `task_generator.py` — Generador Semántico de Tareas
+
+* **Para qué sirve:**
+  Define la receta semántica única de una tarea (`task_config.yaml`) sin reemplazo a partir de un catálogo combinatorio balanceado de $N \in [2, 5]$ landmarks.
+
+* **Parámetros Principales:**
+  * `--task-id`: Identificador de la tarea (ej. `task_0001`).
+  * `--catalog-version {v1, v2}`: Catálogo combinatorio (`v1`: 5 acciones base; `v2`: 9 acciones expandidas).
+  * `--seed`: Semilla pseudoaleatoria de generación.
+  * `--output-dir`: Directorio donde escribir `task_config.yaml`.
+  * `--include-circular-gates`: Habilitar aros circulares además de puertas cuadradas.
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  python3 src/uav_ip/scripts/task_generator.py \
+    --task-id task_0001 \
+    --catalog-version v2 \
+    --seed 42 \
+    --output-dir /tmp/test_task
+  cat /tmp/test_task/task_config.yaml
+  ```
+
+---
+
+### 6. `world_generator.py` — Generador de Mundos SDF y Waypoints
+
+* **Para qué sirve:**
+  Toma la receta semántica de `task_config.yaml` e instancia poses aleatorias 3D para cada obstáculo a lo largo del pasillo en $+X$, garantizando separaciones mínimas, alineación de la plataforma de aterrizaje y verificando la factibilidad geométrica de transiciones (`check_circuit_transition_feasibility`). Genera el archivo de mundo Gazebo `.sdf` y el archivo de navegación `waypoints.yaml`.
+
+* **Modo de Uso:**
+  Es invocado automáticamente por `data_collector.py` y `kinematic_pseudo_generator.py`. Para inspección manual:
+  ```bash
+  python3 src/uav_ip/scripts/world_generator.py \
+    --task-config /tmp/test_task/task_config.yaml \
+    --seed 101 \
+    --output-sdf /tmp/test_task/world.sdf \
+    --output-waypoints /tmp/test_task/waypoints.yaml
+  ```
+
+---
+
+### 7. `validate_episode.py` — CLI del Validador Físico de Episodios
+
+* **Para qué sirve:**
+  Permite validar de forma independiente y reproducible un episodio individual o un dataset completo a partir de sus archivos `.mcap` y `waypoints.yaml`.
+
+* **Contrato de Códigos de Retorno en Terminal:**
+  * Código `0`: Todos los episodios evaluados fueron aceptados (`validation_status == "accepted"`).
+  * Código `1`: Al menos un episodio fue rechazado por motivos físicos, de misión o de grabación.
+  * Código `2`: Error de sintaxis, argumentos inválidos o rutas inexistentes.
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  # Validar un episodio individual:
+  python3 src/uav_ip/scripts/validate_episode.py \
+    --episode-dir datasets_sitl_v2/task_0000/episode_00 \
+    --strict
+
+  # Validar un dataset completo y exportar reporte JSON:
+  python3 src/uav_ip/scripts/validate_episode.py \
+    --dataset-dir datasets_sitl_v2 \
+    --json > /tmp/reporte_validacion.json
+  ```
+
+---
+
+### 8. `visualize_dataset.py` — Visualizador 3D y Análisis Gráfico
+
+* **Para qué sirve:**
+  Proporciona herramientas visuales interactivas en Matplotlib para inspeccionar las trayectorias de vuelo en 3D, proyecciones en planos horizontal (XY) y vertical (XZ), animaciones GIF y análisis gráfico de los vectores de recuperación de Tube Augmentation.
+
+* **Ejemplo de Ejecución:**
+  ```bash
+  # Inspección estática 3D de un episodio:
+  python3 src/uav_ip/scripts/visualize_dataset.py \
+    --bag-path datasets_sitl_v2/task_0000/episode_00
+
+  # Inspección de los vectores de recuperación de Tube Augmentation:
+  python3 src/uav_ip/scripts/visualize_dataset.py \
+    --bag-path datasets_sitl_v2/task_0000/episode_00 \
+    --show-aug
+
+  # Generar una animación GIF interactiva del vuelo:
+  python3 src/uav_ip/scripts/visualize_dataset.py \
+    --bag-path datasets_sitl_v2/task_0000/episode_00 \
+    --animate --save-gif /tmp/vuelo_animado.gif
+  ```
+
+---
+
+### 9. Scripts de Apoyo y Mantenimiento
+
+* **`kill_sim.sh`:**
+  Mata de forma agresiva y limpia todos los procesos huérfanos o zombies de Gazebo (`gz sim`), PX4 SITL, MicroXRCEAgent y nodos ROS 2 que hayan quedado en segundo plano tras una interrupción con `Ctrl+C`:
+  ```bash
+  bash src/uav_ip/scripts/kill_sim.sh
+  ```
+
+* **`setup_venv_ip.sh`:**
+  Aprovisiona el entorno virtual aislado `~/venv_ip` instalando PyTorch, PyG y sus dependencias compatibles con el sistema:
+  ```bash
+  bash src/uav_ip/scripts/setup_venv_ip.sh
+  ```
+
+* **`test_flight.sh`:**
+  Lanza un vuelo de prueba rápido de un solo episodio en el simulador para verificar visualmente que Gazebo, PX4 y el piloto experto funcionen correctamente:
+  ```bash
+  bash src/uav_ip/scripts/test_flight.sh
+  ```
+
+---
+
+## 🚀 Flujos de Trabajo Recomendados (Workflows Paso a Paso)
+
+### Workflow A: Pre-entrenamiento Masivo Rápido (Corpus Cinemático)
+*Objetivo: Generar 1.000 demostraciones en ~5 minutos para entrenar la red de difusión.*
+
+1. Generar el dataset cinemático con catálogo $v2$:
+   ```bash
+   ~/venv_ip/bin/python3 src/uav_ip/scripts/kinematic_pseudo_generator.py \
+     --num-tasks 200 \
+     --episodes-per-task 5 \
+     --catalog-version v2 \
+     --output-dir datasets_kinematic \
+     --workers 8 \
+     --require-torch
+   ```
+2. Auditar el dataset y generar splits oficiales:
+   ```bash
+   ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
+     --dataset-dir datasets_kinematic \
+     --require-pt
+   ```
+
+---
+
+### Workflow B: Campaña Física en Simulación SITL (Dataset de Evaluación / Fine-Tuning)
+*Objetivo: Generar demostraciones físicas de alta fidelidad en PX4 + Gazebo.*
+
+1. Preparar la terminal de simulación:
+   ```bash
+   source /opt/ros/jazzy/setup.bash
+   source install/setup.bash
+   export ROS_DOMAIN_ID=33
+   export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+   ```
+2. Ejecutar la campaña física con catálogo $v2$:
+   ```bash
+   python3 src/uav_ip/scripts/data_collector.py \
+     --num-tasks 12 \
+     --episodes-per-task 5 \
+     --catalog-version v2 \
+     --seed 42 \
+     --output-dir datasets_sitl_v2
+   ```
+3. Convertir los rosbags a grafos `HeteroData` (.pt):
+   ```bash
+   ~/venv_ip/bin/python3 src/uav_ip/scripts/bag_to_heterodata.py \
+     --dataset-dir datasets_sitl_v2 \
+     --require-torch \
+     --tube-decay 0.70 \
+     --workers 8 \
+     --overwrite
+   ```
+4. Auditar y generar splits de evaluación formal:
+   ```bash
+   ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
+     --dataset-dir datasets_sitl_v2 \
+     --require-pt
+   ```
+
+---
+
+## 🧪 Verificación de Tests Automatizados (`pytest`)
+
+El paquete incluye una suite completa de pruebas unitarias que verifica la geometría, el LiDAR analítico, las transformaciones $SE(3)$, el decaimiento de Tube Augmentation y el generador cinemático:
+
+```bash
+pytest src/uav_ip/test -q
+```
+*Resultado esperado:* **`63 passed in ~11s`** (con 0 fallos y 0 tests omitidos).
+
+---
+
+## 📚 Documentación Técnica Canónica
+
+Para profundizar en los fundamentos matemáticos y la memoria técnica del proyecto:
+* **[Fundamentos Teóricos, Decisiones de Diseño y Memoria Arquitectónica](docs/FUNDAMENTOS_Y_DISENO.md):** Formalización matemática de Instant Policy, preservación de Markov, envolvente real del x500, catálogo $v2$ y registro histórico de decisiones (ADRs).
+* **[Auditoría de Consistencia, Ejecución Forense y Literatura Relacionada](docs/AUDITORIA_CONSISTENCIA_Y_LITERATURA.md):** Informe técnico de revisión cruzada, análisis forense de anomalías y bibliografía científica anotada.
+* **[Plan Maestro de Implementación](docs/PLAN_IMPLEMENTACION.md):** Hoja de ruta activa, componentes completados y arquitectura de la red neuronal (Hito 4).
+* **[Guía de Troubleshooting](docs/TROUBLESHOOTING.md):** Resolución rápida de errores de PX4, Gazebo, FastDDS y virtualenvs.
