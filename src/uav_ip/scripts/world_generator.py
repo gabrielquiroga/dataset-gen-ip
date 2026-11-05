@@ -589,8 +589,12 @@ def modify_sdf(
     hoops: list[dict],
     landing: dict,
     remove_takeoff_platform: bool = False,
+    rtf: float = 1.0,
 ) -> ET.ElementTree:
     """Parsea el SDF plantilla, limpia modelos previos e inyecta dinámicamente los landmarks."""
+    if not math.isfinite(rtf) or rtf <= 0.0:
+        raise ValueError(f"El factor de tiempo real (rtf) debe ser > 0, recibido: {rtf}")
+
     tree = ET.parse(template_path)
     root = tree.getroot()
 
@@ -598,6 +602,21 @@ def modify_sdf(
     if world_elem is None:
         raise ValueError("No se encontro <world> en el SDF plantilla")
     world_elem.set("name", world_name)
+
+    physics_elem = world_elem.find("physics")
+    if physics_elem is not None and abs(float(rtf) - 1.0) > 1e-6:
+        max_step_elem = physics_elem.find("max_step_size")
+        dt_step = float(max_step_elem.text) if (max_step_elem is not None and max_step_elem.text) else 0.004
+        base_rate = 1.0 / max(1e-6, dt_step)
+        target_rate = base_rate * float(rtf)
+        rtf_elem = physics_elem.find("real_time_factor")
+        if rtf_elem is None:
+            rtf_elem = ET.SubElement(physics_elem, "real_time_factor")
+        rtf_elem.text = f"{float(rtf):.4g}"
+        rate_elem = physics_elem.find("real_time_update_rate")
+        if rate_elem is None:
+            rate_elem = ET.SubElement(physics_elem, "real_time_update_rate")
+        rate_elem.text = f"{target_rate:.4g}"
 
     if remove_takeoff_platform:
         takeoff_model = _find_model(world_elem, "plataforma_salida")
@@ -765,6 +784,12 @@ def main() -> None:
         action="store_true",
         help="Elimina la plataforma de salida (despegue) del mundo generado.",
     )
+    parser.add_argument(
+        "--rtf",
+        type=float,
+        default=1.0,
+        help="Factor de velocidad de tiempo real en Gazebo (ej. 0.5 o 0.25 para dar margen CPU a la red). Default: 1.0",
+    )
 
     args = parser.parse_args()
 
@@ -796,7 +821,7 @@ def main() -> None:
     landmarks_info = cfg["landmarks"]
     primitives = cfg["primitives"]
 
-    print(f"Generando circuito para '{args.task_id}' (seed={args.seed})...")
+    print(f"Generando circuito para '{args.task_id}' (seed={args.seed}, rtf={args.rtf})...")
     start_pose = generate_start_pose(seed=args.seed)
     hoops, landing = generate_random_circuit(
         landmarks_info, seed=args.seed, primitives=primitives, start_pose=start_pose
@@ -817,7 +842,14 @@ def main() -> None:
         f"  Plataforma: X={landing['x']:6.2f}  Y={landing['y']:6.2f}  Z={landing['z']:4.2f}"
     )
 
-    tree = modify_sdf(args.template, args.task_id, hoops, landing, args.no_takeoff_platform)
+    tree = modify_sdf(
+        args.template,
+        args.task_id,
+        hoops,
+        landing,
+        args.no_takeoff_platform,
+        rtf=args.rtf,
+    )
 
     sdf_path = task_dir / f"{args.task_id}.sdf"
     yaml_path = task_dir / "waypoints.yaml"

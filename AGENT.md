@@ -10,6 +10,7 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
 3. `docs/AUDITORIA_CONSISTENCIA_Y_LITERATURA.md`: Auditoría forense del sistema, contrastación científica con Instant Policy y literatura relacionada, y bibliografía comentada.
 4. `docs/TROUBLESHOOTING.md`: Registro de soluciones a problemas de simulación, networking, virtualenvs de ML y comandos.
 5. `README.md`: Portal principal y manual de usuario detallado de cada script del repositorio.
+6. `docs/EXPLORACION_RED_NEURONAL.md`: Contratos de tensores E/S, verificación matemática $SE(3)$/SVD 4-DoF, resultados en lazo cerrado cinemático y decisiones cerradas para el Hito 4.
 
 ## 🛠️ Tecnologías y Estilos
 - **Lenguaje Principal:** Python 3 (estrictamente tipado siempre que sea posible, usando docstrings y tipos de `typing`).
@@ -32,9 +33,10 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
    * Keyframes de contexto: subsampleados uniformemente a $L=10$ hitos temporales.
 7. **El Entorno WSL2:** El usuario corre sobre WSL2 en Windows con GPU integrada. Prohibido sugerir herramientas dependientes exclusivamente de NVIDIA/CUDA propietarias para la simulación física.
 8. **Networking de ROS 2:** Cualquier script de bash o comando sugerido debe considerar el aislamiento de red de WSL2: `export ROS_DOMAIN_ID=33`, `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` y `export GZ_PARTITION=sim`.
-9. **Desacoplamiento de Entornos:**
-   * Recolección de datos y control de vuelo: Python del sistema con ROS 2 Jazzy.
-   * Postproceso ML y grafos: Virtualenv aislado (`~/venv_ip` creado con `src/uav_ip/scripts/setup_venv_ip.sh`) con `rosbags`, `torch` y `torch_geometric`.
+9. **Desacoplamiento de Entornos y Subcarpeta `policy/`:**
+   * Recolección de datos y control de vuelo (`src/uav_ip/uav_ip/*.py`): Python del sistema con ROS 2 Jazzy.
+   * Red neuronal, difusión en grafos y evaluación ML (`src/uav_ip/uav_ip/policy/`, `src/uav_ip/scripts/policy/`, `src/uav_ip/test/policy/`): Virtualenv aislado (`~/venv_ip` creado con `src/uav_ip/scripts/setup_venv_ip.sh`) con `rosbags`, `torch` y `torch_geometric`.
+   * **Regla unidireccional de dependencias:** `uav_ip.policy` puede importar del núcleo (`uav_ip.synthetic_lidar`, `uav_ip.validation_geometry`, `uav_ip.validate_episode`), pero el núcleo `uav_ip` NUNCA debe importar `uav_ip.policy` ni `torch`.
 10. **Estrategia Híbrida de Generación:**
     * Para pre-entrenamiento masivo de la red neuronal ($1.000+$ episodios): Usar `kinematic_pseudo_generator.py` (ultrarrápido en Python puro con dinámica diferencial y cuaterniones).
     * Para evaluación formal (test set held-out) y co-fine-tuning: Usar `data_collector.py` (simulación física en PX4 SITL + Gazebo).

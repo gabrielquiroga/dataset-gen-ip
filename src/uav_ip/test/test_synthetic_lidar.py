@@ -276,8 +276,10 @@ def test_discover_dataset_episodes(tmp_path):
 
     from bag_to_heterodata import discover_dataset_episodes
 
-    dataset_dir = repo_root / "datasets"
+    dataset_dir = repo_root / "datasets" / "sitl"
     if not dataset_dir.is_dir():
+        dataset_dir = repo_root / "datasets"
+    if not (dataset_dir / "task_0000").is_dir():
         dataset_dir = tmp_path / "datasets_mock"
         for tid, ep_id in [("task_0000", "episode_00"), ("task_0001", "episode_02")]:
             ep_dir = dataset_dir / tid / ep_id

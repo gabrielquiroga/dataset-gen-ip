@@ -23,8 +23,11 @@ rosbag2_*/
 *.npz
 *.pt
 *.pth
+*.ckpt
 *.onnx
 *.safetensors
+checkpoints/
+runs/
 
 # ==========================================
 # Python Artifacts & Environments
