@@ -29,10 +29,15 @@ except ImportError as exc:
     )
     raise SystemExit(1) from exc
 
-from uav_ip.policy.exploration_suite import run_all_explorations  # noqa: E402
+from uav_ip.policy.exploration_suite import (  # noqa: E402
+    generate_markdown_exploration_report,
+    run_all_explorations,
+)
 
 
 def main() -> None:
+    import json
+
     repo_root = _PKG_ROOT.parent.parent
     parser = argparse.ArgumentParser(
         description="Ejecuta los 5 experimentos de exploracion y validacion Pre-Hito 4 "
@@ -68,7 +73,19 @@ def main() -> None:
         default=35,
         help="Epocas para la prueba de Overfit del Experimento 3 (default: 35)",
     )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Regenera unicamente docs/EXPLORACION_RED_NEURONAL.md a partir de exploration_metrics.json",
+    )
     args = parser.parse_args()
+
+    if args.report_only:
+        metrics_path = args.output_report.parent / "assets" / "exploration" / "exploration_metrics.json"
+        results = json.loads(metrics_path.read_text(encoding="utf-8"))
+        generate_markdown_exploration_report(results, output_report_path=args.output_report)
+        print(f"Reporte regenerado en: {args.output_report}", flush=True)
+        return
 
     run_all_explorations(
         kinematic_dir=args.kinematic_dir,
