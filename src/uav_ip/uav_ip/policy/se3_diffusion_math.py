@@ -262,18 +262,34 @@ def vector_4dof_to_se3(
 @dataclass(frozen=True)
 class ActionBounds4DoF:
     """
-    Cotas simetricas para normalizar vectores 4-DoF [dx_s, dy_s, dz_s, dyaw_rad]
-    al intervalo [-1, 1] (y viceversa).
-    Valores por defecto calibrados para pasos incrementales Δt = 0.1 s en escala s = 0.1:
-      - max_dx_dy_scaled = 0.075 (equivale a 0.75 m por paso de 0.1 s = 7.5 m/s > cota de 6.5 m/s)
-      - max_dz_scaled    = 0.050 (equivale a 0.50 m por paso de 0.1 s = 5.0 m/s vertical)
-      - max_dyaw_rad     = 0.650 rad (~37.2° por paso de 0.1 s)
+    Cotas simetricas auxiliares para reescalar vectores 4-DoF [dx_s, dy_s, dz_s, dyaw_rad]
+    al intervalo [-1, 1] durante las pruebas exploratorias Pre-Hito 4.
+
+    NOTA: Los valores por defecto provienen de los percentiles observados en el corpus exploratorio
+    actual (Δt = 0.1 s, escala s = 0.1) y NO constituyen cotas universales para la red final.
+    Usar `clip=True` con cotas fijas puede truncar maniobras futuras con mayor velocidad angular
+    o vertical; para el Hito 4 conviene revisar normalizacion por el schedule de ruido de difusion,
+    estadisticos dinamicos del split de entrenamiento (sin clipping duro en inferencia) o limites
+    fisicos del vehiculo.
     """
 
     max_dx_scaled: float = 0.075
     max_dy_scaled: float = 0.075
     max_dz_scaled: float = 0.050
     max_dyaw_rad: float = 0.650
+
+    @classmethod
+    def for_stride(cls, action_stride: int = 1) -> "ActionBounds4DoF":
+        """Escala las cotas incrementales proporcionalmente al paso temporal `action_stride`."""
+        s = max(1, int(action_stride))
+        if s == 1:
+            return cls()
+        return cls(
+            max_dx_scaled=0.075 * float(s),
+            max_dy_scaled=0.075 * float(s),
+            max_dz_scaled=0.050 * float(s),
+            max_dyaw_rad=min(math.pi, 0.650 * float(s)),
+        )
 
     def scale_vector_numpy(self) -> np.ndarray:
         return np.array(

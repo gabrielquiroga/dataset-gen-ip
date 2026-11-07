@@ -194,27 +194,36 @@ def _get_lidar_generator(scale_factor: float) -> SyntheticLidarGenerator:
 def run_kinematic_closed_loop_rollout(
     policy: Any,
     waypoints_cfg: Dict[str, Any],
-    context_pack: Dict[str, torch.Tensor],
+    context_pack: Dict[str, Any],
     execution_horizon: int = 4,
     num_ddim_steps: int = 4,
     max_steps_10hz: int = 160,
     scale_factor: float = DEFAULT_SCALE_FACTOR,
+    action_stride: Optional[int] = None,
     initial_pos_enu_m: Optional[np.ndarray] = None,
     initial_yaw_enu_rad: Optional[float] = None,
     initial_vel_flu_mps: Optional[np.ndarray] = None,
     reference_pos_enu_m: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
-    Ejecuta una simulacion completa en lazo cerrado a 10 Hz con horizonte deslizante
-    `T_exec = execution_horizon` in {1, 2, 4, 8}:
+    Ejecuta una simulacion completa en lazo cerrado con horizonte deslizante
+    `T_exec = execution_horizon` in [1, T] y paso temporal `dt_step = 0.10 * action_stride`:
       - Sintetiza LiDAR 360° en vivo con `SyntheticLidarGenerator` en cada replanificacion.
       - Cachea las representaciones de contexto (φ_e + σ) una sola vez al inicio del episodio
-        si `policy` implementa `encode_context`.
+        si `policy` implementa `encode_context` (incluyendo `context_keyframe_mask` si `L` es adaptativo).
       - Evalua la trayectoria resultante con `validate_episode_data()` y calcula el error
         ADE/FDE respecto a `reference_pos_enu_m` si se provee.
     """
-    T_exec = max(1, min(8, int(execution_horizon)))
-    dt_step = 0.10  # 10 Hz
+    req_t_exec = max(1, int(execution_horizon))
+    if action_stride is not None:
+        stride = max(1, int(action_stride))
+    elif isinstance(context_pack, dict) and "action_stride" in context_pack:
+        stride = max(1, int(context_pack["action_stride"]))
+    elif hasattr(policy, "action_stride"):
+        stride = max(1, int(getattr(policy, "action_stride")))
+    else:
+        stride = 1
+    dt_step = 0.10 * float(stride)
 
     lidar_gen = _get_lidar_generator(scale_factor)
     landmarks_list = waypoints_cfg.get("landmarks", [])
@@ -253,6 +262,7 @@ def run_kinematic_closed_loop_rollout(
         device = next(policy.parameters()).device
         with torch.no_grad():
             ctx_pose = context_pack.get("context_pose_se3")
+            ctx_mask = context_pack.get("context_keyframe_mask")
             cached_context = policy.encode_context(
                 context_scene_pos=context_pack["context_scene_pos"].to(device),
                 context_vel_flu=context_pack["context_vel_flu"].to(device),
@@ -261,6 +271,7 @@ def run_kinematic_closed_loop_rollout(
                 context_target_flight_state=context_pack["context_target_flight_state"].to(device),
                 keypoints_body=kp_body.to(device),
                 context_pose_se3=ctx_pose.to(device) if ctx_pose is not None else None,
+                context_keyframe_mask=ctx_mask.to(device) if ctx_mask is not None else None,
             )
     context_encode_ms = (time.perf_counter() - t_ctx_start) * 1000.0
 
@@ -274,11 +285,13 @@ def run_kinematic_closed_loop_rollout(
     land_y = float(landing_cfg.get("y", 0.0))
 
     step_count = 0
+    odom_tick_cursor = 0
+    effective_t_exec = req_t_exec
     num_replan_calls = 0
     inference_times_ms: List[float] = []
     lidar_times_ms: List[float] = []
 
-    while step_count < max_steps_10hz:
+    while odom_tick_cursor < max_steps_10hz:
         # 1. Sintetizar nube LiDAR 360° en la pose actual (Horizontal FLU, s=0.1)
         t_lid0 = time.perf_counter()
         cloud_flu_scaled = lidar_gen.generate_pointcloud(
@@ -291,7 +304,7 @@ def run_kinematic_closed_loop_rollout(
             landmarks=landmarks_list,
             landing=landing_cfg,
             as_tensor=False,
-            seed=100 + step_count,
+            seed=100 + odom_tick_cursor,
         )
         lidar_times_ms.append((time.perf_counter() - t_lid0) * 1000.0)
 
@@ -302,6 +315,7 @@ def run_kinematic_closed_loop_rollout(
 
         sample = {
             **context_pack,
+            "action_stride": stride,
             "live_scene_pos": torch.from_numpy(cloud_flu_scaled).unsqueeze(0).to(dtype=torch.float32),
             "live_pose_se3": live_pose_se3,
             "live_vel_flu": torch.from_numpy(curr_vel_flu).unsqueeze(0).to(dtype=torch.float32),
@@ -309,7 +323,7 @@ def run_kinematic_closed_loop_rollout(
             "keypoints_body": kp_body,
         }
 
-        # 2. Invocar prediccion de horizonte T=8
+        # 2. Invocar prediccion de horizonte T pasos
         t_inf0 = time.perf_counter()
         if cached_context is not None:
             pred = policy.predict_actions(
@@ -318,20 +332,23 @@ def run_kinematic_closed_loop_rollout(
                 cached_context=cached_context,
             )
         elif hasattr(policy, "reference_episode") and getattr(policy, "reference_episode") is not None:
-            pred = policy.predict_actions(sample=sample, step_cursor=step_count)
+            pred = policy.predict_actions(sample=sample, step_cursor=odom_tick_cursor)
         else:
             pred = policy.predict_actions(sample=sample)
         inference_times_ms.append((time.perf_counter() - t_inf0) * 1000.0)
         num_replan_calls += 1
 
-        wp_horizon = pred.pred_world_waypoints_enu_m  # (8, 4) [X_m, Y_m, Z_m, yaw_rad]
-        fs_horizon = pred.pred_flight_state.numpy().reshape(-1)  # (8,)
+        wp_horizon = pred.pred_world_waypoints_enu_m  # (T, 4) [X_m, Y_m, Z_m, yaw_rad]
+        fs_horizon = pred.pred_flight_state.numpy().reshape(-1)  # (T,)
         predicted_horizons_history.append(wp_horizon.copy())
 
-        # 3. Ejecutar los primeros `T_exec` pasos del horizonte predicho
+        steps_to_exec = max(1, min(int(wp_horizon.shape[0]), req_t_exec))
+        effective_t_exec = steps_to_exec
+
+        # 3. Ejecutar los primeros `steps_to_exec` pasos del horizonte predicho
         landed_trigger = False
-        for k in range(T_exec):
-            if step_count >= max_steps_10hz:
+        for k in range(steps_to_exec):
+            if odom_tick_cursor >= max_steps_10hz:
                 break
             next_pos_m = wp_horizon[k, :3].astype(np.float64)
             next_yaw = float(wrap_angle_numpy(wp_horizon[k, 3]))
@@ -344,6 +361,7 @@ def run_kinematic_closed_loop_rollout(
             curr_yaw = next_yaw
             curr_flight_state = 1.0 if next_fs >= 0.5 else 0.0
             step_count += 1
+            odom_tick_cursor += stride
 
             traj_times.append(step_count * dt_step)
             traj_pos_enu_m.append(curr_pos_m.copy())
@@ -378,8 +396,9 @@ def run_kinematic_closed_loop_rollout(
     fde_m = float("nan")
     if reference_pos_enu_m is not None and len(reference_pos_enu_m) > 0:
         ref = np.asarray(reference_pos_enu_m, dtype=np.float64)
-        L_cmp = min(len(pos_traj), len(ref))
-        ade_m = float(np.mean(np.linalg.norm(pos_traj[:L_cmp] - ref[:L_cmp], axis=-1)))
+        ref_strided = ref[::stride]
+        L_cmp = min(len(pos_traj), len(ref_strided))
+        ade_m = float(np.mean(np.linalg.norm(pos_traj[:L_cmp] - ref_strided[:L_cmp], axis=-1)))
         fde_m = float(np.linalg.norm(pos_traj[-1] - ref[-1]))
 
     return {
@@ -391,7 +410,8 @@ def run_kinematic_closed_loop_rollout(
         "yaw_enu_rad": yaw_traj,
         "timestamps_s": times_traj,
         "predicted_horizons": predicted_horizons_history,
-        "execution_horizon": T_exec,
+        "execution_horizon": int(effective_t_exec),
+        "action_stride": int(stride),
         "num_ddim_steps": int(num_ddim_steps),
         "num_steps_executed": int(step_count),
         "num_replan_calls": int(num_replan_calls),

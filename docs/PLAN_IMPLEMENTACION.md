@@ -153,3 +153,43 @@ flowchart LR
   1. Tasa de éxito en tareas del split de validación `val_tasks.json` (firmas conocidas en mundos nuevos).
   2. Tasa de éxito en tareas del split de prueba `held_out_tasks.json` (firmas jamás vistas en el entrenamiento).
   3. *Context Swap Test*: Demostrar que ante el mismo mundo físico, cambiar el contexto altera deterministamente el vuelo del dron sin modificar los pesos de la red.
+
+### Tarea 4.5: Registro de Pruebas Exploratorias Pre-Hito 4 y Agenda de Exploración en Grilla sobre la Red Final
+
+> [!NOTE]
+> El detalle matemático, tablas y gráficas de la exploración preliminar ya ejecutada en el subpaquete aislado `src/uav_ip/uav_ip/policy/` se encuentra documentado en [`docs/EXPLORACION_RED_NEURONAL.md`](EXPLORACION_RED_NEURONAL.md).
+
+#### A. Interfaces y Herramientas Verificadas en la Exploración Preliminar
+- [x] **Aislamiento de entorno (`uav_ip/policy/`):** Separación entre el núcleo ROS 2 (sin `torch`) y los módulos de red neuronal ejecutados en `~/venv_ip`, más soporte de `--rtf <float>` en `world_generator.py`.
+- [x] **Conversión incremental $\delta T_k \leftrightarrow T_{EA}^{(t,k)}$ (Experimento 1):** Verificado sobre 200 episodios cinemáticos y 60 episodios PX4 SITL que $\delta T_k = (T_{EA}^{(t,k-1)})^{-1} T_{EA}^{(t,k)}$ mantiene escala uniforme a lo largo del horizonte frente al crecimiento lineal de las poses acumuladas. *(Nota: los percentiles medidos en `ActionBounds4DoF` corresponden solo a este corpus exploratorio y no se asumen como cotas fijas para la red final).*
+- [x] **Proyección rígida SVD 4-DoF en Horizontal FLU (Experimento 2):** Verificada la reversibilidad numérica ($< 10^{-6}\text{ m}$) entre flujos de 6 keypoints y matrices $4\times 4$, observando que ante $2\text{ cm}$ de ruido en los keypoints el SVD 6-DoF libre introduce hasta $10.7^\circ$ de *roll/pitch* aparente mientras `align_keypoints_svd_horizontal_flu` mantiene la actualización dentro del marco `Horizontal FLU`.
+- [x] **Evaluador cinemático en lazo cerrado y caché de contexto en inferencia (Experimentos 3 y 5):** Verificado `kinematic_rollout_eval.py` con `OracleReplayPolicy` (`ADE = 0.000 m`, `accepted`) y comprobado que precalcular una vez la codificación de las demos al inicio del episodio reduce el costo por ciclo de control ($3.1\times\text{–}5.8\times$ en las pruebas sobre CPU).
+
+#### B. Parches Exploratorios a Revisar y Estudio de Grilla Pendiente (A Evaluar sobre la Red Final del Hito 4)
+
+> [!IMPORTANT]
+> La red auxiliar `MiniInstantPolicyNet` utilizada en la exploración incluyó varios atajos ad-hoc únicamente para ajustar en pocos segundos sobre pruebas mínimas (1 episodio o 3 muestras). **Esos atajos NO constituyen patrones para trasladar a la red final**; tanto esos aspectos de modelado como la grilla de hiperparámetros deben revisarse sobre la arquitectura definitiva del Hito 4 (diseñándola de forma parametrizable en $L$, $T$ y `action_stride`):
+
+- [ ] **0. Revisión de Parches Exploratorios de `MiniInstantPolicyNet` (No Trasladar como Patrón):**
+  - *Normalización y escala traslación/rotación:* Revisar un esquema general sin constantes manuales `flow_scale` ni recorte duro (`ActionBounds4DoF` con `clip=True`) ajustados a este dataset, contemplando que futuras tareas puedan involucrar mayor rotación o velocidad vertical (p. ej. normalización por el *schedule* de ruido $\sigma_k$ de difusión o estadísticos dinámicos del split de entrenamiento sin *clipping* en inferencia).
+  - *Invariancia espacial $SE(3)$ y señal de progreso:* No trasladar la inyección de `live_pose_se3` global ni la comparación en $X_{\text{ENU}}$ (`ctx_x - live_x`) usadas en el *overfit* de 1 episodio. Revisar cómo representar el orden relativo dentro de las demos de contexto sin usar coordenadas globales en la consulta viva $O_t$, evaluar si `data['aug']` ($\gamma = 0.70$) ya basta sin agregar perturbaciones extra al vuelo, y analizar alternativas egocéntricas solo si apareciera ambigüedad perceptual con el LiDAR 360° ($10.0\text{ m}$).
+  - *Propagación de contexto ($\varphi$) y proceso de difusión ($\psi$):* No trasladar la separación manual `Key`/`Value`, el `live_modality_dropout` ni las anclas sintéticas creadas para la sonda de 3 muestras, ni tampoco el puente determinista desde $I_4$; evaluar la arquitectura estándar de grafos heterogéneos de *Instant Policy* y un *schedule* DDPM/DDIM estocástico entrenados sobre la diversidad completa del Catálogo $v2$.
+  - *Muestreo de escena ($\phi_e$):* Revisar el muestreo sin el corte fijo `z_flu > -0.11` usado en `subsample_scene_centroids_torch()`, dado que `synthetic_lidar.py` no genera piso infinito y un umbral fijo en $Z$ puede descartar puntos legítimos del `landing_pad` al volar alto (`overfly`), además de evaluar $M \in \{16, 32, 64\}$ centroides.
+- [ ] **1. Cantidad y Estrategia de *Keyframes* de Contexto ($L$ fijo vs. $L$ adaptativo por longitud):**
+  - Evaluar valores fijos $L \in \{10, 16, 24\}$ frente a **$L$ adaptativo correlacionado con la longitud/complejidad de la demostración** (p. ej. 1 keyframe cada $1.2\text{–}1.5\text{ m}$ de longitud de arco + picos de curvatura $\kappa(t)$ y transición de aterrizaje, acotado en $[10, 28]$).
+  - Analizar el compromiso entre reducir huecos entre keyframes en circuitos largos de 3–4 obstáculos o maniobras `orbit` y el costo/dispersión de atención en $\varphi$.
+  - *Consideración de diseño:* Emplear aristas espaciales relativas $SE(3)$ y codificación continua en $[0, 1]$ dentro de cada demo (con grafos dinámicos PyG o `key_padding_mask` por lote) para que el número de parámetros no dependa de $L$.
+- [ ] **2. Longitud del Horizonte de Pasos Futuros ($T$):**
+  - Evaluar $T \in \{6, 8, 12, 16\}$ pasos futuros ($\equiv 0.6\text{ s}, 0.8\text{ s}, 1.2\text{ s}, 1.6\text{ s}$ a $10\text{ Hz}$).
+  - Medir el compromiso entre anticipación geométrica en puertas/slaloms, el alcance de visión del LiDAR ($10.0\text{ m}$) y el costo computacional sobre los $6 \times T$ nodos de acción en la etapa $\varphi$.
+- [ ] **3. Resolución Temporal del Horizonte (`action_stride` $\in \{1, 2\}$):**
+  - Comparar paso estándar `stride = 1` ($\Delta t = 0.1\text{ s}$) frente a paso extendido `stride = 2` ($\Delta t = 0.2\text{ s}$).
+  - Caso a contrastar: `(T = 8, stride = 2)` vs. `(T = 16, stride = 1)` (ambos abarcan $1.6\text{ s}$ hacia adelante, con distinta densidad de nodos y latencia apoyándose en la interpolación spline a $50\text{ Hz}$).
+- [ ] **4. Fracción Ejecutada del Horizonte en Lazo Cerrado ($r_{\text{exec}} = T_{\text{exec}} / T$) — *Barrido en inferencia (sin re-entrenar)*:**
+  - Para cada $T$ evaluado, barrer $r_{\text{exec}} \in \{0.25, 0.50, 0.75\}$ (además de los extremos $T_{\text{exec}}=1$ y $T_{\text{exec}}=T$) midiendo tasa de aceptación en `validate_episode_data()`, suavidad de trayectoria (`ADE`/`FDE`) y frecuencia efectiva de replanificación.
+- [ ] **5. Número de Demostraciones en Contexto ($N_{\text{demos}} \in \{1, 2, 3, 4\}$) — *Barrido en inferencia (sin re-entrenar)*:**
+  - Evaluar desempeño *one-shot* ($N_{\text{demos}}=1$) vs. *few-shot* ($2, 3, 4$ demos) sobre el mismo checkpoint entrenado.
+  - Incluir comparación a **presupuesto constante de nodos de contexto** (ej. 1 demo densa con $L=24$ frente a 2 demos con $L=12$) para observar el aporte relativo entre densidad intra-demo y variabilidad inter-demo.
+- [ ] **6. Frontera Pareto de Tiempo Real ($K \in \{1, 2, 4, 8\}$ pasos DDIM + factor `--rtf` en Gazebo SITL):**
+  - Cruzar la tasa de éxito geométrico en `val_tasks` / `held_out_tasks` contra la latencia real de inferencia en CPU/GPU (con caché de contexto activo) sobre la red final para elegir el par operativo $(K, \text{RTF})$ en PX4 SITL.
+

@@ -63,7 +63,9 @@ ros2_ws/
 │       │   ├── visualize_dataset.py          # CLI de visualización 3D y análisis de recuperación
 │       │   ├── setup_venv_ip.sh              # Aprovisionamiento del entorno virtual ML (~/venv_ip)
 │       │   ├── kill_sim.sh                   # Limpieza agresiva de procesos huérfanos de simulación
-│       │   └── test_flight.sh                # Lanzador rápido de un vuelo de prueba aislado
+│       │   ├── test_flight.sh                # Lanzador rápido de un vuelo de prueba aislado
+│       │   └── policy/                       # CLIs de red neuronal y evaluación ML (~/venv_ip)
+│       │       └── run_exploration_suite.py  # Suite exploratoria y sonda parametrizable (L, T, stride...)
 │       ├── uav_ip/                # Biblioteca central de lógica de negocio (Punto Único de Verdad)
 │       │   ├── base_pilot.py          # Ciclo de vida ROS 2 y protocolo de armado Offboard seguro
 │       │   ├── waypoint_controller.py # Piloto experto (feed-forward, cruce tangencial, orbit cw/ccw)
@@ -71,13 +73,20 @@ ros2_ws/
 │       │   ├── validation_geometry.py # Geometría compartida, envolvente x500 (0.3857m) y obstáculos
 │       │   ├── validate_episode.py    # Motor de validación física, reloj, MCAP/CRC32 y misiones
 │       │   ├── synthetic_lidar.py     # Generador analítico LiDAR 360° (Horizontal FLU, kernel C SIMD)
-│       │   └── visualize_dataset.py   # Motor de renderizado 3D y animaciones GIF
-│       └── test/                  # Suite completa de pruebas unitarias e integradas (63 tests)
+│       │   ├── visualize_dataset.py   # Motor de renderizado 3D y animaciones GIF
+│       │   └── policy/                # Subpaquete aislado de red neuronal y difusión SE(3) (PyTorch/PyG)
+│       │       ├── se3_diffusion_math.py     # Matemática 4-DoF Horizontal FLU, flujo de keypoints y SVD
+│       │       ├── in_context_dataset.py     # Cargador In-Context parametrizable al vuelo (L fijo o adaptive, T, stride)
+│       │       ├── simple_validation_net.py  # Red de validación MiniInstantPolicyNet y OracleReplayPolicy
+│       │       ├── kinematic_rollout_eval.py # Evaluador en lazo cerrado cinemático a 50 Hz con spline PCHIP
+│       │       └── exploration_suite.py      # Experimentos cuantitativos y sonda de hiperparámetros
+│       └── test/                  # Suite completa de pruebas unitarias e integradas (núcleo + test/policy/)
 ├── docs/                          # Documentación técnica canónica consolidada
 │   ├── assets/                    # Animaciones GIF y capturas de simulación
 │   ├── FUNDAMENTOS_Y_DISENO.md           # Teoría matemática, ADRs, envolventes y catálogo v2
 │   ├── AUDITORIA_CONSISTENCIA_Y_LITERATURA.md # Auditoría forense y bibliografía anotada
 │   ├── PLAN_IMPLEMENTACION.md            # Hoja de ruta activa e hitos del proyecto
+│   ├── EXPLORACION_RED_NEURONAL.md       # Contratos E/S, validación SE(3)/SVD y exploración Pre-Hito 4
 │   └── TROUBLESHOOTING.md                # Solución de problemas comunes en WSL2, ROS y PX4
 └── datasets/                      # Almacenamiento local de datasets y particiones
 ```
@@ -304,11 +313,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 </p>
 
 * **Modo de Uso:**
-  Es invocado automáticamente por `data_collector.py` y `kinematic_pseudo_generator.py`. Para inspección manual:
+  Es invocado automáticamente por `data_collector.py` y `kinematic_pseudo_generator.py`. Acepta además `--rtf <float>` (por defecto `1.0`) para escalar el *Real-Time Factor* de Gazebo Harmonic (ej. `--rtf 0.5` o `0.25`) manteniendo intacto el paso físico `max_step_size = 0.004s`, útil para evaluar la red neuronal en CPU sin degradación por latencia:
   ```bash
   python3 src/uav_ip/scripts/world_generator.py \
     --task-config /tmp/test_task/task_config.yaml \
     --seed 101 \
+    --rtf 0.5 \
     --output-sdf /tmp/test_task/world.sdf \
     --output-waypoints /tmp/test_task/waypoints.yaml
   ```
@@ -393,6 +403,47 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 
 ---
 
+### 10. `scripts/policy/run_exploration_suite.py` — Exploración y Validación Parametrizable de la Política
+
+* **Para qué sirve:**
+  Ejecuta dentro del entorno virtual aislado `~/venv_ip` los experimentos cuantitativos Pre-Hito 4 (contratos E/S de `HeteroData`, exactitud matemática $SE(3)$/SVD 4-DoF, lazo cerrado cinemático con `OracleReplayPolicy` y `MiniInstantPolicyNet`, cobertura FPS y latencia en CPU) o lanza sondas rápidas sobre combinaciones arbitrarias de hiperparámetros **sin necesidad de regenerar los archivos `heterodata.pt`**.
+
+* **Argumentos de Hiperparámetros Variables:**
+  * `--num-keyframes <int|adaptive>`: Cantidad $L$ de keyframes por demostración (ej. `10`, `16`, `24`) o `'adaptive'` para escalar $L$ automáticamente con la longitud de arco de cada circuito usando enmascarado booleano `context_keyframe_mask` (por defecto: `10`).
+  * `--adaptive-arc-m <float>`: Separación media de arco en metros por keyframe cuando `--num-keyframes adaptive` (por defecto: `1.5`).
+  * `--horizon <int>`: Pasos futuros $T$ del horizonte de predicción reconstruidos al vuelo (ej. `6`, `8`, `12`, `16`; por defecto: `8`).
+  * `--action-stride <int>`: Separación temporal en ticks de $10\text{ Hz}$ entre pasos del horizonte (`1` = $\Delta t = 0.1\text{ s}$, `2` = $\Delta t = 0.2\text{ s}$; por defecto: `1`).
+  * `--num-context-demos <int>`: Número $N_{\text{demos}}$ de demostraciones de contexto por consulta (por defecto: `2`).
+  * `--execution-horizon <int>`: Pasos $T_{\text{exec}} \in [1, T]$ ejecutados antes de volver a consultar la red en lazo cerrado (por defecto: `4`).
+  * `--num-ddim-steps <int>`: Iteraciones internas $K$ de *denoising* DDIM (por defecto: `4`).
+  * `--num-centroids <int>` / `--d-model <int>`: Centroides FPS $M$ del codificador de escena y dimensión oculta de `MiniInstantPolicyNet` (por defecto: `16` y `64`).
+  * `--custom-eval-only`: Ejecuta únicamente una sonda rápida de validación (contratos + Oráculo + red + latencia CPU) para la combinación indicada sin sobrescribir el reporte canónico; combinable con `--task-id <id>` y `--output-json <ruta>`.
+  * `--report-only`: Regenera `docs/EXPLORACION_RED_NEURONAL.md` a partir de `docs/assets/exploration/exploration_metrics.json`.
+
+* **Ejemplos de Ejecución:**
+  ```bash
+  # 1. Ejecutar la suite completa de 5 experimentos y generar el reporte Markdown:
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py \
+    --kinematic-dir datasets/kinematic \
+    --sitl-dir datasets/sitl \
+    --output-report docs/EXPLORACION_RED_NEURONAL.md
+
+  # 2. Probar rápidamente L adaptativo con horizonte T=12 y T_exec=6:
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py \
+    --custom-eval-only \
+    --num-keyframes adaptive --adaptive-arc-m 1.5 \
+    --horizon 12 --action-stride 1 \
+    --execution-horizon 6 --num-context-demos 2 --num-ddim-steps 4
+
+  # 3. Probar paso temporal doble (stride=2 -> dt=0.2s, alcance 1.6s con T=8) y exportar JSON:
+  ~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py \
+    --custom-eval-only \
+    --num-keyframes 16 --horizon 8 --action-stride 2 \
+    --execution-horizon 4 --output-json /tmp/probe_stride2.json
+  ```
+
+---
+
 ## 🚀 Flujos de Trabajo Recomendados (Workflows Paso a Paso)
 
 ### Workflow A: Pre-entrenamiento Masivo Rápido (Corpus Cinemático)
@@ -456,12 +507,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 
 ## 🧪 Verificación de Tests Automatizados (`pytest`)
 
-El paquete incluye una suite completa de pruebas unitarias que verifica la geometría, el LiDAR analítico, las transformaciones $SE(3)$, el decaimiento de Tube Augmentation y el generador cinemático:
+El paquete incluye una suite completa de pruebas unitarias e integradas que verifica la geometría, el LiDAR analítico, las transformaciones $SE(3)$/SVD 4-DoF, el decaimiento de Tube Augmentation, el generador cinemático, el aislamiento unidireccional de `uav_ip.policy` y la parametrización dinámica de $(L, T, \text{stride}, N_{\text{demos}}, T_{\text{exec}})$:
 
 ```bash
-pytest src/uav_ip/test -q
+~/venv_ip/bin/python3 -m pytest src/uav_ip/test -q
 ```
-*Resultado esperado:* **`63 passed in ~11s`** (con 0 fallos y 0 tests omitidos).
+*Resultado esperado:* **`71 passed`** (con 0 fallos y 0 tests omitidos).
 
 ---
 
@@ -470,5 +521,6 @@ pytest src/uav_ip/test -q
 Para profundizar en los fundamentos matemáticos y la memoria técnica del proyecto:
 * **[Fundamentos Teóricos, Decisiones de Diseño y Memoria Arquitectónica](docs/FUNDAMENTOS_Y_DISENO.md):** Formalización matemática de Instant Policy, preservación de Markov, envolvente real del x500, catálogo $v2$ y registro histórico de decisiones (ADRs).
 * **[Auditoría de Consistencia, Ejecución Forense y Literatura Relacionada](docs/AUDITORIA_CONSISTENCIA_Y_LITERATURA.md):** Informe técnico de revisión cruzada, análisis forense de anomalías y bibliografía científica anotada.
-* **[Plan Maestro de Implementación](docs/PLAN_IMPLEMENTACION.md):** Hoja de ruta activa, componentes completados y arquitectura de la red neuronal (Hito 4).
+* **[Plan Maestro de Implementación](docs/PLAN_IMPLEMENTACION.md):** Hoja de ruta activa, componentes completados, arquitectura de la red neuronal (Hito 4) y protocolo de ablaciones (Tarea 4.5).
+* **[Exploración Pre-Hito 4 y Contratos de Red Neuronal](docs/EXPLORACION_RED_NEURONAL.md):** Guía didáctica y empírica de contratos de tensores E/S, verificación $SE(3)$/SVD 4-DoF, evaluación en lazo cerrado cinemático y latencia CPU vs RTF.
 * **[Guía de Troubleshooting](docs/TROUBLESHOOTING.md):** Resolución rápida de errores de PX4, Gazebo, FastDDS y virtualenvs.

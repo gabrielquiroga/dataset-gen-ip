@@ -10,7 +10,7 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
 3. `docs/AUDITORIA_CONSISTENCIA_Y_LITERATURA.md`: Auditoría forense del sistema, contrastación científica con Instant Policy y literatura relacionada, y bibliografía comentada.
 4. `docs/TROUBLESHOOTING.md`: Registro de soluciones a problemas de simulación, networking, virtualenvs de ML y comandos.
 5. `README.md`: Portal principal y manual de usuario detallado de cada script del repositorio.
-6. `docs/EXPLORACION_RED_NEURONAL.md`: Contratos de tensores E/S, verificación matemática $SE(3)$/SVD 4-DoF, resultados en lazo cerrado cinemático y decisiones cerradas para el Hito 4.
+6. `docs/EXPLORACION_RED_NEURONAL.md`: Contratos de tensores E/S, verificación matemática $SE(3)$/SVD 4-DoF, resultados exploratorios en lazo cerrado cinemático y aspectos abiertos a revisar en el Hito 4.
 
 ## 🛠️ Tecnologías y Estilos
 - **Lenguaje Principal:** Python 3 (estrictamente tipado siempre que sea posible, usando docstrings y tipos de `typing`).
@@ -28,9 +28,9 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
    * `data['scene'].pos`: nubes de 2048 puntos en Horizontal FLU con escala $s=0.1$.
    * `data['agent'].x`: poses $SE(3)$ ejecutadas ($x, y, z$ escalados por $s=0.1$, cuaternión $q_w, q_x, q_y, q_z$) más 6 keypoints del dron.
    * `data['agent'].vel_flu`: velocidades lineales $(T, 3)$ en marco Horizontal FLU.
-   * `data['agent'].y`: horizonte de $T=8$ acciones relativas $T_{EA}^{(t,k)} \in SE(3)$ muestreadas de la trayectoria real a $10\text{ Hz}$.
+   * `data['agent'].y`: horizonte base de $T=8$ acciones relativas $T_{EA}^{(t,k)} \in SE(3)$ muestreadas de la trayectoria real a $10\text{ Hz}$.
    * `data['aug']`: nodos de recuperación por *Tube Augmentation* ($30\%$ de los pasos con perturbaciones $\delta p \le 0.60\text{ m}$, decaimiento exponencial $\gamma = 0.70$ con cota $\le 6.5\text{ m/s}$ y $10\%$ flip de estado de vuelo binario).
-   * Keyframes de contexto: subsampleados uniformemente a $L=10$ hitos temporales.
+   * **Reconstrucción dinámica en `uav_ip.policy` (sin regenerar `.pt`):** Aunque `heterodata.pt` pre-almacena por defecto `keyframe_indices` ($L=10$) y `action_se3` ($T=8, \text{stride}=1$), `InContextNavigationDataset` y `extract_context_from_episode` permiten parametrizar al vuelo cualquier combinación de $(L, T, \text{action\_stride}, N_{\text{demos}})$ — incluyendo `L='adaptive'` correlacionado con la longitud de arco y colación enmascarada mediante `context_keyframe_mask` (`collate_in_context_batch`) — a partir de las secuencias completas `pose_se3`, `scene.pos` y `aug.pose_se3`.
 7. **El Entorno WSL2:** El usuario corre sobre WSL2 en Windows con GPU integrada. Prohibido sugerir herramientas dependientes exclusivamente de NVIDIA/CUDA propietarias para la simulación física.
 8. **Networking de ROS 2:** Cualquier script de bash o comando sugerido debe considerar el aislamiento de red de WSL2: `export ROS_DOMAIN_ID=33`, `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` y `export GZ_PARTITION=sim`.
 9. **Desacoplamiento de Entornos y Subcarpeta `policy/`:**

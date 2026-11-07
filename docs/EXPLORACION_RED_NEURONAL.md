@@ -35,11 +35,11 @@ En todo el proyecto conviven dos sistemas de coordenadas y una escala espacial r
      - **$+Z$ (*Up*):** Verticalmente hacia arriba (cielo).
    - **¿Por qué se llama *Horizontal* FLU?** Un dron cuadricóptero necesita inclinarse hacia adelante (*pitch*) para acelerar o hacia los lados (*roll*) para doblar. Si usáramos el marco inclinado del chasis, cada vez que el dron frenara o acelerara, toda la nube LiDAR parecería subir y bajar violentamente. Al proyectar el marco sobre el plano horizontal (**forzando $\text{roll} = 0$ y $\text{pitch} = 0$**, conservando únicamente el giro de brújula o **rumbo $\psi$ / *yaw***), el suelo siempre está plano y un movimiento en $+X$ significa siempre *"avanzar horizontalmente hacia donde mira la nariz"*.
 3. **Factor de Escala Espacial $s = 0.1$ ($1\text{ unidad} = 10\text{ metros}$):**
-   - El paper original de *Instant Policy* fue diseñado para brazos robóticos de mesa cuyos movimientos ocurren dentro de una caja de $\sim 0.5\text{ m} \times 0.5\text{ m}$. Nuestro dron vuela en circuitos de $25\text{ m}$ con un LiDAR que ve hasta $5\text{ m}$ de radio.
+   - El paper original de *Instant Policy* fue diseñado para brazos robóticos de mesa cuyos movimientos ocurren dentro de una caja de $\sim 0.6\text{–}1.0\text{ m}$. Nuestro dron vuela en circuitos de $25\text{ m}$ con un LiDAR omnidireccional de hasta $10.0\text{ m}$ de radio.
    - Al multiplicar todas las distancias en metros por **$s = 0.1$** (es decir, **dividir los metros por $10$**):
-     - El radio de visión de $5\text{ m}$ del LiDAR pasa a ser $0.5\text{ unidades}$.
+     - El radio máximo de visión de $10.0\text{ m}$ del LiDAR pasa a ser $1.0\text{ unidad}$.
      - Un avance de $0.20\text{ m}$ en un paso de $0.1\text{ s}$ pasa a ser $0.020\text{ unidades}$.
-     - Así, todos los números que entran a las capas geométricas de la red quedan alrededor de $[-0.5, +0.5]$, evitando que las funciones de activación y las distancias del grafo se saturen.
+     - Así, las coordenadas relativas que entran a los embeddings sinusoidales de Fourier quedan dentro de $[-1.0, +1.0]$, evitando aliasing periódico en la frecuencia fundamental.
    - **Regla práctica de lectura:** Siempre que veas una posición o desplazamiento con subíndice $s$ (como $\Delta x_s = 0.030$), **multiplícalo por $10$ para obtener metros reales** ($0.030 \times 10 = 0.30\text{ m} = 30\text{ cm}$). Los ángulos ($\psi, \Delta\psi$) se miden en **radianes** y no se escalan.
 
 ---
@@ -125,43 +125,78 @@ Para cumplir la **Regla 9 de `AGENT.md`** (*el núcleo de generación jamás deb
 
 - **Librería de la política (`src/uav_ip/uav_ip/policy/`):**
   - [`se3_diffusion_math.py`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py): Todas las fórmulas geométricas: conversión entre acciones acumuladas $T_{EA}^{(t,k)}$ e incrementales $\delta T_k$, normalización 4-DoF a $[-1, 1]$, cálculo del flujo desacoplado $[\Delta\hat{\mathbf{p}}_t, \Delta\hat{\mathbf{p}}_r]$ sobre los 6 keypoints del dron y reconstrucción rígida mediante SVD proyectado a Horizontal FLU.
-  - [`in_context_dataset.py`](../src/uav_ip/uav_ip/policy/in_context_dataset.py): El cargador `InContextNavigationDataset` que lee los archivos `heterodata.pt`, empareja cada instante de vuelo con $N_{\text{demos}}=2$ demostraciones de la misma tarea muestreadas en sus $L=10$ keyframes, y verifica con [`verify_sample_contract()`](../src/uav_ip/uav_ip/policy/in_context_dataset.py) que ninguna dimensión ni escala sea inválida.
-  - [`simple_validation_net.py`](../src/uav_ip/uav_ip/policy/simple_validation_net.py): Contiene tanto la política perfecta de referencia (`OracleReplayPolicy`, que devuelve las acciones exactas del experto para verificar que el simulador no tenga errores) como nuestra red neuronal validadora completa (`MiniInstantPolicyNet`, que implementa las 4 etapas $\phi_e \to \sigma \to \varphi \to \psi$, el bucle de difusión DDIM de $K$ pasos y el SVD 4-DoF).
-  - [`kinematic_rollout_eval.py`](../src/uav_ip/uav_ip/policy/kinematic_rollout_eval.py): Simulador de vuelo en lazo cerrado en Python puro. En cada paso mueve el dron según lo que ordena la red neuronal, genera en vivo la nueva vista láser con [`SyntheticLidarGenerator`](../src/uav_ip/uav_ip/synthetic_lidar.py), interpola la trayectoria a $50\text{ Hz}$ con splines PCHIP y al terminar audita el vuelo completo con el juez oficial del proyecto ([`validate_episode_data()`](../src/uav_ip/uav_ip/validate_episode.py)).
-  - [`exploration_suite.py`](../src/uav_ip/uav_ip/policy/exploration_suite.py): Script maestro que ejecuta los 5 experimentos de validación y genera automáticamente este reporte y sus figuras.
+  - [`in_context_dataset.py`](../src/uav_ip/uav_ip/policy/in_context_dataset.py): El cargador `InContextNavigationDataset` que lee los archivos `heterodata.pt` y reconstruye al vuelo (sin regenerar `.pt`) cualquier combinación de $N_{\text{demos}}$, cantidad de keyframes $L$ (entero fijo como `10, 16, 24` o `'adaptive'` proporcional a la longitud de arco), horizonte futuro $T$ (ej. `6, 8, 12, 16`) y `action_stride` (`1` o `2`), verificando contratos con [`verify_sample_contract()`](../src/uav_ip/uav_ip/policy/in_context_dataset.py).
+  - [`simple_validation_net.py`](../src/uav_ip/uav_ip/policy/simple_validation_net.py): Contiene la política de referencia (`OracleReplayPolicy`, parametrizable en `horizon` y `action_stride`) y una red ligera puramente exploratoria (`MiniInstantPolicyNet`) creada solo para comprobar que las dimensiones, máscaras y gradientes conectan de extremo a extremo (incluye atajos temporales de exploración documentados en la Sección 5.5, que no constituyen un patrón para la red final y quedan marcados para revisión en el Hito 4).
+  - [`kinematic_rollout_eval.py`](../src/uav_ip/uav_ip/policy/kinematic_rollout_eval.py): Simulador de vuelo en lazo cerrado en Python puro para cualquier horizonte $T$, ventana $T_{\text{exec}} \in [1, T]$ y `action_stride`. En cada paso mueve el dron según lo que ordena la política, genera en vivo la nueva vista láser con [`SyntheticLidarGenerator`](../src/uav_ip/uav_ip/synthetic_lidar.py), interpola la trayectoria a $50\text{ Hz}$ con splines PCHIP y al terminar audita el vuelo completo con el juez oficial ([`validate_episode_data()`](../src/uav_ip/uav_ip/validate_episode.py)).
+  - [`exploration_suite.py`](../src/uav_ip/uav_ip/policy/exploration_suite.py): Script maestro que ejecuta tanto los 5 experimentos canónicos como sondas rápidas con hiperparámetros variables (`run_custom_hyperparameter_probe`).
 - **Ejecutables para `~/venv_ip` (`src/uav_ip/scripts/policy/`):**
-  - [`run_exploration_suite.py`](../src/uav_ip/scripts/policy/run_exploration_suite.py): Punto de entrada por línea de comandos.
+  - [`run_exploration_suite.py`](../src/uav_ip/scripts/policy/run_exploration_suite.py): Punto de entrada por línea de comandos parametrizable.
 - **Pruebas unitarias (`src/uav_ip/test/policy/`):**
-  - [`test_exploration_pipeline.py`](../src/uav_ip/test/policy/test_exploration_pipeline.py): 6 tests automáticos en `pytest` que blindan la matemática, los contratos de datos, la red neuronal y el lazo cerrado.
+  - [`test_exploration_pipeline.py`](../src/uav_ip/test/policy/test_exploration_pipeline.py): Suite automática en `pytest` que verifica la matemática, los contratos variables $(L, T, \text{stride})$, la red exploratoria y el lazo cerrado.
+
+### 1.1 Cómo Invocar el Script con Hiperparámetros Variables (Sin Regenerar `heterodata.pt`)
+
+Como cada archivo `heterodata.pt` almacena la trayectoria completa `pose_se3`, las nubes `scene.pos` y las velocidades `vel_flu` a $10\text{ Hz}$, [`run_exploration_suite.py`](../src/uav_ip/scripts/policy/run_exploration_suite.py) permite variar todos los ejes de diseño directamente desde la terminal:
+
+```bash
+# A) Evaluar rápidamente una combinación puntual (sin sobrescribir este reporte):
+~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py \
+  --custom-eval-only \
+  --num-keyframes adaptive --adaptive-arc-m 1.5 \
+  --horizon 12 --action-stride 1 \
+  --execution-horizon 6 --num-context-demos 2 --num-ddim-steps 4 \
+  --num-centroids 32 --d-model 128
+
+# B) Probar paso temporal doble (action_stride=2 -> Δt = 0.2 s, cubriendo 1.6 s con T=8):
+~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py \
+  --custom-eval-only \
+  --num-keyframes 16 --horizon 8 --action-stride 2 --execution-horizon 4
+
+# C) Regenerar únicamente este documento Markdown desde exploration_metrics.json:
+~/venv_ip/bin/python3 src/uav_ip/scripts/policy/run_exploration_suite.py --report-only
+```
+
+| Parámetro CLI | Default | Valores Admitidos y Efecto |
+| :--- | :---: | :--- |
+| `--num-keyframes` | `10` | Entero positivo (`10`, `16`, `24`, ...) o `adaptive` ($L_d = \lceil \text{arco}_d / \Delta s \rceil$ acotado en $[10, 28]$). |
+| `--adaptive-arc-m` | `1.5` | Metros de recorrido por keyframe cuando `--num-keyframes adaptive`. |
+| `--horizon` | `8` | Pasos futuros $T$ predichos por inferencia (`6`, `8`, `12`, `16`, ...). |
+| `--action-stride` | `1` | Separación en ticks de $10\text{ Hz}$ entre pasos (`1` $\equiv 0.1\text{ s}$, `2` $\equiv 0.2\text{ s}$). Escala cotas automáticamente. |
+| `--num-context-demos` | `2` | Cantidad $N_{\text{demos}}$ de demostraciones de contexto por consulta (`1`, `2`, `3`, `4`). |
+| `--execution-horizon` | `4` | Pasos $T_{\text{exec}} \in [1, T]$ ejecutados antes de replanificar en lazo cerrado. |
+| `--num-ddim-steps` | `4` | Iteraciones internas $K$ de refinamiento DDIM (`1`, `2`, `4`, `8`). |
+| `--num-centroids` / `--d-model` | `16` / `64` | Centroides FPS $M$ del codificador $\phi_e$ y dimensión oculta de `MiniInstantPolicyNet`. |
+| `--custom-eval-only` | `False` | Ejecuta validación de contratos + Oráculo + entrenamiento rápido + rollout + latencia en ~20 s sin pisar el reporte. |
 
 ---
 
 ## 2. Mapa Maestro de Contratos de Entrada/Salida (E/S)
 
 ### ¿Qué significa esta tabla y por qué es necesaria?
-Antes de construir una red neuronal grande, el error más común en robótica es que un módulo entregue distancias en metros mientras otro espera decámetros ($s=0.1$), o que un tensor tenga las dimensiones invertidas. Esta tabla actúa como el **contrato legal de ingeniería** entre el dataset (`heterodata.pt`), la red neuronal y el controlador del dron:
+Antes de construir una red neuronal mayor, un error frecuente en robótica es que un módulo entregue distancias en metros mientras otro espera decámetros ($s=0.1$), o que un tensor tenga las dimensiones invertidas. Esta tabla documenta el **contrato de ingeniería** entre el dataset (`heterodata.pt`), la red neuronal y el controlador del dron:
 - **Cómo leer la columna `Forma Exacta`:**
-  - `N_demos`: Cantidad de demostraciones de contexto (normalmente $2$).
-  - `L=10`: Cantidad de *keyframes* (fotografías resumen) por cada demostración.
-  - `T=8`: Los $8$ pasos futuros que conforman el horizonte de predicción ($0.8\text{ s}$).
+  - `N_demos`: Cantidad de demostraciones de contexto (por defecto $2$, configurable con `--num-context-demos`).
+  - `L`: Cantidad de *keyframes* por demostración (por defecto $10$, o variable por longitud de arco con `--num-keyframes adaptive` acompañado de `context_keyframe_mask`).
+  - `T`: Cantidad de pasos futuros del horizonte de predicción (por defecto $8$ pasos $= 0.8\text{ s}$ con `action_stride=1`, configurable con `--horizon` y `--action-stride`).
   - `2048, 3`: Los $2048$ puntos $(x, y, z)$ de cada barrido LiDAR.
   - `4, 4`: Una matriz de transformación homogénea $SE(3)$ de $4 \times 4$.
 
 | Etapa | Nombre del Tensor | Forma Exacta | Tipo | Marco de Coordenadas | Escala / Unidades | Descripción |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Context Input** | `context_scene_pos` | `(N_demos, L=10, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 0.1 (1 unidad = 10 m) | Nubes LiDAR 360° en los L=10 keyframes de cada demostracion de contexto. |
-| **Context Input** | `context_pose_se3` | `(N_demos, L=10, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw) in SO(2) | Poses T_{WE}^{t_l} de los keyframes (usadas solo para aristas relativas intra-demo). |
-| **Context Input** | `context_vel_flu` | `(N_demos, L=10, 3)` | `float32` | Horizontal FLU | m/s (fisico directo) | Velocidad lineal propioceptiva [vx_flu, vy_flu, vz_flu] en cada keyframe. |
-| **Context Input** | `context_flight_state` | `(N_demos, L=10, 1)` | `float32` | Escalar binario | {0.0, 1.0} | Estado de vuelo en el keyframe (1.0 = vuelo activo, 0.0 = aterrizaje). |
-| **Context Input** | `context_action_se3` | `(N_demos, L=10, T=8, 4, 4)` | `float32` | Horizontal FLU relativo al keyframe l | Traslacion s = 0.1; Rotacion R_z(dyaw) | Horizonte futuro acumulado T_{EA}^{(t_l, 1..8)} demostrado en cada keyframe. |
-| **Context Input** | `context_delta_se3` | `(N_demos, L=10, T=8, 4, 4)` | `float32` | Horizontal FLU paso a paso (k-1 -> k) | Traslacion s = 0.1 (Δt = 0.1 s) | Incrementos paso a paso δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k en cada keyframe. |
+| **Context Input** | `context_scene_pos` | `(N_demos, L, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 0.1 (1 unidad = 10 m) | Nubes LiDAR 360° en los L keyframes (fijo o adaptativo) de cada demostracion. |
+| **Context Input** | `context_pose_se3` | `(N_demos, L, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw) in SO(2) | Poses T_{WE}^{t_l} de los keyframes (usadas solo para aristas relativas intra-demo). |
+| **Context Input** | `context_vel_flu` | `(N_demos, L, 3)` | `float32` | Horizontal FLU | m/s (fisico directo) | Velocidad lineal propioceptiva [vx_flu, vy_flu, vz_flu] en cada keyframe. |
+| **Context Input** | `context_flight_state` | `(N_demos, L, 1)` | `float32` | Escalar binario | {0.0, 1.0} | Estado de vuelo en el keyframe (1.0 = vuelo activo, 0.0 = aterrizaje). |
+| **Context Input** | `context_action_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU relativo al keyframe l | Traslacion s = 0.1; Rotacion R_z(dyaw) | Horizonte futuro acumulado T_{EA}^{(t_l, 1..T)} demostrado en cada keyframe. |
+| **Context Input** | `context_delta_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU paso a paso (k-1 -> k) | Traslacion s = 0.1 (Δt = 0.1 s * stride) | Incrementos paso a paso δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k en cada keyframe. |
+| **Context Input** | `context_keyframe_mask` | `(N_demos, L)` | `bool` | Mascara booleana | {True, False} | True en keyframes reales; False en slots de relleno cuando L es adaptativo. |
 | **Live Query Input** | `live_scene_pos` | `(1, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 0.1 (1 unidad = 10 m) | Nube LiDAR 360° actual observada por el dron en el instante t. |
-| **Live Query Input** | `live_pose_se3` | `(1, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw_t) | Pose actual T_{WE}^t (usada para proyectar la salida al mundo; NO entra a la GNN). |
+| **Live Query Input** | `live_pose_se3` | `(1, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw_t) | Pose actual T_{WE}^t (para proyectar la salida al mundo; usada en MiniInstantPolicyNet solo como atajo exploratorio, a revisar en el Hito 4). |
 | **Live Query Input** | `live_vel_flu` | `(1, 3)` | `float32` | Horizontal FLU | m/s (fisico directo) | Velocidad lineal actual del dron en su propio marco Horizontal FLU. |
 | **Live Query Input** | `live_flight_state` | `(1, 1)` | `float32` | Escalar binario | {0.0, 1.0} | Estado binario actual s_t antes de predecir el horizonte futuro. |
-| **Network Output** | `pred_action_se3` | `(T=8, 4, 4)` | `float32` | Horizontal FLU relativo al instante t | Traslacion s = 0.1; Rotacion R_z(dyaw_k) | Horizonte de T=8 poses relativas acumuladas predichas T_hat_{EA}^{(t, 1..8)}. |
-| **Network Output** | `pred_flight_state` | `(T=8, 1)` | `float32` | Probabilidad escalar | [0.0, 1.0] | Prediccion del estado de vuelo futuro s_hat_{t+1..t+8} (<0.5 activa aterrizaje). |
-| **Controller Output** | `pred_world_waypoints_enu_m` | `(T=8, 4)` | `float32` | Gazebo ENU global | Metros reales (÷ s = × 10.0) y radianes [-pi, pi) | Waypoints globales [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] para el spline. |
+| **Network Output** | `pred_action_se3` | `(T, 4, 4)` | `float32` | Horizontal FLU relativo al instante t | Traslacion s = 0.1; Rotacion R_z(dyaw_k) | Horizonte de T poses relativas acumuladas predichas T_hat_{EA}^{(t, 1..T)}. |
+| **Network Output** | `pred_flight_state` | `(T, 1)` | `float32` | Probabilidad escalar | [0.0, 1.0] | Prediccion del estado de vuelo futuro s_hat_{t+1..t+T} (<0.5 activa aterrizaje). |
+| **Controller Output** | `pred_world_waypoints_enu_m` | `(T, 4)` | `float32` | Gazebo ENU global | Metros reales (÷ s = × 10.0) y radianes [-pi, pi) | Waypoints globales [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] para el spline. |
 
 ---
 
@@ -175,7 +210,7 @@ Tenías la duda de cómo debía predecir la red esos 8 pasos futuros y cómo deb
    - *Problema intuitivo:* Si el dron vuela a $2\text{ m/s}$, en el paso $k=1$ ($0.1\text{ s}$ después) habrá avanzado **$0.20\text{ m}$**, pero en el paso $k=8$ ($0.8\text{ s}$ después) habrá avanzado **$1.60\text{ m}$** (¡8 veces más!). Si entrenamos la red directamente con estos valores, el error del paso 8 será numéricamente mucho más grande que el del paso 1, haciendo que la red preste mucha atención al final del horizonte y descuide el primer paso inmediato, que es justamente el que el dron va a ejecutar primero.
 2. **Formulación Incremental Paso a Paso ($\delta T_k$):** Cada nodo $k$ representa únicamente **el pequeño salto entre el paso anterior $k-1$ y el paso $k$**:
    $$\delta T_k = \left(T_{EA}^{(t, k-1)}\right)^{-1} T_{EA}^{(t, k)}, \quad \text{con } T_{EA}^{(t, 0)} = I_4$$
-   - *Ventaja intuitiva:* Tanto en $k=1$ como en $k=8$, el salto dura exactamente $\Delta t = 0.1\text{ s}$ y mide siempre alrededor de $0.20\text{ m}$. Los 8 pasos tienen **exactamente la misma escala estadística**. Y cuando necesitamos las poses acumuladas para dibujar los nodos del grafo, simplemente encadenamos (multiplicamos) los saltos desde el principio:
+   - *Ventaja intuitiva:* Tanto en $k=1$ como en $k=8$, el salto dura exactamente $\Delta t = 0.1\text{ s}$ y mide siempre alrededor de $0.20\text{ m}$. Los 8 pasos tienen **la misma escala estadística**. Y cuando necesitamos las poses acumuladas para construir los nodos del grafo, encadenamos (multiplicamos) los saltos desde el principio:
    $$T_{EA}^{(t, k)} = \delta T_1 \cdot \delta T_2 \cdots \delta T_k = \prod_{m=1}^{k} \delta T_m$$
 
 Para comprobarlo con datos reales de tu proyecto, analizamos **200 episodios cinemáticos** (54164 instantes de vuelo nominal + 16245 instantes de recuperación *Tube Augmentation*) y **60 episodios físicos en PX4 SITL** (11661 instantes nominales + 3499 instantes *Tube Augmentation*).
@@ -183,37 +218,34 @@ Para comprobarlo con datos reales de tu proyecto, analizamos **200 episodios cin
 ### 3.2 Tabla Comparativa de Rangos: Acumulada $T_{EA}^{(t,k)}$ vs. Incremental $\delta T_k$
 
 **Cómo leer esta tabla:**
-- Las columnas `p50`, `p95`, `p99.5` y `Máximo Absoluto` muestran los desplazamientos en la escala interna de la red ($s = 0.1$) para las traslaciones ($|\Delta x_s|, |\delta x_s|, |\delta y_s|, |\delta z_s|$) y en **radianes** para el giro de rumbo ($|\delta\psi|$).
+- Las columnas `p50`, `p95`, `p99.5` y `Máximo Absoluto` muestran los desplazamientos en la escala interna de la red ($s = 0.1$) para las traslaciones ($\vert \Delta x_s|, |\delta x_s|, |\delta y_s|, |\delta z_s \vert $) y en **radianes** para el giro de rumbo ($\vert \delta\psi \vert $).
 - La última columna (`Equivalente Físico (p99.5)`) convierte el percentil $99.5\%$ a **metros reales** (multiplicando por $10$) o a **grados** para que puedas interpretarlo físicamente de un vistazo.
 
 | Dominio / Formulación | Componente | p50 | p95 | p99.5 | Máximo Absoluto | Equivalente Físico (p99.5) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Kinematic — Acumulada $k=1$** | $|\Delta x_s|$ | 0.0133 | 0.0178 | 0.0203 | 0.0220 | 0.203 m |
-| **Kinematic — Acumulada $k=8$** | $|\Delta x_s|$ | 0.1003 | 0.1364 | 0.1492 | 0.1653 | 1.492 m |
-| **Kinematic — Incremental $\delta T_k$ ($\forall k$)** | $|\delta x_s|$ | 0.0131 | 0.0177 | 0.0196 | 0.0220 | 0.196 m ($\Delta t=0.1$ s) |
-| **Kinematic — Incremental $\delta T_k$ ($\forall k$)** | $|\delta y_s|$ | 0.0047 | 0.0138 | 0.0189 | 0.0234 | 0.189 m ($\Delta t=0.1$ s) |
-| **Kinematic — Incremental $\delta T_k$ ($\forall k$)** | $|\delta z_s|$ | 0.0000 | 0.0104 | 0.0160 | 0.0221 | 0.160 m ($\Delta t=0.1$ s) |
-| **Kinematic — Incremental $\delta T_k$ ($\forall k$)** | $|\delta \psi|$ [rad] | 0.0289 | 0.1363 | 0.1942 | 0.9267 | 11.13° ($\Delta t=0.1$ s) |
-| **PX4 SITL — Acumulada $k=8$** | $|\Delta x_s|$ | 0.1053 | 0.2317 | 0.2939 | 0.3313 | 2.939 m |
-| **PX4 SITL — Incremental $\delta T_k$ ($\forall k$)** | $|\delta x_s|$ | 0.0127 | 0.0307 | 0.0392 | 0.0438 | 0.392 m ($\Delta t=0.1$ s) |
-| **PX4 SITL — Incremental $\delta T_k$ ($\forall k$)** | $|\delta y_s|$ | 0.0068 | 0.0213 | 0.0353 | 0.0493 | 0.353 m ($\Delta t=0.1$ s) |
-| **PX4 SITL — Incremental $\delta T_k$ ($\forall k$)** | $|\delta z_s|$ | 0.0008 | 0.0120 | 0.0200 | 0.0311 | 0.200 m ($\Delta t=0.1$ s) |
-| **PX4 SITL — Incremental $\delta T_k$ ($\forall k$)** | $|\delta \psi|$ [rad] | 0.0176 | 0.1392 | 0.2831 | 0.2988 | 16.22° ($\Delta t=0.1$ s) |
-| **Tube Augmentation ($\gamma=0.70$)** | $|\delta x_s|, |\delta y_s|$ | 0.0122 | 0.0200 | 0.0263 | 0.0357 | Cota física $\le 0.65$ m ($6.5$ m/s) |
+| **Kinematic - Acumulada $k=1$** | $\vert \Delta x_s \vert$ | 0.0133 | 0.0178 | 0.0203 | 0.0220 | 0.203 m |
+| **Kinematic - Acumulada $k=8$** | $\vert \Delta x_s \vert $ | 0.1003 | 0.1364 | 0.1492 | 0.1653 | 1.492 m |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x_s \vert $ | 0.0131 | 0.0177 | 0.0196 | 0.0220 | 0.196 m ($\Delta t=0.1$ s) |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y_s \vert $ | 0.0047 | 0.0138 | 0.0189 | 0.0234 | 0.189 m ($\Delta t=0.1$ s) |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z_s \vert $ | 0.0000 | 0.0104 | 0.0160 | 0.0221 | 0.160 m ($\Delta t=0.1$ s) |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert $ [rad] | 0.0289 | 0.1363 | 0.1942 | 0.9267 | 11.13° ($\Delta t=0.1$ s) |
+| **PX4 SITL - Acumulada $k=8$** | $\vert \Delta x_s \vert $ | 0.1053 | 0.2317 | 0.2939 | 0.3313 | 2.939 m |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x_s \vert $ | 0.0127 | 0.0307 | 0.0392 | 0.0438 | 0.392 m ($\Delta t=0.1$ s) |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y_s \vert $ | 0.0068 | 0.0213 | 0.0353 | 0.0493 | 0.353 m ($\Delta t=0.1$ s) |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z_s \vert $ | 0.0008 | 0.0120 | 0.0200 | 0.0311 | 0.200 m ($\Delta t=0.1$ s) |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert $ [rad] | 0.0176 | 0.1392 | 0.2831 | 0.2988 | 16.22° ($\Delta t=0.1$ s) |
+| **Tube Augmentation ($\gamma=0.70$)** | $\vert \delta x_s\vert, \vert\delta y_s \vert $ | 0.0122 | 0.0200 | 0.0263 | 0.0357 | Cota física $\le 0.65$ m ($6.5$ m/s) |
 
 ![Comparación Acumulada vs Incremental](assets/exploration/exp1_cumulative_vs_incremental_bounds.png)
 
-### 3.3 Cómo interpretar la gráfica y qué queda demostrado
+### 3.3 Cómo interpretar la gráfica y qué se observa
 - **Gráfica Izquierda (Acción Acumulada $T_{EA}^{(t,k)}$):** Observa cómo a medida que nos alejamos en el eje horizontal desde el paso $k=1$ hasta el paso $k=8$, las curvas suben en rampa empinada: en cinemático pasan de $0.203\text{ m}$ ($k=1$) a $1.492\text{ m}$ ($k=8$), y en PX4 SITL llegan hasta **$2.939\text{ m}$** en $k=8$.
-- **Gráfica Derecha (Incremento Paso a Paso $\delta T_k$):** Al transformar las acciones a incrementos entre pasos consecutivos, **las curvas se vuelven líneas horizontales perfectamente planas** de $k=1$ a $k=8$ ($0.196\text{ m}$ en cinemático y $0.392\text{ m}$ en SITL). La línea punteada roja muestra el límite físico máximo que puede alcanzar un paso de recuperación de *Tube Augmentation* ($0.075$ en escala $s=0.1$, que equivale a $0.75\text{ m}$ por paso o $7.5\text{ m/s}$, cubriendo con margen la cota dura de $6.5\text{ m/s}$ fijada en `bag_to_heterodata.py`).
+- **Gráfica Derecha (Incremento Paso a Paso $\delta T_k$):** Al transformar las acciones a incrementos entre pasos consecutivos, **las curvas se mantienen casi planas** de $k=1$ a $k=8$ ($0.196\text{ m}$ en cinemático y $0.392\text{ m}$ en SITL). La línea punteada roja muestra una referencia exploratoria ($0.075$ en escala $s=0.1$, que equivale a $0.75\text{ m}$ por paso o $7.5\text{ m/s}$, cubriendo la cota de $6.5\text{ m/s}$ fijada en `bag_to_heterodata.py`).
 
-> [!IMPORTANT]
-> **Justificación de la Decisión 1 (`ActionBounds4DoF`):**
-> Queda demostrado empíricamente que parametrizar el aprendizaje sobre los incrementos $\delta T_k$ elimina el desbalance de $8\times$ entre el inicio y el final del horizonte. Fijamos como cotas universales de normalización en [`ActionBounds4DoF`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py):
-> - `max_dx_scaled = 0.075` ($\pm 0.75\text{ m}$ por paso de $0.1\text{ s}$) y `max_dy_scaled = 0.075` ($\pm 0.75\text{ m}$ por paso).
-> - `max_dz_scaled = 0.050` ($\pm 0.50\text{ m}$ verticales por paso).
-> - `max_dyaw_rad = 0.650` ($\pm 0.65\text{ rad} \approx \pm 37.2^\circ$ por paso).
-> Con estas cotas, el $100\%$ de los pasos nominales y de recuperación *Tube Augmentation* quedan contenidos en $[-1, 1]$ sin recortar (*clipping*) ninguna maniobra legítima.
+> [!NOTE]
+> **Observación sobre `ActionBounds4DoF` (Alcance Exploratorio - A Revisar en el Hito 4):**
+> Los datos muestran que trabajar sobre incrementos $\delta T_k$ mantiene una escala uniforme entre $k=1$ y $k=8$, a diferencia de las poses acumuladas $T_{EA}^{(t,k)}$. Para poder ejecutar las pruebas rápidas de este reporte se definieron en [`ActionBounds4DoF`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py) cotas auxiliares tomadas de este corpus (`0.075` en $X/Y$, `0.050` en $Z$ y `0.65 rad` en $\psi$ por paso de $0.1\text{ s}$).
+> **Importante:** Estos valores provienen de la distribución de este dataset concreto y **no representan un patrón fijo para la red final**. Aplicar un recorte duro (`clip=True`) con umbrales ajustados al dataset actual podría limitar maniobras futuras con mayor velocidad de giro o ascenso; en el Hito 4 conviene revisar un esquema más general (por ejemplo, normalización mediante la escala de ruido $\sigma_k$ del *schedule* de difusión, estadísticos calculados dinámicamente del split de entrenamiento sin *clipping* duro en inferencia, o límites físicos del vehículo).
 
 ---
 
@@ -227,14 +259,13 @@ Como vimos en la Sección 0.3, la etapa final $\psi$ de la red neuronal no escup
    $$\Delta\mathbf{p}_r^i = \left(R_* - R_{\text{curr}}\right) \mathbf{p}_g^i$$
 
 **¿Cómo reconstruimos una matriz rígida $4 \times 4$ a partir de las predicciones de la red?**
-- Para la **nueva posición del dron ($\mathbf{t}_{\text{new}}$)**, simplemente promediamos el flujo de traslación predicho por los 6 puntos y se lo sumamos a la posición actual:
+- Para la **nueva posición del dron ($\mathbf{t}_{\text{new}}$)**, promediamos el flujo de traslación predicho por los 6 puntos y se lo sumamos a la posición actual:
   $$\mathbf{t}_{\text{new}} = \mathbf{t}_{\text{curr}} + \frac{1}{6} \sum_{i=1}^{6} \Delta\hat{\mathbf{p}}_t^i$$
 - Para la **nueva orientación ($R_{\text{new}}$)**, tomamos dónde estarían las 6 puntas de la cruceta después de aplicarles el flujo rotacional predicho ($\mathbf{q}_i = R_{\text{curr}} \mathbf{p}_g^i + \Delta\hat{\mathbf{p}}_r^i$) y buscamos la matriz de rotación rígida que mejor alinee la cruceta original $\{\mathbf{p}_g^i\}$ con los puntos movidos $\{\mathbf{q}_i\}$.
 
-**El peligro del SVD 6-DoF clásico frente a nuestra solución SVD 4-DoF Horizontal FLU:**
-- El algoritmo estándar de alineación 3D (llamado **SVD de Kabsch-Arun en 6-DoF**) busca cualquier rotación 3D libre en $SO(3)$. Pero las predicciones de una red neuronal nunca son perfectas: si la red se equivoca por apenas $1$ o $2\text{ cm}$ en la altura $Z$ del punto de la nariz ($\mathbf{p}_g^1$) respecto al de la cola ($\mathbf{p}_g^2$), el SVD 6-DoF clásico interpreta que el dron **se inclinó hacia arriba o hacia abajo (*pitch*) o de costado (*roll*)**.
-- Eso violaría nuestra regla fundamental de que todas las acciones viven en el marco nivelado **Horizontal FLU** ($\text{roll}=0, \text{pitch}=0$).
-- Por eso implementamos en [`align_keypoints_svd_horizontal_flu()`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py) una **proyección analítica exacta en 4-DoF ($SE(2) \times \mathbb{R}$)**: proyectamos las puntas de la cruceta al plano horizontal $(X, Y)$, calculamos la matriz de covarianza planar $H_{2\times 2} = \sum_{i=1}^6 \mathbf{p}_{g, xy}^i (\mathbf{q}_{xy}^i)^\top$ y extraemos directamente el ángulo de rumbo óptimo en forma cerrada:
+**Comparación entre SVD 6-DoF libre y SVD 4-DoF proyectado a Horizontal FLU:**
+- El algoritmo estándar de alineación 3D (llamado **SVD de Kabsch-Arun en 6-DoF**) busca cualquier rotación 3D libre en $SO(3)$. Si las predicciones de los 6 puntos tienen pequeñas discrepancias independientes (por ejemplo $1$ o $2\text{ cm}$ en la altura $Z$ del punto de la nariz $\mathbf{p}_g^1$ respecto al de la cola $\mathbf{p}_g^2$), el SVD 6-DoF interpreta esa diferencia como una inclinación en *pitch* o *roll*.
+- Dado que en este sistema las acciones están definidas sobre el marco nivelado **Horizontal FLU** ($\text{roll}=0, \text{pitch}=0$), implementamos en [`align_keypoints_svd_horizontal_flu()`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py) una **proyección analítica en 4-DoF ($SE(2) \times \mathbb{R}$)**: proyectamos las puntas de la cruceta al plano horizontal $(X, Y)$, calculamos la matriz de covarianza planar $H_{2\times 2} = \sum_{i=1}^6 \mathbf{p}_{g, xy}^i (\mathbf{q}_{xy}^i)^\top$ y extraemos el ángulo de rumbo óptimo en forma cerrada:
   $$\Delta\psi_{\text{new}} = \text{atan2}\!\left(H_{xy} - H_{yx},\; H_{xx} + H_{yy}\right), \quad R_{\text{new}} = R_z(\Delta\psi_{\text{new}}) = \begin{bmatrix} \cos\Delta\psi_{\text{new}} & -\sin\Delta\psi_{\text{new}} & 0 \\ \sin\Delta\psi_{\text{new}} & \cos\Delta\psi_{\text{new}} & 0 \\ 0 & 0 & 1 \end{bmatrix}$$
 
 ### 4.2 Resultados de las 3 Pruebas Matemáticas (sobre 12 Episodios Reales)
@@ -256,24 +287,24 @@ Como vimos en la Sección 0.3, la etapa final $\psi$ de la red neuronal no escup
 | **SVD 4-DoF Proyectado (`align_keypoints_svd_horizontal_flu`)** | **`0.00°`** | **`0.00°`** | **`0.00°`** | **`1.887°`** |
 
 > [!TIP]
-> **Qué queda demostrado y por qué justifica nuestra decisión:**
-> 1. Todas nuestras fórmulas de conversión entre poses acumuladas, incrementos $\delta T_k$ y flujos de 6 keypoints son **matemáticamente reversibles sin pérdida de información** (el error de $\sim 10^{-7}\text{ m}$ es simplemente la precisión límite de los números `float32` en una computadora).
-> 2. Si usáramos el SVD 6-DoF estándar del paper original, un error mínimo de $2\text{ cm}$ en la red neuronal inventaría inclinaciones falsas de hasta **`10.70°`** de *roll/pitch*, inclinando artificialmente el marco del dron en mitad del bucle DDIM. Nuestro `align_keypoints_svd_horizontal_flu` garantiza **`0.00°` de inclinación espuria** manteniendo exactamente la misma precisión en el giro de rumbo ($1.887^\circ$).
+> **Lectura de la prueba geométrica:**
+> 1. Las conversiones entre poses acumuladas, incrementos $\delta T_k$ y flujos de 6 keypoints son numéricamente reversibles dentro de la precisión `float32` ($\sim 10^{-7}\text{ m}$).
+> 2. Mientras las acciones se formulen en el marco nivelado `Horizontal FLU` ($\text{roll}=0, \text{pitch}=0$), el SVD 6-DoF libre traduce pequeños ruidos de predicción ($2\text{ cm}$) en inclinaciones aparentes de hasta **`10.70°`**, mientras que `align_keypoints_svd_horizontal_flu` mantiene la actualización restringida al subgrupo planar + altitud ($SE(2) \times \mathbb{R}$) con el mismo error medio en rumbo.
 
 ---
 
 ## 5. Experimento 3: Evaluación en Lazo Cerrado Cinemático, Horizonte $T_{\text{exec}}$ y *Context-Swap*
 
 ### 5.1 ¿Qué dudas queremos resolver en este experimento?
-Este experimento responde directamente a tres de tus preguntas iniciales:
-1. **Tu Duda 4 (Evaluador Cinemático Ideal en Lazo Cerrado):** ¿Es viable construir un simulador cinemático ideal en Python puro (sin esperar a Gazebo ni a los controladores PID de PX4) donde el dron avance exactamente a la pose predicha, genere su propio LiDAR sintético en cada paso y sea auditado por el validador geométrico oficial `validate_episode_data()`?
-2. **Tu Duda 3 (Horizonte de Ejecución $T_{\text{exec}}$):** De los 8 pasos que predice la red en cada inferencia, ¿da lo mismo recalcular la predicción en cada paso ($T_{\text{exec}}=1$), a mitad de camino ($T_{\text{exec}}=4$) o recién al llegar al octavo paso ($T_{\text{exec}}=8$)?
-3. **Validación del Dataset y del Aprendizaje en Contexto:** ¿Son suficientes los datos guardados en `heterodata.pt` para que una red neuronal vuele un circuito completo de principio a fin sin chocar y cambie su decisión de vuelo cuando le cambiamos las demostraciones de contexto?
+Este experimento aborda tres preguntas prácticas de integración:
+1. **Tu Duda 4 (Evaluador Cinemático Ideal en Lazo Cerrado):** ¿Es viable construir un simulador cinemático ideal en Python puro (sin esperar a Gazebo ni a los controladores PID de PX4) donde el dron avance a la pose predicha, genere su propio LiDAR sintético en cada paso y sea auditado por el validador geométrico `validate_episode_data()`?
+2. **Tu Duda 3 (Horizonte de Ejecución $T_{\text{exec}}$):** De los pasos que predice la red en cada inferencia, ¿cómo cambia el comportamiento al recalcular la predicción en cada paso ($T_{\text{exec}}=1$), a mitad de camino ($T_{\text{exec}}=4$) o al final del horizonte ($T_{\text{exec}}=8$)?
+3. **Chequeo del Flujo de Datos del Dataset:** ¿Conectan correctamente los tensores guardados en `heterodata.pt` con un bucle de entrenamiento e inferencia en lazo cerrado?
 
 ---
 
-### 5.2 Parte A — Control de Cordura con `OracleReplayPolicy` (0% Error de Red)
-**¿Qué hicimos aquí?** Antes de probar una red neuronal, creamos una política "Oráculo" (`OracleReplayPolicy`) que lee las acciones perfectas $T_{EA}^{(t, 1..8)}$ del dataset y las entrega como si fuera la red neuronal. La pusimos a volar en lazo cerrado en el circuito `task_0006` (4 obstáculos + plataforma de aterrizaje) probando los cuatro horizontes de replanificación $T_{\text{exec}} \in \{1, 2, 4, 8\}$.
+### 5.2 Parte A - Control de Cordura con `OracleReplayPolicy` (0% Error de Red)
+**¿Qué hicimos aquí?** Antes de probar una red neuronal, creamos una política "Oráculo" (`OracleReplayPolicy`) que lee las acciones de referencia $T_{EA}^{(t, 1..8)}$ del dataset y las entrega con el mismo formato de salida que tendrá la red. La evaluamos en lazo cerrado en el circuito `task_0006` (4 obstáculos + plataforma de aterrizaje) probando cuatro horizontes de replanificación $T_{\text{exec}} \in \{1, 2, 4, 8\}$.
 
 | Horizonte de Ejecución ($T_{\text{exec}}$) | Veredicto `validate_episode_data` | Estado de Misión | Pasos Ejecutados ($10\text{ Hz}$) | Llamadas a la Política | ADE [m] | FDE [m] |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -282,14 +313,14 @@ Este experimento responde directamente a tres de tus preguntas iniciales:
 | **`T_exec = 4`** | `accepted` | `valid` | 235 | 59 | 0.00000 | 0.05159 |
 | **`T_exec = 8`** | `accepted` | `valid` | 235 | 30 | 0.00000 | 0.05159 |
 
-**¿Qué demuestra esta tabla?**
-- El error `ADE = 0.00000 m` y `FDE = 0.05159 m` (distancia al centro de la plataforma en el instante exacto en que `flight_state` activa el aterrizaje dentro del radio de $0.50\text{ m}$) con veredicto **`accepted`** en los 4 casos demuestra que **el contrato de salida de la política, la composición de poses en `Horizontal FLU`, el interpolador PCHIP a $50\text{ Hz}$ y el validador geométrico encajan con precisión matemática absoluta**.
-- Observa la columna `Llamadas a la Política`: con $T_{\text{exec}} = 1$ necesitamos llamar a la red $235$ veces para completar los $23.5\text{ s}$ del circuito; con **$T_{\text{exec}} = 4$** necesitamos solo **$59$ llamadas** ($4\times$ menos cómputo) obteniendo exactamente el mismo vuelo.
+**¿Qué verifica esta tabla?**
+- El error `ADE = 0.00000 m` y `FDE = 0.05159 m` (distancia al centro de la plataforma en el instante en que `flight_state` activa el aterrizaje dentro del radio de $0.50\text{ m}$) con veredicto **`accepted`** en los 4 casos confirma que **el formato de salida de la política, la composición de poses en `Horizontal FLU`, el interpolador PCHIP a $50\text{ Hz}$ y el validador geométrico son mutuamente consistentes**.
+- En la columna `Llamadas a la Política`: con $T_{\text{exec}} = 1$ se invoca la política $235$ veces para completar los $23.5\text{ s}$ del circuito, frente a **$59$ llamadas** con $T_{\text{exec}} = 4$ ($4\times$ menos invocaciones).
 
 ---
 
-### 5.3 Parte B — Vuelo Autónomo en Lazo Cerrado con `MiniInstantPolicyNet` (task_0006)
-**¿Qué hicimos aquí?** Entrenamos nuestra red neuronal validadora ligera `MiniInstantPolicyNet` (`d_model=64`) en CPU durante 41.39 segundos (la pérdida de entrenamiento bajó limpiamente de `0.8214` a `0.0332`). Luego soltamos al dron desde el punto de despegue en el simulador en lazo cerrado sobre `task_0006` (un circuito exigente de $27\text{ m}$ con 4 obstáculos donde **tres de ellos son puertas cuadradas `square_gate` que requieren maniobras distintas**), dejando que **únicamente la red neuronal** conduzca al dron hasta la plataforma de aterrizaje.
+### 5.3 Parte B - Prueba Exploratoria de Ajuste Rápido con `MiniInstantPolicyNet` (task_0006)
+**¿Qué hicimos aquí?** Como prueba funcional del flujo de gradientes y tensores, sobre-ajustamos (`overfit`) la red validadora ligera `MiniInstantPolicyNet` (`d_model=64`) en CPU durante 41.39 segundos sobre un único episodio de `task_0006` (la pérdida bajó de `0.8214` a `0.0332`). Luego evaluamos ese mismo episodio en el simulador cinemático en lazo cerrado variando $T_{\text{exec}}$ y $K$:
 
 | Pasos DDIM ($K$) | Horizonte $T_{\text{exec}}$ | Veredicto Validador | Llamadas a Red | Latencia Media [ms] | ADE [m] | FDE (Error al Landing Pad) [m] |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -300,91 +331,73 @@ Este experimento responde directamente a tres de tus preguntas iniciales:
 | **$K = 1$** | **$T_{\text{exec}} = 4$** | `rejected` | 54 | 6.20 ms | 1.7344 | **0.9117** |
 | **$K = 4$** | **$T_{\text{exec}} = 4$** | `rejected` | 55 | 12.29 ms | 1.5528 | **0.0985** |
 
-**Cómo interpretar estos resultados (y qué nos enseñan sobre la arquitectura):**
-1. **Por qué $T_{\text{exec}} = 1$ falla (`FDE = 5.3763 m`) mientras que $T_{\text{exec}} = 4$ llega al centro de la plataforma (`FDE = 0.0985 m`):**
-   - Si replanificamos en cada paso individual ($T_{\text{exec}} = 1$, cada $0.1\text{ s}$), cualquier pequeña oscilación de la red reinicia el arco de giro y el dron acumula deriva hasta terminar a $5.38\text{ m}$ de la meta.
-   - En cambio, cuando el dron ejecuta un tramo coherente de **$T_{\text{exec}} = 4$ pasos** ($0.4\text{ s}$) y usa **$K = 4$ pasos de refinamiento DDIM**, completa los $27\text{ m}$ del circuito y aterriza a solo **`0.0985 m` ($9.8\text{ cm}$) del centro exacto del *landing pad*** invirtiendo `12.29 ms` por llamada (o `7.66 ms` con $K=2$, llegando a `0.56 m`).
-2. **¿Por qué la columna `Veredicto Validador` marca `rejected` aunque el dron llegó a $9.8\text{ cm}$ de la meta?**
-   - Mira el **Panel Central** de la figura de abajo: la línea verde (`MiniInstantPolicyNet`) sigue fielmente a la demostración (línea negra punteada) al cruzar `landmark_1 (square_gate)` y al esquivar `landmark_2 (pole)`, y llega directo a la meta final en $(X=27.3\text{ m}, Y=0\text{ m})$.
-   - Sin embargo, al pasar por `landmark_3 (square_gate)` y `landmark_4 (square_gate)`, la red validadora pequeña recorta la amplitud del slalom (pasa a $\sim 1\text{ m}$ en vez de abrirse hasta $Y=-2\text{ m}$ y $Y=+3\text{ m}$), por lo que el juez geométrico estricto `validate_episode_data()` rechaza el margen lateral en esos dos obstáculos.
-   - **¿Por qué ocurrió ese recorte?** Porque en `task_0006` los obstáculos 1, 3 y 4 son **tres puertas cuadradas geométricamente idénticas** (`square_gate`), pero en la primera hay que ir al centro, en la tercera a la derecha y en la cuarta a la izquierda. Este diagnóstico visual fue el que nos permitió descubrir el problema de ***aliasing* perceptual secuencial** explicado abajo en el **Hallazgo 2**.
+**Lectura exploratoria de esta tabla (sin extrapolar valores óptimos a la red final):**
+1. **Sensibilidad observada ante la ventana de replanificación ($T_{\text{exec}}$):**
+   - En esta red pequeña, replanificar en cada paso individual ($T_{\text{exec}} = 1$, cada $0.1\text{ s}$) amplificó pequeñas oscilaciones de predicción (`FDE = 5.3763 m`), mientras que ejecutar un tramo intermedio ($T_{\text{exec}} = 4$ pasos $= 0.4\text{ s}$, con $K = 4$) redujo el desvío al final del episodio (`FDE = 0.0985 m`). Cómo se comportará este compromiso en la red final dependerá de su suavidad y de su horizonte $T$, por lo que conviene volver a medirlo en el Hito 4.
+2. **Por qué el validador marcó `rejected` a pesar del bajo FDE:**
+   - En el **Panel Central** de la figura inferior se observa que la trayectoria de `MiniInstantPolicyNet` cruza `landmark_1 (square_gate)`, esquiva `landmark_2 (pole)` y alcanza la plataforma final, pero recorta la amplitud lateral en `landmark_3` y `landmark_4` (ambas puertas cuadradas con maniobras distintas de slalom), incumpliendo el margen de seguridad de `validate_episode_data()`. Esto refleja las limitaciones de una red exploratoria de 1 capa ajustada rápidamente sobre un solo episodio.
 
 ---
 
-### 5.4 Parte C — Prueba de Condicionamiento en Contexto (*Context-Swap Test*)
-**¿Qué hicimos aquí?** Queríamos comprobar que la red neuronal **realmente mira las demostraciones de contexto** para decidir qué maniobra hacer, en lugar de reaccionar siempre igual ante un obstáculo. Para ello:
-- Congelamos al dron exactamente en el mismo punto $(X = 2.15\text{ m}, Y = -0.25\text{ m})$ aproximándose a una puerta cuadrada (`square_gate` ubicada hacia $Y \approx -1.0\text{ m}$), con **exactamente la misma nube LiDAR $O_t$, la misma velocidad y los mismos pesos de la red neuronal**.
-- Cambiamos **únicamente las 2 demostraciones de contexto** inyectadas a la red:
-  1. Primero le inyectamos el contexto de `task_0079`, donde las demostraciones esquivan la puerta por la **izquierda (`slalom(side=left)`)**.
-  2. Luego le inyectamos el contexto de `task_0118`, donde las demostraciones **atraviesan la puerta por el centro (`traverse (center)`)**.
-  3. Finalmente le inyectamos el contexto de `task_0171`, donde las demostraciones esquivan la puerta por la **derecha (`slalom(side=right)`)**.
+### 5.4 Parte C - Sonda Sintética de Condicionamiento en Contexto (*Context-Swap* sobre 3 Muestras)
+**¿Qué hicimos aquí?** Para comprobar que el canal de entrada de contexto está cableado de punta a punta con la predicción de waypoints, armamos una sonda mínima con **solo 3 muestras estáticas** frente a una puerta cuadrada desde el mismo punto $(X = 2.15\text{ m}, Y = -0.25\text{ m})$ y la misma nube $O_t$, inyectando contextos correspondientes a tres maniobras (`task_0079` izquierda, `task_0118` centro, `task_0171` derecha):
 
 | Tarea de Contexto Inyectada | Primitiva Demostrada en el Contexto | $\Delta X$ Predicho ($k=8$) [m] | $\Delta Y$ Lateral Predicho ($k=8$) [m] | Comportamiento Observado en la Gráfica |
 | :--- | :--- | :---: | :---: | :--- |
-| **`task_0079`** | `slalom(side=left)` | `+1.264 m` | **`+2.065 m`** | Curva Azul: Viraje franco a Babor (+Y, esquive por la izquierda) |
-| **`task_0118`** | `traverse (center)` | `+1.621 m` | **`-0.746 m`** | Curva Verde: Avance rápido (+1.62 m en X) alineándose al centro de la puerta |
-| **`task_0171`** | `slalom(side=right)` | `+1.169 m` | **`-1.250 m`** | Curva Roja: Viraje pronunciado a Estribor (-Y, esquive por fuera a la derecha) |
+| **`task_0079`** | `slalom(side=left)` | `+1.264 m` | **`+2.065 m`** | Curva Azul: Desplazamiento hacia +Y (izquierda) |
+| **`task_0118`** | `traverse (center)` | `+1.621 m` | **`-0.746 m`** | Curva Verde: Avance frontal en +X hacia la abertura |
+| **`task_0171`** | `slalom(side=right)` | `+1.169 m` | **`-1.250 m`** | Curva Roja: Desplazamiento hacia -Y (derecha) |
 
 ![Resultados Overfit, Rollout y Context-Swap](assets/exploration/exp3_overfit_rollout_and_context_swap.png)
 
 **Cómo leer los 3 paneles de la figura superior:**
-- **Panel Izquierdo (Curva de Aprendizaje):** Muestra cómo cae el error (Loss) en escala logarítmica desde `0.82` hasta `0.03` durante el entrenamiento en CPU, confirmando que los gradientes fluyen sin atascos a través de las 4 etapas de la red.
-- **Panel Central (Vista Superior X-Y del Circuito `task_0006`):** La línea negra punteada es la demostración original (`episode_00`); la línea verde continua es el vuelo en lazo cerrado de `MiniInstantPolicyNet` a lo largo de los $27\text{ m}$ del circuito a través de `landmark_1` a `landmark_4` hasta la meta final.
-- **Panel Derecho (*Context-Swap Test*):** Muestra las 3 trayectorias futuras de 8 pasos que predice la red partiendo exactamente del mismo punto $(2.15, -0.25)$ cuando solo cambiamos el contexto: la **curva azul** (`slalom(left)`) dobla fuertemente hacia $+Y$ ($+2.06\text{ m}$), la **curva verde** (`traverse`) avanza rápidamente en $+X$ ($+1.62\text{ m}$) apuntando al hueco central de la puerta ($\Delta Y = -0.75\text{ m}$), y la **curva roja** (`slalom(right)`) dobla aún más a la derecha ($\Delta Y = -1.25\text{ m}$) para rodear la puerta por fuera.
+- **Panel Izquierdo:** Evolución de la pérdida de entrenamiento de `MiniInstantPolicyNet` sobre un episodio, verificando que los gradientes fluyen sin errores numéricos.
+- **Panel Central:** Comparación en planta X-Y entre la demostración (`episode_00`, línea negra punteada) y el vuelo de la red exploratoria (línea verde).
+- **Panel Derecho:** Salida de los 8 pasos futuros ante una misma observación local al intercambiar los tensores de contexto en la sonda de 3 muestras.
 
 ---
 
-### 5.5 Tres Hallazgos Arquitectónicos Clave Descubiertos en el Experimento 3 (Justificación Técnica para el Hito 4)
+### 5.5 Parches Exploratorios Usados en `MiniInstantPolicyNet` - Notas de Revisión para el Hito 4
 
-Al construir y depurar `MiniInstantPolicyNet` para que superara las pruebas 5.3 y 5.4, descubrimos **tres fenómenos matemáticos y de diseño** que no son obvios a simple vista en el paper de *Instant Policy* (porque ellos mueven un brazo robótico en espacio libre, mientras nosotros volamos un dron a alta velocidad por un circuito secuencial). Estos tres hallazgos son el mayor aporte de esta exploración para el Hito 4:
+> [!WARNING]
+> **Alcance Estricto de Esta Exploración:**
+> El propósito de `MiniInstantPolicyNet` fue comprobar rápidamente en CPU que los tensores de entrada y salida encajan entre sí sobre pruebas reducidas (1 episodio en 5.3 y 3 muestras estáticas en 5.4). Para que esa red simplificada ajustara en pocos segundos se introdujeron **varios parches heurísticos** en `simple_validation_net.py` y `exploration_suite.py`. **Estos parches NO son patrones recomendados para la red final**; se dejan registrados aquí únicamente como aspectos que conviene revisar con cuidado al diseñar el Hito 4.
 
-#### Hallazgo 1: Por qué el giro necesita un factor de amplificación (`flow_scale`)
-- **El problema en palabras simples:** Imagina que en un paso de $0.1\text{ s}$ el dron avanza $40\text{ cm}$ hacia adelante y gira $6^\circ$ ($0.10\text{ rad}$) de rumbo:
-  - El **flujo de traslación** $\Delta\mathbf{p}_t$ vale $0.40\text{ m}$ (que en escala $s=0.1$ es **$0.040$**).
-  - ¿Cuánto se mueven las puntas de la cruceta (que están a $0.5\text{ m}$ del centro, es decir, $L_g = 0.05$ en escala $s=0.1$) debido a un giro de $0.10\text{ rad}$? Por la fórmula del arco ($\text{arco} = \text{radio} \times \text{ángulo}$):
-    $$|\Delta\mathbf{p}_r| \approx L_g \times |\delta\psi| = 0.05 \times 0.10 = \mathbf{0.005}$$
-  - Es decir, el número que representa la traslación ($0.040$) es **$8$ veces más grande** que el número que representa la rotación ($0.005$). Y como la función de pérdida eleva los errores al cuadrado (MSE), **el avance pesa $8^2 = 64$ veces más que el giro durante el entrenamiento**. Sin corregir esto, la red aprende a avanzar perfecto pero deja el rumbo $\psi$ casi sin entrenar.
-- **La solución validada:** Dividimos cada componente del flujo por su escala típica característica (`flow_scale = [0.04, 0.04, 0.03, 0.012, 0.012, 0.012]`, donde los primeros 3 números normalizan la traslación $\Delta\mathbf{p}_t$ y los últimos 3 normalizan la rotación $\Delta\mathbf{p}_r$). Así, tanto avanzar como girar tienen magnitud $\sim 1.0$ dentro de la función de pérdida, y la red aprende ambos con la misma prioridad.
+#### 1. Escala entre Traslación y Rotación (`flow_scale` y `ActionBounds4DoF`)
+- **Qué se hizo en la exploración:** Al escalar el espacio por $s = 0.1$, los 6 keypoints del dron ($0.5\text{ m}$ reales) quedan a un radio $L_g = 0.05$, por lo que un giro pequeño desplaza las puntas de la cruceta numéricamente menos que una traslación típica ($\|\Delta\mathbf{p}_r\| \approx L_g |\delta\psi \vert $). En `MiniInstantPolicyNet` se aplicó un vector fijo `flow_scale = [0.04, 0.04, 0.03, 0.012, 0.012, 0.012]` y cotas `ActionBounds4DoF` con `clip=True` sacadas de los percentiles de este dataset.
+- **Limitación de ese parche:** Esos coeficientes dependen de las velocidades lineales y de giro presentes en los episodios actuales. En tareas futuras que requieran giros amplios o maniobras verticales rápidas, fijar constantes a mano o aplicar `clip=True` podría sesgar el gradiente o recortar acciones válidas.
+- **Qué revisar en el Hito 4:** Evaluar una normalización general no atada manualmente a este subconjunto - por ejemplo, escalar el objetivo por el nivel de ruido $\sigma_k$ propio del *schedule* de difusión en cada paso, o calcular estadísticos dinámicos del split de entrenamiento sin imponer *clipping* duro en inferencia.
 
-#### Hallazgo 2: *Aliasing* Perceptual en Circuitos con Obstáculos Repetidos y Tubo Estabilizador $SE(3)$ ($\gamma = 0.65$)
-- **El problema en palabras simples:** Mira el panel central de la gráfica del Experimento 3 (`task_0006`): tanto el obstáculo 3 como el obstáculo 4 son puertas cuadradas idénticas (`square_gate`). Sin embargo, en el obstáculo 3 la demostración **cruza por el centro**, mientras que en el obstáculo 4 **esquiva por la izquierda**.
-  - Si la red mira únicamente la nube LiDAR local (que solo ve $5\text{ m}$ alrededor del dron), cuando está a $2\text{ m}$ de una puerta cuadrada no tiene forma de saber si está frente a la primera puerta o frente a la segunda. En robótica esto se llama ***aliasing* perceptual** (dos lugares distintos del circuito se ven idénticos localmente).
-  - Además, en lazo cerrado, si la red se desvía $15\text{ cm}$ respecto a la línea de las demostraciones, necesita saber cómo volver suavemente al carril sin dar un volantazo brusco.
-- **La solución validada:**
-  1. Incluimos una señal de fase/progreso espacial a lo largo del episodio dentro de la codificación del nodo para desempatar obstáculos geométricamente idénticos ubicados en distintas etapas del circuito.
-  2. Durante el entrenamiento aplicamos **recuperación continua de tubo en $SE(3)$ (*On-the-Fly Tube Recovery*)**: desplazamos sintéticamente al dron fuera de la trayectoria nominal mediante una perturbación $\Delta T_{\text{pert}}(1)$ y le enseñamos a la red una trayectoria objetivo $\tilde{T}_{EA}^{(t,k)}$ cuya desviación decae exponencialmente como $\gamma^k$ con **$\gamma = 0.65$**:
-     $$\tilde{T}_{EA}^{(t, k)} = \left(\Delta T_{\text{pert}}(1)\right)^{-1} \, T_{EA}^{(t, k)} \, \Delta T_{\text{pert}}(\gamma^k)$$
-     Esto crea un "embudo invisible" alrededor de la trayectoria demostrada que devuelve al dron al centro del carril cada vez que se desvía.
+#### 2. Señal de Progreso y Coordenadas Globales (`live_pose_se3`)
+- **Qué se hizo en la exploración:** En la prueba 5.3 sobre `task_0006` (que atraviesa tres `square_gate` parecidas), `MiniInstantPolicyNet` recibió la posición global en el mapa (`pose_se3[:, :3, 3]`) y ponderó la atención según la diferencia en $X_{\text{ENU}}$ (`ctx_x - live_x`), además de sumar perturbaciones sintéticas extra al vuelo ($\gamma = 0.65$) sobre los datos ya existentes.
+- **Limitación de ese parche:** Comparar coordenadas globales de mapa (`Gazebo ENU`) entre la demostración y el dron en vivo ata la red al lugar exacto del mapa donde ocurrió el episodio, por lo que dejaría de corresponderse cuando los obstáculos cambien de ubicación o rumbo entre episodios. En cambio, la idea general de representar el **orden o progreso relativo** sí merece estudiarse diferenciando dónde se aplica: dentro de las demostraciones grabadas (índice relativo o aristas entre keyframes $l = 0 \dots L-1$) no depende del marco global, mientras que para el dron en vivo habría que evaluar alternativas egocéntricas si hicieran falta.
+- **Qué revisar en el Hito 4:** Revisar primero cuánto desambigua por sí sola la vista LiDAR 360° de $R_{\max} = 10.0\text{ m}$ (que suele abarcar obstáculos vecinos) junto con los nodos `data['aug']` ($\gamma = 0.70$) ya incluidos en `heterodata.pt`, y, si se observa ambigüedad en circuitos con tramos repetidos, evaluar mecanismos de progreso o memoria que preserven la invariancia espacial respecto al mundo.
 
-#### Hallazgo 3: Prevención del "Atajo Causal" (*Context Collapse*) en la Etapa $\varphi$
-- **El problema en palabras simples:** Cuando entrenamos con pocas tareas, si la etapa $\varphi$ le pasa directamente la observación actual del LiDAR (`sigma_live`) al cabezal de salida $\psi$ mediante una suma directa (*conexión residual*), la red descubre una "trampa": memoriza qué hacer en cada rincón del circuito mirando solo `sigma_live` e **ignora por completo las demostraciones de contexto**. Entonces, cuando haces el *Context-Swap Test* y cambias la demostración de *izquierda* a *derecha*, ¡la red sigue yendo siempre hacia el mismo lado!
-- **La solución validada:**
-  1. **Separación estricta Clave / Valor (*Key / Value*) en la atención cruzada:** Las **Claves (*Keys*)** de las demostraciones contienen únicamente *qué vio la demo* (su geometría LiDAR $\sigma$), mientras que los **Valores (*Values*)** contienen *qué acción tomó la demo* ($\delta T_{1..8}$). La observación actual del dron (`sigma_live`) actúa como la **Consulta (*Query*)** que busca qué keyframe del contexto se parece a lo que ve ahora y extrae su acción.
-  2. **Modality Dropout sobre el camino directo:** Durante el entrenamiento apagamos aleatoriamente el camino directo de `sigma_live` el $35\%$ de las veces, obligando matemáticamente a que la etapa $\varphi$ extraiga la dirección del viraje desde las demostraciones en contexto. Gracias a esto, el *Context-Swap Test* (Sección 5.4) separa limpiamente $+2.065\text{ m}$ (izquierda), $-0.746\text{ m}$ (centro) y $-1.250\text{ m}$ (derecha).
+#### 3. Separación Manual Clave/Valor, `Modality Dropout` y Anclas Sintéticas en el Test de 3 Muestras
+- **Qué ocurrió y qué parche se usó en la exploración:** En la sonda 5.4 (*Context-Swap*) se entrenó `MiniInstantPolicyNet` desde cero con **solo 3 muestras estáticas**. Con tan pocos datos, cualquier red pequeña tiende a memorizar diferencias mínimas entre las 3 entradas e ignorar el contexto. Para forzar que en ese test de juguete mirara el contexto, se separaron manualmente *Keys* y *Values*, se apagó aleatoriamente la rama de la observación actual (`live_modality_dropout`) y en `exploration_suite.py` se sobrescribió el primer keyframe como ancla sintética.
+- **Limitación de ese parche:** Tanto el problema observado como esa solución rebuscada provienen del régimen artificial de entrenar con 3 ejemplos sueltos, no necesariamente del comportamiento de la arquitectura real entrenada sobre un corpus amplio.
+- **Qué revisar en el Hito 4:** Probar primero la formulación estándar de grafos heterogéneos de *Instant Policy* (donde las acciones demostradas son nodos geométricos 3D dentro del grafo sin particiones forzadas ni apagado manual de ramas) entrenando sobre las tareas variadas del Catálogo $v2$, y recién analizar regularizaciones adicionales si en validación multi-tarea se detectara subutilización del contexto.
+
+#### 4. Otros Atajos Internos de `MiniInstantPolicyNet` (Puente Determinista desde $I_4$ y Cachés por Suma Hash)
+- **Puente interpolado determinista:** `MiniInstantPolicyNet` usó una interpolación lineal fija sobre $u \in \{0.25, 0.5, 0.75, 1.0\}$ partiendo siempre desde la identidad $I_4$, únicamente para simplificar el chequeo numérico en CPU. En el Hito 4 corresponde revisar el proceso de difusión estocástico (DDPM/DDIM) y su muestreo de ruido.
+- **Cachés por suma hash en entrenamiento:** `_patch_cache` y la deduplicación por suma de tensores en `encode_context` se agregaron solo para acelerar iteraciones repetidas sobre el mismo episodio en CPU y no son apropiados para entrenamiento general (a diferencia de cachear en inferencia la codificación de las demos fijas al comenzar un episodio de vuelo).
 
 ---
 
-## 6. Experimento 4: Resolución de Compresión de Escena ($M = 16$ vs. $M = 32$ Centroides FPS)
+## 6. Experimento 4: Exploración de Compresión de Escena ($M = 16$ vs. $M = 32$ Centroides FPS)
 
-### 6.1 ¿Qué duda queremos resolver y cómo funciona la compresión de la nube LiDAR?
-Cada barrido de nuestro sensor LiDAR sintético contiene **$N = 2048$ puntos 3D**. Si conectáramos los $2048$ puntos de cada uno de los $L=10$ keyframes de las 2 demostraciones directamente contra el dron, tendríamos más de $40{,}000$ nodos por inferencia, lo que haría imposible correr en tiempo real en CPU.
+### 6.1 ¿Qué se midió y qué precaución hay que tener con el prefiltrado usado?
+Cada barrido de nuestro sensor LiDAR sintético contiene **$N = 2048$ puntos 3D** pertenecientes a los obstáculos cercanos y a la plataforma `landing_pad` dentro del radio de $10.0\text{ m}$. Para estimar cuánta resolución espacial se pierde al comprimir la nube a $M$ centroides mediante *Farthest Point Sampling* (FPS) y vecindades $k$-NN ($k_{\text{nn}} = 16$), medimos la distancia desde los puntos de los obstáculos cercanos hasta su centroide más próximo con $M = 16$ y $M = 32$:
 
-Para comprimir la nube sin perder la geometría de los obstáculos, la etapa $\phi_e$ realiza tres pasos en [`subsample_scene_centroids_torch()`](../src/uav_ip/uav_ip/policy/simple_validation_net.py):
-1. **Filtrado priorizado de obstáculos sobre el suelo (`z_flu > -0.11`, equivalente a más de $1.1\text{ m}$ por debajo del dron):** La mayoría de los puntos del LiDAR pegan contra el piso plano, que no aporta información sobre hacia dónde esquivar. Al priorizar los puntos elevados, nos aseguramos de gastar nuestros nodos en postes, puertas y barras.
-2. **Muestreo del Punto Más Lejano (*Farthest Point Sampling*, FPS):** Elige iterativamente **$M$ puntos (centroides)** lo más separados posibles entre sí para cubrir uniformemente todos los obstáculos visibles.
-3. **Agrupación de Vecinos ($k$-NN con $k_{\text{nn}} = 16$):** Cada uno de los $M$ centroides reúne a sus $16$ puntos LiDAR más cercanos y calcula cómo están distribuidos respecto al centroide, resumiendo esa pequeña región del obstáculo en un vector de características.
-
-**La pregunta experimental es:** ¿Nos alcanza con $M = 16$ centroides o vale la pena subir a **$M = 32$ centroides**?
-
-| Configuración de Escena ($\phi_e$) | Centroides en Obstáculos Elevados (Media) | Distancia Media Obstáculo $\to$ Centroide [m] | Distancia p95 Obstáculo $\to$ Centroide [m] | Tiempo FPS + k-NN por Nube [ms] |
+| Configuración Evaluada | Centroides con `z_flu > -0.10` (Media) | Distancia Media Obstáculo $\to$ Centroide [m] | Distancia p95 Obstáculo $\to$ Centroide [m] | Tiempo FPS + k-NN por Nube [ms] |
 | :--- | :---: | :---: | :---: | :---: |
 | **`M = 16` centroides** | 14.1 / 16 | `0.237 m` | `0.387 m` | `0.85 ms` |
 | **`M = 32` centroides** | 29.9 / 32 | `0.144 m` | `0.205 m` | `1.66 ms` |
 
 > [!NOTE]
-> **Cómo leer esta tabla y por qué elegimos $M = 32$:**
-> - La columna `Distancia p95 Obstáculo -> Centroide` mide cuál es el "hueco sin cubrir" más grande dentro de un obstáculo real: con $M = 16$, hay zonas de las puertas que quedan a casi $40\text{ cm}$ (`0.387 m`) del centroide más cercano. Con **$M = 32$**, esa distancia baja casi a la mitad (**`0.205 m`** = $20.5\text{ cm}$), lo que permite distinguir con nitidez los 4 bordes de una puerta cuadrada (`square_gate`) y al mismo tiempo mantener centroides en el siguiente obstáculo al fondo.
-> - ¿Cuánto nos cuesta pasar de $M=16$ a $M=32$ en tu CPU? Apenas pasa de `1.00 ms` a **`1.66 ms`** por nube ($+0.66\text{ ms}$). Es una ganancia enorme de resolución geométrica por menos de un milisegundo.
+> **Lectura exploratoria y advertencia sobre el filtro `z_flu > -0.11`:**
+> - Pasar de $M = 16$ a $M = 32$ reduce en esta prueba la distancia p95 sin cubrir de `0.387 m` a `0.205 m` con un incremento moderado de tiempo en CPU (`1.00 ms` $\to$ `1.66 ms` por nube), lo que sugiere considerar $M \in \{16, 32, 64\}$ dentro de las opciones a evaluar en el Hito 4.
+> - **Parche exploratorio a revisar:** En [`subsample_scene_centroids_torch()`](../src/uav_ip/uav_ip/policy/simple_validation_net.py) se incluyó un corte heurístico `z_flu > -0.11` ($1.1\text{ m}$ por debajo del dron). Como [`synthetic_lidar.py`](../src/uav_ip/uav_ip/synthetic_lidar.py) **no genera piso infinito** (solo muestrea obstáculos y `landing_pad`), un corte fijo en $Z$ puede descartar puntos legítimos de la plataforma de aterrizaje cuando el dron vuela alto (p. ej. durante un `overfly` a $2.5\text{ m}$). Por ello, este corte fijo fue únicamente un supuesto exploratorio y conviene revisarlo en el Hito 4 (por ejemplo, evaluando FPS / PointNet++ sobre la nube completa sin umbral rígido en $Z$).
 
 ---
 
@@ -393,15 +406,15 @@ Para comprimir la nube sin perder la geometría de los obstáculos, la etapa $\p
 ### 7.1 ¿Qué dudas queremos resolver aquí? (Tu Duda 1 sobre Gazebo y la velocidad de la red)
 Tu primera duda fue: *"¿Puede ralentizarse Gazebo para que las demoras de cálculo en la red neuronal no perjudiquen tanto? ¿Está bien este enfoque?"*
 
-Para responder con números exactos en tu máquina (**CPU:** `x86_64`, `8` hilos de PyTorch), medimos cuánto tarda una inferencia completa variando tres factores:
-1. **El tamaño de la red:** `Small (d=64, M=16)`, `Medium (d=128, M=16)`, `Medium-Dense (d=128, M=32)` y `Large (d=256, M=32)`.
-2. **La cantidad de refinamientos internos de difusión ($K \in \{1, 2, 4, 8\}$).**
-3. **El truco clave de ingeniería: Caché de Contexto vs. Sin Caché:**
-   - Las $N_{\text{demos}} = 2$ demostraciones de contexto ($2 \times 10 = 20$ nubes LiDAR) **son fijas durante todo el vuelo**. No cambian mientras el dron vuela.
-   - **Sin Caché:** Si en cada paso de vuelo volvemos a procesar las 20 nubes LiDAR de las demostraciones con las etapas $\phi_e$ y $\sigma$, desperdiciamos el $80\%$ del tiempo de CPU recalculando siempre lo mismo.
-   - **Con Caché:** Calculamos $\phi_e + \sigma$ de las demostraciones **una única vez antes de despegar** y guardamos el resultado en memoria. Durante el vuelo, la CPU solo tiene que procesar **1 nube LiDAR** (la observación actual $O_t$) y correr el bucle $\varphi \to \psi$.
+Para tener órdenes de magnitud orientativos en tu máquina (**CPU:** `x86_64`, `8` hilos de PyTorch), medimos tiempos de ejecución sobre `MiniInstantPolicyNet` variando:
+1. **Tamaño de referencia:** `Mini (d=64, M=16)`, `Medium (d=128, M=16)`, `Medium-Dense (d=128, M=32)` y `Large (d=256, M=32)`.
+2. **Cantidad de pasos internos ($K \in \{1, 2, 4, 8\}$).**
+3. **Caché de Contexto en Inferencia vs. Recálculo Completo:**
+   - Durante un episodio de vuelo, las $N_{\text{demos}}$ demostraciones de contexto no cambian de un paso al siguiente.
+   - **Sin Caché:** Re-ejecutar $\phi_e + \sigma$ sobre todas las nubes de las demostraciones en cada ciclo de control repite trabajo idéntico.
+   - **Con Caché en Inferencia:** Codificar las demostraciones una vez al inicio del vuelo deja en el lazo de tiempo real únicamente la nube actual $O_t$ y los pasos de actualización.
 
-| Configuración del Modelo | Parámetros | Caché Contexto (1 vez/ep) | Sin Caché ($K=4$) | Con Caché ($K=1$) | Con Caché ($K=2$) | Con Caché ($K=4$) | Con Caché ($K=8$) | Aceleración por Caché |
+| Configuración Evaluada | Parámetros | Caché Contexto (1 vez/ep) | Sin Caché ($K=4$) | Con Caché ($K=1$) | Con Caché ($K=2$) | Con Caché ($K=4$) | Con Caché ($K=8$) | Aceleración por Caché |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Mini (d=64, M=16)** | `128,968` | `32.0 ms` | `32.0 ms` | `5.3 ms` | `7.1 ms` | **`10.5 ms`** | `16.6 ms` | **`3.1x`** |
 | **Medium (d=128, M=16)** | `470,920` | `22.6 ms` | `34.0 ms` | `5.6 ms` | `7.3 ms` | **`11.0 ms`** | `19.3 ms` | **`3.1x`** |
@@ -410,28 +423,34 @@ Para responder con números exactos en tu máquina (**CPU:** `x86_64`, `8` hilos
 
 ![Benchmark de Latencia en CPU](assets/exploration/exp5_cpu_latency_benchmark.png)
 
-### 7.2 Cómo se relacionan estos milisegundos con la ralentización (`--rtf`) de Gazebo
+### 7.2 Relación entre Latencia de Inferencia y Factor `--rtf` en Gazebo
 
-**La fórmula del presupuesto de tiempo disponible:**
-Cada paso del horizonte equivale a $\Delta t_{\text{paso}} = 0.10\text{ s}$ ($100\text{ ms}$) de tiempo dentro del simulador. Si replanificamos cada $T_{\text{exec}} = 4$ pasos, la red neuronal debe entregar un nuevo plan cada:
-$$\Delta t_{\text{replan, sim}} = T_{\text{exec}} \times 0.10\text{ s} = 0.40\text{ s} \; (400\text{ ms de tiempo simulado})$$
-Si además configuramos Gazebo para correr con un **Factor de Tiempo Real (*Real-Time Factor*, `RTF`)**, el tiempo real de reloj de pared ($\Delta t_{\text{wall}}$) que tiene tu CPU para calcular cada inferencia es:
-$$\Delta t_{\text{wall}} = \frac{\Delta t_{\text{replan, sim}}}{\text{RTF}} = \frac{400\text{ ms}}{\text{RTF}}$$
-- Con **`RTF = 1.0x`** (tiempo real): tienes **$400\text{ ms}$** disponibles. Nuestra configuración recomendada `Medium-Dense (d=128, M=32)` con caché y $K=4$ tarda apenas **`11.7 ms`** (¡menos del $3\%$ del tiempo disponible!).
-- Con **`RTF = 0.5x`** (cámara lenta al $50\%$, activable con `world_generator.py --rtf 0.5`): tienes **$800\text{ ms}$** disponibles por inferencia. Como el nodo de control en ROS 2 sincroniza sus pasos leyendo el reloj simulado `px4_timestamp` (y no el reloj de pared de Windows/WSL2), **ralentizar Gazebo a `RTF = 0.5x` es 100% transparente para la física de PX4** y garantiza que jamás haya retrasos de cómputo aunque la CPU esté ocupada renderizando Gazebo.
+**Presupuesto temporal según frecuencia de replanificación y `RTF`:**
+Si cada paso del horizonte dura $\Delta t_{\text{paso}} = 0.10\text{ s} \times \text{stride}$ de tiempo simulado y se replanifica cada $T_{\text{exec}}$ pasos, el margen de tiempo real de reloj de pared ($\Delta t_{\text{wall}}$) disponible para calcular una inferencia a un `RTF` dado es:
+$$\Delta t_{\text{wall}} = \frac{T_{\text{exec}} \times \Delta t_{\text{paso}}}{\text{RTF}}$$
+- Por ejemplo, con $T_{\text{exec}} = 4$ y $\Delta t_{\text{paso}} = 0.10\text{ s}$, la ventana simulada es de $400\text{ ms}$ ($400\text{ ms}$ reales a `RTF = 1.0x`, u $800\text{ ms}$ reales a `RTF = 0.5x` usando `world_generator.py --rtf 0.5`).
+- Nota: La arquitectura de grafos heterogéneos del Hito 4 tendrá distinto costo computacional que `MiniInstantPolicyNet`, por lo que estos tiempos deberán volver a medirse sobre el modelo final para elegir el par $(K, \text{RTF})$ al evaluar en PX4 SITL sincronizado con `px4_timestamp`.
 
 ---
 
-## 8. Resumen Ejecutivo: Tabla de Decisiones Cerradas para el Hito 4
+## 8. Síntesis de la Exploración: Qué Verificamos de Interfaz y Qué Queda Abierto para el Hito 4
 
-Toda esta exploración nos permite pasar a la implementación final del Hito 4 sin ninguna incógnita abierta. Cada decisión de diseño está respaldada por un experimento cuantitativo:
+Para separar lo que corresponde a contratos de datos verificados frente a lo que fueron simplificaciones temporales de la exploración, resumimos ambos grupos por separado:
 
-| Eje de Diseño | Decisión Validada Empíricamente | Qué Demostró el Experimento y Por Qué se Elige |
+### 8.1 Interfaces, Geometría y Herramientas Verificadas
+
+| Componente | Qué Se Comprobó en Esta Exploración |
+| :--- | :--- |
+| **1. Contratos de `heterodata.pt` y Cargador Dinámico** | `InContextNavigationDataset` carga episodios cinemáticos y SITL verificando formas, tipos y escalas (`s=0.1` en posiciones, rad en ángulos, m/s en `vel_flu`), y permite variar al vuelo $(L, T, \text{action\_stride}, N_{\text{demos}})$ - incluyendo `L='adaptive'` con `context_keyframe_mask` - sin regenerar `.pt`. |
+| **2. Conversión $\delta T_k \leftrightarrow T_{EA}^{(t,k)}$ y Proyección SVD 4-DoF** | La descomposición incremental mantiene escala uniforme a lo largo del horizonte con error de ida y vuelta $< 10^{-6}\text{ m}$, y `align_keypoints_svd_horizontal_flu` evita introducir *roll/pitch* espurio ante ruido en los keypoints mientras se trabaje en `Horizontal FLU`. |
+| **3. Evaluador Cinemático en Lazo Cerrado (`kinematic_rollout_eval.py`)** | Con `OracleReplayPolicy`, la composición de poses, interpolación PCHIP a $50\text{ Hz}$, generación LiDAR en vivo y auditoría con `validate_episode_data()` reproducen los vuelos de referencia (`accepted`, `ADE = 0.000 m`). |
+| **4. Soporte `--rtf` y Caché de Demostraciones en Inferencia** | `world_generator.py --rtf <float>` escala la velocidad de reloj de Gazebo manteniendo `max_step_size = 0.004s`, y precalcular la codificación de las demos al inicio del episodio reduce entre $3\times$ y $5.8\times$ el costo por ciclo de control en las pruebas medidas. |
+
+### 8.2 Aspectos Abiertos y Parches Exploratorios a Revisar en el Hito 4
+
+| Aspecto | Atajo Usado en la Exploración (`MiniInstantPolicyNet`) | Qué Revisar / Evaluar en la Red Final (Hito 4) |
 | :--- | :--- | :--- |
-| **1. Representación del Horizonte ($T=8$)** | **Entrenar sobre incrementos paso a paso $\delta T_k$ + reconstruir poses acumuladas $\prod_{m=1}^k \delta T_m$ en los nodos** | El Experimento 1 demostró que las acciones acumuladas crecen $8\times$ entre $k=1$ y $k=8$, mientras que $\delta T_k$ tiene una distribución plana e idéntica en los 8 pasos, reconstruyendo $T_{EA}^{(t,k)}$ con error $< 10^{-6}\text{ m}$ (Experimento 2). |
-| **2. Variedad Geométrica y Readout SVD** | **4-DoF Horizontal FLU ($SE(2) \times \mathbb{R}$) mediante `align_keypoints_svd_horizontal_flu`** | El Experimento 2 demostró que un ruido de solo $2\text{ cm}$ en los keypoints induce hasta $10.7^\circ$ de *roll/pitch* falso con SVD 6-DoF clásico, mientras que nuestro SVD 4-DoF mantiene $0.00^\circ$ de inclinación espuria. |
-| **3. Cotas de Normalización (`ActionBounds4DoF` y `flow_scale`)** | `$\Delta x_{\max}=\Delta y_{\max}=0.075$, $\Delta z_{\max}=0.050$, $\Delta\psi_{\max}=0.65\text{ rad}$ y `flow_scale=[0.04, 0.04, 0.03, 0.012, 0.012, 0.012]`** | Cubre el $100\%$ de las maniobras nominales y de recuperación *Tube Augmentation* (Experimento 1) y corrige la atenuación de $64\times$ del gradiente de giro frente al de traslación (Experimento 3). |
-| **4. Resolución del Codificador de Escena ($\phi_e$)** | **$M = 32$ centroides FPS priorizando obstáculos (`z_flu > -0.11`) + $k_{\text{nn}} = 16$** | El Experimento 4 demostró que $M=32$ reduce casi a la mitad los huecos sin cubrir en las puertas (`0.387 m` $\to$ `0.205 m` en p95) costando solo `1.66 ms` en CPU. |
-| **5. Capacidad de la Red (`d_model`) y Etapa $\varphi$** | **`d_model = 128` (4 cabezas, separación Clave/Valor en $\varphi$, *Modality Dropout* y tubo $\gamma=0.65$)** | El Experimento 3 demostró que esta estructura vuela el circuito completo en lazo cerrado (`FDE < 10 cm`) y cambia limpiamente de maniobra (*izquierda*, *centro*, *derecha*) al intercambiar el contexto. |
-| **6. Bucle Externo e Interno de Inferencia** | **$T_{\text{exec}} = 4$ pasos ($2.5\text{ Hz}$ de replanificación con spline PCHIP a $50\text{ Hz}$) y $K = 4$ pasos DDIM (con opción rápida $K=2$)** | El Experimento 3 demostró que $T_{\text{exec}}=4$ logra el menor error de aterrizaje reduciendo $4\times$ la cantidad de llamadas a la red respecto a $T_{\text{exec}}=1$. |
-| **7. Caché de Contexto y Sincronización SITL** | **Cachear $\phi_e + \sigma$ de las demos 1 vez al inicio del episodio + usar `--rtf 0.5` en Gazebo SITL guiado por `px4_timestamp`** | El Experimento 5 demostró que el caché acelera la red hasta $5.8\times$ (`11.7 ms` en `Medium-Dense`), usando $< 1.5\%$ del presupuesto de tiempo a `RTF = 0.5x`. |
+| **Normalización y Balance Traslación / Giro** | `flow_scale` manual y `ActionBounds4DoF` con `clip=True` ajustados a este dataset. | Revisar una formulación general sin constantes ajustadas a mano ni `clip` duro en inferencia (p. ej. normalización por el *schedule* de ruido $\sigma_k$ de difusión, estadísticos del split de `train` o límites físicos) contemplando tareas futuras con giros o ascensos más intensos. |
+| **Invariancia Espacial $SE(3)$ y Señal de Progreso** | Inyección de `live_pose_se3` global, gaussiana longitudinal `ctx_x - live_x` y tubo extra $\gamma=0.65$ al vuelo. | Revisar cómo representar el orden dentro de las demos sin pasar coordenadas globales del mapa en la consulta viva $O_t$, evaluar si `data['aug']` ($\gamma=0.70$) ya resulta suficiente y analizar alternativas egocéntricas si apareciera ambigüedad perceptual. |
+| **Propagación de Contexto ($\varphi$) y Difusión ($\psi$)** | Separación manual `Key`/`Value`, `live_modality_dropout` (sonda de 3 muestras) y puente determinista desde $I_4$. | Revisar la arquitectura estándar de grafos heterogéneos de *Instant Policy* (acciones demostradas como nodos geométricos 3D y *schedule* DDPM/DDIM estocástico) entrenando sobre la variedad de tareas del Catálogo $v2$. |
+| **Muestreo de Escena ($\phi_e$) e Hiperparámetros** | Corte fijo `z_flu > -0.11` antes de FPS y pruebas puntuales de tamaño. | Revisar el muestreo sobre la nube completa sin el corte rígido en $Z$ (que puede descartar el `landing_pad` al volar alto) y evaluar en grilla $(L, T, \text{stride}, N_{\text{demos}}, T_{\text{exec}}, K, M)$ sobre la arquitectura final (Tarea 4.5 de `PLAN_IMPLEMENTACION.md`). |

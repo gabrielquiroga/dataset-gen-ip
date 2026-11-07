@@ -6,16 +6,17 @@ Ambas politicas implementan exactamente el mismo contrato `.predict_actions(...)
   Entrada:
     - Contexto: `context_scene_pos` (N, L, 2048, 3), `context_pose_se3` (N, L, 4, 4),
                 `context_vel_flu` (N, L, 3), `context_flight_state` (N, L, 1),
-                `context_action_se3` (N, L, 8, 4, 4) / `context_delta_se3` (N, L, 8, 4, 4)
+                `context_action_se3` (N, L, T, 4, 4) / `context_delta_se3` (N, L, T, 4, 4),
+                `context_keyframe_mask` opcional (N, L) bool para `L` adaptativo.
     - Observacion actual (O_t):
                 `live_scene_pos` (1, 2048, 3), `live_pose_se3` (1, 4, 4),
                 `live_vel_flu` (1, 3), `live_flight_state` (1, 1)
   Salida (`PolicyPrediction`):
-    - `pred_action_se3`:            (8, 4, 4) poses relativas acumuladas en Horizontal FLU (s=0.1)
-    - `pred_delta_se3`:             (8, 4, 4) incrementos paso a paso δT_k en Horizontal FLU (s=0.1)
-    - `pred_flight_state`:          (8, 1)    probabilidad de vuelo activo en [0, 1]
-    - `pred_world_waypoints_enu_m`: (8, 4)    [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] en metros reales
-    - `pred_keypoint_flow`:         (8, 6, 6) flujo cartesiano desacoplado [Δp_t, Δp_r] en los 6 keypoints
+    - `pred_action_se3`:            (T, 4, 4) poses relativas acumuladas en Horizontal FLU (s=0.1)
+    - `pred_delta_se3`:             (T, 4, 4) incrementos paso a paso δT_k en Horizontal FLU (s=0.1)
+    - `pred_flight_state`:          (T, 1)    probabilidad de vuelo activo en [0, 1]
+    - `pred_world_waypoints_enu_m`: (T, 4)    [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] en metros reales
+    - `pred_keypoint_flow`:         (T, 6, 6) flujo cartesiano desacoplado [Δp_t, Δp_r] en los 6 keypoints
 """
 
 from __future__ import annotations
@@ -48,11 +49,11 @@ from .se3_diffusion_math import (
 class PolicyPrediction:
     """Estructura tipada de salida de cualquier politica de navegacion UAV Instant Policy."""
 
-    pred_action_se3: torch.Tensor  # (8, 4, 4) float32 en Horizontal FLU (s=0.1)
-    pred_delta_se3: torch.Tensor  # (8, 4, 4) float32 en Horizontal FLU (s=0.1)
-    pred_flight_state: torch.Tensor  # (8, 1) float32 en [0, 1]
-    pred_world_waypoints_enu_m: np.ndarray  # (8, 4) float32 [X_m, Y_m, Z_m, yaw_rad]
-    pred_keypoint_flow: torch.Tensor  # (8, 6, 6) float32 [dp_t, dp_r]
+    pred_action_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=0.1)
+    pred_delta_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=0.1)
+    pred_flight_state: torch.Tensor  # (T, 1) float32 en [0, 1]
+    pred_world_waypoints_enu_m: np.ndarray  # (T, 4) float32 [X_m, Y_m, Z_m, yaw_rad]
+    pred_keypoint_flow: torch.Tensor  # (T, 6, 6) float32 [dp_t, dp_r]
 
 
 def subsample_scene_centroids_torch(
@@ -63,9 +64,11 @@ def subsample_scene_centroids_torch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Submuestrea `M = num_centroids` centroides representativos de una nube LiDAR (B, N, 3)
-    y agrupa sus `K_nn = num_neighbors` vecinos locales mas cercanos para construir parches PointNet:
-      1. Prioriza puntos de obstaculos por encima del suelo (`z_flu > ground_z_cutoff_scaled`)
-         mediante Farthest Point Sampling (FPS) determinista en PyTorch puro.
+    y agrupa sus `K_nn = num_neighbors` vecinos locales mas cercanos para construir parches locales:
+      1. En esta version exploratoria aplica un filtro heuristico `z_flu > ground_z_cutoff_scaled`
+         antes de FPS. NOTA: Este corte fijo en Z es unicamente exploratorio y NO se recomienda como
+         patron fijo para la red final, ya que a gran altitud (ej. `overfly`) puede descartar puntos
+         bajos legitimos como el `landing_pad`.
       2. Extrae los `num_neighbors` vecinos mas cercanos a cada centroide y devuelve:
          - `centroids`: (B, M, 3)
          - `local_diffs`: (B, M, K_nn, 3) desplazamientos relativos (p_j - c_m)
@@ -261,20 +264,19 @@ class MiniScenePatchEncoder(nn.Module):
 
 class MiniInstantPolicyNet(nn.Module):
     """
-    Red Simple Validadora (`MiniInstantPolicyNet`) que implementa de extremo a extremo
-    las 4 etapas de Instant Policy (φ_e -> σ -> φ -> ψ) + bucle DDIM de K pasos +
-    reconstruccion rigida SVD 4-DoF en Horizontal FLU:
+    Red Simple Validadora (`MiniInstantPolicyNet`) creada exclusivamente para verificar en CPU
+    el flujo de tensores de extremo a extremo (φ_e -> σ -> φ -> ψ + readout SVD 4-DoF) durante
+    la exploracion Pre-Hito 4.
 
-      1. `scene_encoder` (φ_e): Comprime la nube LiDAR de 2048 puntos a M centroides.
-      2. `local_sigma` (σ): Propaga geometria relativa (c_m - p_g^i) desde los M nodos
-         de escena hacia los 6 nodos keypoint del dron, inyectando `vel_flu` y `flight_state`.
-      3. `context_phi` (φ): Codifica las acciones demostradas en los N_demos x L keyframes
-         de contexto y ejecuta atencion cruzada (Contexto -> 6 Keypoints Actuales),
-         formando el cuello de botella de informacion (`bottleneck`, forma [B, 6, d_model]).
-      4. `action_psi` (ψ): Condicionado en el cuello de botella, en las posiciones actuales
-         de los 8 x 6 keypoints ruidosos y en el paso de difusion k, predice el flujo
-         desacoplado [Δp_t, Δp_r, ∇s] ∈ R^7 para cada keypoint futuro y actualiza la pose
-         en SE(2) x R ⊂ SE(3) mediante `apply_keypoint_flow_and_svd_4dof`.
+    IMPORTANTE — ALCANCE EXPLORATORIO (NO COPIAR COMO PATRON DE LA RED FINAL):
+    Para converger en pocos segundos sobre pruebas minimas (1 episodio o 3 muestras), esta clase
+    incluye varios atajos ad-hoc que NO deben trasladarse sin revision a la arquitectura del Hito 4:
+      - `flow_scale` manual y `ActionBounds4DoF` con `clip=True` ajustados a este dataset.
+      - Uso opcional de `pose_se3` global y kernel gaussiano longitudinal (`ctx_x - live_x`),
+        lo cual rompe la invariancia espacial SE(3) entre episodios con obstaculos desplazados.
+      - Separacion manual `Key`/`Value` y `live_modality_dropout` pensados para el test de 3 muestras.
+      - Puente interpolado determinista desde la identidad `I_4` en lugar de un schedule DDPM/DDIM
+        estandar en se(3), y caches en memoria por suma hash para acelerar el overfit repetitivo.
     """
 
     def __init__(
@@ -284,6 +286,7 @@ class MiniInstantPolicyNet(nn.Module):
         num_centroids: int = 16,
         num_neighbors: int = 16,
         horizon: int = 8,
+        action_stride: int = 1,
         num_diffusion_steps: int = 4,
         scale_factor: float = DEFAULT_SCALE_FACTOR,
         live_modality_dropout: float = 0.0,
@@ -292,12 +295,17 @@ class MiniInstantPolicyNet(nn.Module):
         self.d_model = int(d_model)
         self.num_heads = int(num_heads)
         self.num_centroids = int(num_centroids)
-        self.horizon = int(horizon)
+        self.horizon = max(1, int(horizon))
+        self.action_stride = max(1, int(action_stride))
         self.num_diffusion_steps = int(num_diffusion_steps)
         self.scale_factor = float(scale_factor)
         self.live_modality_dropout = float(live_modality_dropout)
-        self.bounds = ActionBounds4DoF()
-        flow_scale = torch.tensor([0.04, 0.04, 0.03, 0.012, 0.012, 0.012], dtype=torch.float32)
+        self.bounds = ActionBounds4DoF.for_stride(self.action_stride)
+        s_mult = float(self.action_stride)
+        flow_scale = torch.tensor(
+            [0.04 * s_mult, 0.04 * s_mult, 0.03 * s_mult, 0.012, 0.012, 0.012],
+            dtype=torch.float32,
+        )
         self.register_buffer("flow_scale", flow_scale, persistent=False)
 
         self.pos_emb_3d = SinusoidalPosEmb3D(num_freqs=4, include_input=True)
@@ -307,10 +315,14 @@ class MiniInstantPolicyNet(nn.Module):
             num_neighbors=num_neighbors,
         )
 
-        # Embeddings de identidad para los 6 keypoints del UAV y los T=8 pasos del horizonte
+        # Embeddings de identidad para los 6 keypoints del UAV, los T pasos del horizonte y progreso continuo s_l in [0, 1]
         self.keypoint_id_emb = nn.Embedding(6, d_model)
         self.horizon_step_emb = nn.Embedding(self.horizon, d_model)
-        self.keyframe_order_emb = nn.Embedding(32, d_model)
+        self.keyframe_progress_mlp = nn.Sequential(
+            nn.Linear(16, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
         # Etapa σ (Local Scene -> 6 Agent Keypoints + propiocepcion vel_flu, flight_state y progreso espacial Fourier)
         self.proprio_proj = nn.Sequential(
@@ -341,7 +353,7 @@ class MiniInstantPolicyNet(nn.Module):
         )
         self.phi_norm = nn.LayerNorm(d_model)
 
-        # Etapa ψ (6 Bottleneck Keypoints -> 8 x 6 Noisy Action Keypoints)
+        # Etapa ψ (6 Bottleneck Keypoints -> T x 6 Noisy Action Keypoints)
         self.diff_step_mlp = nn.Sequential(
             nn.Linear(16, d_model),
             nn.GELU(),
@@ -363,16 +375,24 @@ class MiniInstantPolicyNet(nn.Module):
             nn.Linear(d_model, 7),
         )
 
+    @staticmethod
+    def _sinusoidal_scalar_features(val: torch.Tensor) -> torch.Tensor:
+        """Codificacion sinusoidal escalar para v in [0, 1] -> (N, 16)."""
+        half = 8
+        v_col = val.reshape(-1, 1)
+        freqs = torch.exp(
+            -math.log(100.0) * torch.arange(half, dtype=torch.float32, device=val.device) / max(1, half - 1)
+        )
+        args = v_col * freqs
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
     def _encode_diffusion_step(self, k_step: torch.Tensor) -> torch.Tensor:
         """Codificacion sinusoidal escalar del paso de difusion k in [0, 1] -> (B, d_model)."""
-        half = 8
-        k_col = k_step.reshape(-1, 1)
-        freqs = torch.exp(
-            -math.log(100.0) * torch.arange(half, dtype=torch.float32, device=k_step.device) / max(1, half - 1)
-        )
-        args = k_col * freqs  # (B, half)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, 16)
-        return self.diff_step_mlp(emb)
+        return self.diff_step_mlp(self._sinusoidal_scalar_features(k_step))
+
+    def _encode_keyframe_progress(self, prog: torch.Tensor) -> torch.Tensor:
+        """Codificacion continua de progreso relativo del keyframe s_l in [0, 1] -> (N, d_model) invariante a L."""
+        return self.keyframe_progress_mlp(self._sinusoidal_scalar_features(prog))
 
     def _run_sigma_local(
         self,
@@ -428,12 +448,14 @@ class MiniInstantPolicyNet(nn.Module):
         context_target_flight_state: torch.Tensor,
         keypoints_body: torch.Tensor,
         context_pose_se3: Optional[torch.Tensor] = None,
+        context_keyframe_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Precalcula y cachea las representaciones de contexto (φ_e + σ + codificacion de acciones)
-        para las `N_demos x L` observaciones demostradas.
+        para las `N_demos x L` observaciones demostradas (soportando `L` arbitrario o adaptativo).
         Acepta entrada con o sin dimension de batch:
           - `context_scene_pos`: (B, N_demos, L, 2048, 3) o (N_demos, L, 2048, 3)
+          - `context_keyframe_mask`: opcional (B, N_demos, L) o (N_demos, L) bool
         Retorna:
           - `ctx_keys`:   (B, N_demos * L * 6, d_model) claves en el espacio de observacion σ
           - `ctx_values`: (B, N_demos * L * 6, d_model) valores con la accion demostrada codificada
@@ -446,27 +468,41 @@ class MiniInstantPolicyNet(nn.Module):
             context_target_flight_state = context_target_flight_state.unsqueeze(0)
             if context_pose_se3 is not None and context_pose_se3.ndim == 4:
                 context_pose_se3 = context_pose_se3.unsqueeze(0)
+            if context_keyframe_mask is not None and context_keyframe_mask.ndim == 2:
+                context_keyframe_mask = context_keyframe_mask.unsqueeze(0)
 
         B, N_demos, L, N_pts, _ = context_scene_pos.shape
         device = context_scene_pos.device
+        if int(context_delta_4dof.shape[-2]) != self.horizon:
+            raise ValueError(
+                f"MiniInstantPolicyNet configurada con horizon={self.horizon}, "
+                f"pero context_delta_4dof tiene T={context_delta_4dof.shape[-2]}."
+            )
+
         norm_d4 = self.bounds.normalize(context_delta_4dof, clip=True)
-        demo_act_5d = torch.cat([norm_d4, context_target_flight_state], dim=-1)  # (B, N, L, 8, 5)
+        demo_act_5d = torch.cat([norm_d4, context_target_flight_state], dim=-1)  # (B, N, L, T, 5)
 
         if B > 1:
             unique_b_idx: List[int] = []
             inv_map: List[int] = []
-            seen_sigs: Dict[Tuple[float, float, float, float], int] = {}
+            seen_sigs: Dict[Tuple[float, float, float, float, int], int] = {}
             with torch.no_grad():
                 s_sum = context_scene_pos.reshape(B, -1).sum(dim=-1).detach().cpu()
                 a_sum = context_delta_4dof.reshape(B, -1).sum(dim=-1).detach().cpu()
                 a_y = context_delta_4dof[:, 0, :, :, 1].reshape(B, -1).sum(dim=-1).detach().cpu()
                 a_x = context_delta_4dof[:, 0, :, :, 0].reshape(B, -1).sum(dim=-1).detach().cpu()
+                m_sum = (
+                    context_keyframe_mask.reshape(B, -1).sum(dim=-1).detach().cpu()
+                    if context_keyframe_mask is not None
+                    else torch.full((B,), N_demos * L, dtype=torch.long)
+                )
                 for b in range(B):
                     sig = (
                         round(float(s_sum[b].item()), 3),
                         round(float(a_sum[b].item()), 5),
                         round(float(a_y[b].item()), 5),
                         round(float(a_x[b].item()), 5),
+                        int(m_sum[b].item()),
                     )
                     if sig not in seen_sigs:
                         seen_sigs[sig] = len(unique_b_idx)
@@ -488,6 +524,15 @@ class MiniInstantPolicyNet(nn.Module):
             if context_pose_se3 is not None
             else None
         )
+        if context_keyframe_mask is not None:
+            u_mask = context_keyframe_mask[unique_b_idx].to(device=device, dtype=torch.bool)  # (U, N_demos, L)
+        else:
+            u_mask = torch.ones((U, N_demos, L), dtype=torch.bool, device=device)
+
+        # Garantizar que al menos el primer keyframe sea valido en cada secuencia para evitar NaN en softmax
+        if not bool(torch.all(u_mask.any(dim=-1))):
+            u_mask = u_mask.clone()
+            u_mask[:, :, 0] = True
 
         sigma_ctx = self._run_sigma_local(
             scene_pos=u_scene,
@@ -498,34 +543,40 @@ class MiniInstantPolicyNet(nn.Module):
         )  # (U * N_demos * L, 6, d_model)
 
         act_emb = self.demo_action_encoder(u_act_flat).unsqueeze(1).expand(U_flat, 6, self.d_model)
-        l_idx = torch.arange(L, device=device).clamp(max=31)
+        l_valid_counts = u_mask.sum(dim=-1, keepdim=True).clamp(min=1).to(dtype=torch.float32)  # (U, N_demos, 1)
+        l_grid = torch.arange(L, device=device, dtype=torch.float32).view(1, 1, L)
+        prog_norm = (l_grid / (l_valid_counts - 1.0).clamp(min=1.0)).clamp(0.0, 1.0)  # (U, N_demos, L)
         l_emb = (
-            self.keyframe_order_emb(l_idx)
-            .view(1, 1, L, 1, self.d_model)
+            self._encode_keyframe_progress(prog_norm.reshape(-1, 1))
+            .view(U, N_demos, L, 1, self.d_model)
             .expand(U, N_demos, L, 6, self.d_model)
             .reshape(U_flat, 6, self.d_model)
         )
 
         u_keys = (sigma_ctx + 0.15 * l_emb).reshape(U, N_demos * L * 6, self.d_model)
         u_values = (act_emb + 0.25 * sigma_ctx).reshape(U, N_demos * L * 6, self.d_model)
+        u_token_mask = u_mask.unsqueeze(-1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6)
 
-        # Codificar coordenadas longitudinales x_s de los keyframes en los primeros 6 tokens si context_pose_se3 existe
+        # Codificar coordenadas longitudinales x_s de los keyframes si context_pose_se3 existe
         if u_pose is not None:
             u_x_kf = u_pose[:, 0, 3].reshape(U, N_demos * L, 1).expand(U, N_demos * L, 6).reshape(U, N_demos * L * 6, 1)
         else:
-            u_x_kf = torch.linspace(0.0, 2.5, steps=L, device=device).view(1, 1, L, 1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6, 1)
+            u_x_kf = torch.linspace(0.0, 2.5, steps=max(2, L), device=device)[:L].view(1, 1, L, 1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6, 1)
 
         if B > 1 and U < B:
             inv_tensor = torch.tensor(inv_map, dtype=torch.long, device=device)
             ctx_keys = u_keys[inv_tensor]
             ctx_values = u_values[inv_tensor]
             ctx_x_kf = u_x_kf[inv_tensor]
+            ctx_token_mask = u_token_mask[inv_tensor]
         else:
             ctx_keys = u_keys
             ctx_values = u_values
             ctx_x_kf = u_x_kf
-        # Adjuntar coordenada longitudinal x_s como metadato ligero mediante atributo o último canal auxiliar
+            ctx_token_mask = u_token_mask
+
         self._last_ctx_x_kf = ctx_x_kf
+        self._last_ctx_token_mask = ctx_token_mask
         return ctx_keys, ctx_values
 
     def compute_bottleneck(
@@ -537,12 +588,13 @@ class MiniInstantPolicyNet(nn.Module):
         ctx_tokens: torch.Tensor,
         ctx_values: Optional[torch.Tensor] = None,
         live_pose_se3: Optional[torch.Tensor] = None,
+        ctx_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Ejecuta φ_e + σ sobre la observacion actual O_t y luego el propagador de contexto φ
         emparejando `query = sigma_live` contra `key = ctx_keys` para extraer `value = ctx_values`
-        con ponderacion de localidad longitudinal sobre los keyframes demostrados,
-        produciendo el cuello de botella en los 6 keypoints actuales: `(B, 6, d_model)`.
+        con ponderacion de localidad longitudinal sobre los keyframes demostrados (enmascarando
+        slots de padding cuando `L` es adaptativo), produciendo `(B, 6, d_model)`.
         """
         if ctx_values is None:
             ctx_values = ctx_tokens
@@ -554,7 +606,32 @@ class MiniInstantPolicyNet(nn.Module):
             keypoints_body=keypoints_body,
             pose_se3=live_pose_se3,
         )  # (B, 6, d_model)
-        cross_ctx, _ = self.phi_cross_attn(query=sigma_live, key=ctx_tokens, value=ctx_values)
+
+        if (
+            ctx_token_mask is None
+            and hasattr(self, "_last_ctx_token_mask")
+            and self._last_ctx_token_mask is not None
+            and self._last_ctx_token_mask.shape[0] in (1, B)
+            and self._last_ctx_token_mask.shape[1] == ctx_tokens.shape[1]
+        ):
+            ctx_token_mask = self._last_ctx_token_mask
+
+        key_padding_mask: Optional[torch.Tensor] = None
+        kf_valid_mask: Optional[torch.Tensor] = None
+        if ctx_token_mask is not None:
+            tm = ctx_token_mask.to(device=sigma_live.device, dtype=torch.bool)
+            if tm.shape[0] == 1 and B > 1:
+                tm = tm.expand(B, -1)
+            kf_valid_mask = tm.reshape(B, -1, 6)[:, :, 0]
+            if not bool(torch.all(tm)):
+                key_padding_mask = ~tm
+
+        cross_ctx, _ = self.phi_cross_attn(
+            query=sigma_live,
+            key=ctx_tokens,
+            value=ctx_values,
+            key_padding_mask=key_padding_mask,
+        )
 
         # Kernel de localidad de progreso longitudinal sobre los N_demos * L keyframes
         ctx_vals_kf = ctx_values.reshape(B, -1, 6, self.d_model)  # (B, K_kf, 6, d_model)
@@ -571,10 +648,18 @@ class MiniInstantPolicyNet(nn.Module):
             live_x = live_pose_se3[:, 0, 3:4]  # (B, 1)
             # Ventana gaussiana longitudinal nitida (sigma_x = 0.07 en s=0.1, equivalente a 0.70 m)
             dist_sq = (ctx_x - live_x) ** 2
-            phase_weights = torch.softmax(-dist_sq / (2.0 * (0.07 ** 2)), dim=-1)  # (B, K_kf)
+            logits = -dist_sq / (2.0 * (0.07 ** 2))
+            if kf_valid_mask is not None:
+                logits = logits.masked_fill(~kf_valid_mask, -1e9)
+            phase_weights = torch.softmax(logits, dim=-1)  # (B, K_kf)
             local_ctx_act = torch.sum(ctx_vals_kf * phase_weights[:, :, None, None], dim=1)  # (B, 6, d_model)
         else:
-            local_ctx_act = ctx_vals_kf.mean(dim=1)
+            if kf_valid_mask is not None:
+                w = kf_valid_mask.to(dtype=ctx_vals_kf.dtype)
+                denom = w.sum(dim=1, keepdim=True).clamp(min=1.0).unsqueeze(-1)
+                local_ctx_act = (ctx_vals_kf * w[:, :, None, None]).sum(dim=1) / denom
+            else:
+                local_ctx_act = ctx_vals_kf.mean(dim=1)
 
         ctx_anchor = 0.4 * cross_ctx + 0.6 * local_ctx_act
 
@@ -601,51 +686,53 @@ class MiniInstantPolicyNet(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Etapa ψ: Propaga informacion desde los 6 nodos del cuello de botella (`bottleneck`, [B, 6, d])
-        hacia los `T=8 x 6 = 48` nodos keypoint de las acciones futuras hipotesis `curr_delta_se3`
-        (B, 8, 4, 4) en el paso de difusion `k_norm` (B, 1).
+        hacia los `T x 6` nodos keypoint de las acciones futuras hipotesis `curr_delta_se3`
+        (B, T, 4, 4) en el paso de difusion `k_norm` (B, 1).
 
         Retorna:
-          - `pred_flow_6d`: (B, 8, 6, 6) flujo cartesiano [Δp_t, Δp_r] para cada paso k=1..8
-          - `pred_flight_logits`: (B, 8, 1) logits del estado binario de vuelo s_{t+1..t+8}
+          - `pred_flow_6d`: (B, T, 6, 6) flujo cartesiano [Δp_t, Δp_r] para cada paso k=1..T
+          - `pred_flight_logits`: (B, T, 1) logits del estado binario de vuelo s_{t+1..t+T}
         """
         B = bottleneck.shape[0]
         device = bottleneck.device
 
         # Posiciones relativas de los 6 keypoints respecto al cuerpo (escaladas a O(1) para Fourier)
-        curr_cum_se3 = incremental_to_cumulative_se3(curr_delta_se3)  # (B, 8, 4, 4)
+        curr_cum_se3 = incremental_to_cumulative_se3(curr_delta_se3)  # (B, T, 4, 4)
         kp_body_exp = keypoints_body.view(1, 1, 6, 3)
-        kp_delta_rel = (transform_keypoints(curr_delta_se3, keypoints_body=keypoints_body) - kp_body_exp) / 0.04
-        kp_cum_rel = (transform_keypoints(curr_cum_se3, keypoints_body=keypoints_body) - kp_body_exp) / 0.16
+        delta_scale = 0.04 * float(self.action_stride)
+        cum_scale = 0.02 * float(self.horizon * self.action_stride)
+        kp_delta_rel = (transform_keypoints(curr_delta_se3, keypoints_body=keypoints_body) - kp_body_exp) / delta_scale
+        kp_cum_rel = (transform_keypoints(curr_cum_se3, keypoints_body=keypoints_body) - kp_body_exp) / cum_scale
 
-        emb_delta = self.pos_emb_3d(kp_delta_rel)  # (B, 8, 6, pos_dim)
-        emb_cum = self.pos_emb_3d(kp_cum_rel)  # (B, 8, 6, pos_dim)
+        emb_delta = self.pos_emb_3d(kp_delta_rel)  # (B, T, 6, pos_dim)
+        emb_cum = self.pos_emb_3d(kp_cum_rel)  # (B, T, 6, pos_dim)
 
-        h_ids = self.horizon_step_emb(torch.arange(self.horizon, device=device))[None, :, None, :]  # (1, 8, 1, d)
+        h_ids = self.horizon_step_emb(torch.arange(self.horizon, device=device))[None, :, None, :]  # (1, T, 1, d)
         kp_ids = self.keypoint_id_emb(torch.arange(6, device=device))[None, None, :, :]  # (1, 1, 6, d)
         k_emb = self._encode_diffusion_step(k_norm)[:, None, None, :]  # (B, 1, 1, d)
 
         # Inyeccion directa por keypoint i desde bottleneck[:, None, :, :] + codificacion de paso
-        node_cond = bottleneck.unsqueeze(1) + h_ids + kp_ids + k_emb  # (B, 8, 6, d)
+        node_cond = bottleneck.unsqueeze(1) + h_ids + kp_ids + k_emb  # (B, T, 6, d)
         act_in = torch.cat([emb_delta, emb_cum, node_cond], dim=-1)
         act_tokens = self.action_kp_proj(act_in).reshape(B, self.horizon * 6, self.d_model)
 
-        # Atencion cruzada desde el cuello de botella actual (6 nodos) hacia los 48 nodos de accion
+        # Atencion cruzada desde el cuello de botella actual (6 nodos) hacia los T*6 nodos de accion
         cross_out, _ = self.psi_cross_attn(query=act_tokens, key=bottleneck, value=bottleneck)
         act_tokens = act_tokens + cross_out
 
-        # Autoatencion entre los 48 nodos de accion para coherencia espacial-temporal del horizonte
+        # Autoatencion entre los T*6 nodos de accion para coherencia espacial-temporal del horizonte
         self_out, _ = self.psi_self_attn(query=act_tokens, key=act_tokens, value=act_tokens)
         act_tokens = self.psi_norm(act_tokens + self_out)
 
         raw_out = self.flow_head(act_tokens).reshape(B, self.horizon, 6, 7)
-        pred_flow_norm = raw_out[..., :6]  # (B, 8, 6, 6) en unidades O(1)
+        pred_flow_norm = raw_out[..., :6]  # (B, T, 6, 6) en unidades O(1)
         pred_flow_6d = pred_flow_norm * self.flow_scale.view(1, 1, 1, 6)
-        pred_flight_logits = raw_out[..., 6].mean(dim=-1, keepdim=True)  # Promedio sobre los 6 keypoints -> (B, 8, 1)
+        pred_flight_logits = raw_out[..., 6].mean(dim=-1, keepdim=True)  # Promedio sobre los 6 keypoints -> (B, T, 1)
         return pred_flow_6d, pred_flight_logits
 
     def compute_loss(
         self,
-        batch: Dict[str, torch.Tensor],
+        batch: Dict[str, Any],
         noise_std_pos: float = 0.020,
         noise_std_yaw: float = 0.15,
     ) -> Dict[str, torch.Tensor]:
@@ -665,6 +752,9 @@ class MiniInstantPolicyNet(nn.Module):
         ctx_pose = batch.get("context_pose_se3")
         if ctx_pose is not None:
             ctx_pose = ctx_pose.to(device)
+        ctx_mask = batch.get("context_keyframe_mask")
+        if ctx_mask is not None:
+            ctx_mask = ctx_mask.to(device)
 
         live_scene = batch["live_scene_pos"].to(device)
         if live_scene.ndim == 4 and live_scene.shape[1] == 1:
@@ -685,10 +775,10 @@ class MiniInstantPolicyNet(nn.Module):
         if kp_body.ndim == 3:
             kp_body = kp_body[0]
 
-        target_delta_se3 = batch["target_delta_se3"].to(device)  # (B, 8, 4, 4)
-        target_delta_4dof = batch["target_delta_4dof"].to(device)  # (B, 8, 4)
-        target_fs = batch["target_flight_state"].to(device)  # (B, 8, 1)
-        valid_mask = batch["target_valid_mask"].to(device)  # (B, 8)
+        target_delta_se3 = batch["target_delta_se3"].to(device)  # (B, T, 4, 4)
+        target_delta_4dof = batch["target_delta_4dof"].to(device)  # (B, T, 4)
+        target_fs = batch["target_flight_state"].to(device)  # (B, T, 1)
+        valid_mask = batch["target_valid_mask"].to(device)  # (B, T)
 
         B = target_delta_se3.shape[0]
         ctx_keys, ctx_values = self.encode_context(
@@ -699,6 +789,7 @@ class MiniInstantPolicyNet(nn.Module):
             context_target_flight_state=ctx_tfs,
             keypoints_body=kp_body,
             context_pose_se3=ctx_pose,
+            context_keyframe_mask=ctx_mask,
         )
         bottleneck = self.compute_bottleneck(
             live_scene_pos=live_scene,
@@ -719,8 +810,9 @@ class MiniInstantPolicyNet(nn.Module):
             u[:half_b, 0] = discrete_u[torch.arange(half_b, device=device) % 4]
 
         noise_4d = torch.randn_like(target_delta_4dof)
+        pos_std = noise_std_pos * float(self.action_stride)
         noise_scale = torch.tensor(
-            [noise_std_pos, noise_std_pos, noise_std_pos, noise_std_yaw],
+            [pos_std, pos_std, pos_std, noise_std_yaw],
             device=device,
             dtype=target_delta_4dof.dtype,
         )
@@ -733,7 +825,7 @@ class MiniInstantPolicyNet(nn.Module):
             T_curr=curr_delta_se3,
             T_target=target_delta_se3,
             keypoints_body=kp_body,
-        )  # (B, 8, 6, 6)
+        )  # (B, T, 6, 6)
 
         pred_flow_6d, pred_fs_logits = self.decode_action_flow_step(
             bottleneck=bottleneck,
@@ -774,9 +866,9 @@ class MiniInstantPolicyNet(nn.Module):
         Ejecuta la inferencia de dos niveles de Instant Policy para una observacion `sample`:
           1. Si `cached_context` no fue provisto, codifica las N_demos x L observaciones de contexto.
           2. Calcula el cuello de botella `bottleneck` (1, 6, d_model) UNA SOLA VEZ para O_t.
-          3. Ejecuta el bucle interno DDIM de `K = num_ddim_steps` pasos sobre los 48 nodos de
+          3. Ejecuta el bucle interno DDIM de `K = num_ddim_steps` pasos sobre los `T x 6` nodos de
              accion futura, aplicando `apply_keypoint_flow_and_svd_4dof` en cada iteracion.
-          4. Compone los incrementos `δT_{1..8}` en `T_{EA}^{(t, 1..8)}` y proyecta los waypoints
+          4. Compone los incrementos `δT_{1..T}` en `T_{EA}^{(t, 1..T)}` y proyecta los waypoints
              al marco Gazebo ENU en metros reales.
         """
         self.eval()
@@ -795,6 +887,9 @@ class MiniInstantPolicyNet(nn.Module):
         ctx_pose = sample.get("context_pose_se3")
         if ctx_pose is not None:
             ctx_pose = torch.as_tensor(ctx_pose, dtype=torch.float32, device=device)
+        ctx_mask = sample.get("context_keyframe_mask")
+        if ctx_mask is not None:
+            ctx_mask = torch.as_tensor(ctx_mask, dtype=torch.bool, device=device)
 
         if cached_context is None:
             ctx_keys, ctx_values = self.encode_context(
@@ -805,6 +900,7 @@ class MiniInstantPolicyNet(nn.Module):
                 context_target_flight_state=sample["context_target_flight_state"].to(device),
                 keypoints_body=kp_body,
                 context_pose_se3=ctx_pose,
+                context_keyframe_mask=ctx_mask,
             )
         else:
             ctx_keys, ctx_values = cached_context
@@ -838,7 +934,7 @@ class MiniInstantPolicyNet(nn.Module):
             live_pose_se3=live_pose_t,
         )
 
-        # Inicializar hipotesis incremental en identidad I_4: (1, 8, 4, 4)
+        # Inicializar hipotesis incremental en identidad I_4: (1, T, 4, 4)
         curr_delta_se3 = (
             torch.eye(4, dtype=torch.float32, device=device)
             .view(1, 1, 4, 4)
@@ -868,9 +964,9 @@ class MiniInstantPolicyNet(nn.Module):
                 step_scale=step_gain,
             )
 
-        pred_delta = curr_delta_se3[0]  # (8, 4, 4)
-        pred_action = incremental_to_cumulative_se3(pred_delta)  # (8, 4, 4)
-        pred_fs = torch.sigmoid(pred_fs_logits[0])  # (8, 1)
+        pred_delta = curr_delta_se3[0]  # (T, 4, 4)
+        pred_action = incremental_to_cumulative_se3(pred_delta)  # (T, 4, 4)
+        pred_fs = torch.sigmoid(pred_fs_logits[0])  # (T, 1)
 
         live_pose = sample["live_pose_se3"]
         if isinstance(live_pose, torch.Tensor) and live_pose.ndim == 3:
@@ -896,7 +992,7 @@ class OracleReplayPolicy:
     Dado un episodio de referencia `reference_episode`, para cualquier consulta `sample` en el
     instante `t_step`:
       1. Toma las etiquetas `delta_se3` reales del episodio (o calcula la accion relativa exacta
-         desde `live_pose_se3` hacia los futuros estados de la trayectoria de referencia).
+         desde `live_pose_se3` hacia los futuros `T` estados con paso `action_stride`).
       2. Las convierte en flujo cartesiano desacoplado `[Δp_t, Δp_r]` sobre los 6 keypoints.
       3. Las pasa por el estimador SVD 4-DoF (`apply_keypoint_flow_and_svd_4dof`) y la composicion
          incremental -> acumulada (`incremental_to_cumulative_se3`) exactamente igual que la red.
@@ -910,9 +1006,13 @@ class OracleReplayPolicy:
         self,
         reference_episode: Optional[Any] = None,
         scale_factor: float = DEFAULT_SCALE_FACTOR,
+        horizon: int = 8,
+        action_stride: int = 1,
     ) -> None:
         self.reference_episode = reference_episode
         self.scale_factor = float(scale_factor)
+        self.horizon = max(1, int(horizon))
+        self.action_stride = max(1, int(action_stride))
 
     def predict_actions(
         self,
@@ -935,14 +1035,20 @@ class OracleReplayPolicy:
             if live_pose_t.ndim == 3:
                 live_pose_t = live_pose_t[0]
 
+        stride = max(1, int(sample.get("action_stride", self.action_stride)))
         if "target_delta_se3" in sample and step_cursor is None:
             gt_delta = torch.as_tensor(sample["target_delta_se3"], dtype=torch.float32)
             gt_fs = torch.as_tensor(sample["target_flight_state"], dtype=torch.float32)
+            H = int(gt_delta.shape[0])
         elif self.reference_episode is not None:
             ep = self.reference_episode
-            ref_poses = ep["agent"].pose_se3.to(dtype=torch.float32)  # (T, 4, 4)
-            ref_fs = ep["agent"].flight_state.to(dtype=torch.float32)  # (T, 1)
+            ref_poses = ep["agent"].pose_se3.to(dtype=torch.float32)  # (T_ep, 4, 4)
+            ref_fs = ep["agent"].flight_state.to(dtype=torch.float32)  # (T_ep, 1)
             T_total = int(ref_poses.shape[0])
+            if "context_delta_se3" in sample:
+                H = int(sample["context_delta_se3"].shape[-3])
+            else:
+                H = self.horizon
 
             if step_cursor is None:
                 # Buscar el indice temporal mas cercano a live_pose_t
@@ -951,24 +1057,24 @@ class OracleReplayPolicy:
             else:
                 t0 = min(T_total - 1, max(0, int(step_cursor)))
 
-            # Construir las 8 poses relativas exactas desde live_pose_t hacia ref_poses[t0 + 1 .. t0 + 8]
+            # Construir las H poses relativas exactas desde live_pose_t hacia ref_poses[t0 + k*stride]
             from .se3_diffusion_math import invert_rigid_se3_torch
 
             live_inv = invert_rigid_se3_torch(live_pose_t)
             cum_list = []
             fs_list = []
-            for k in range(1, 9):
-                tk = min(T_total - 1, t0 + k)
+            for k in range(1, H + 1):
+                tk = min(T_total - 1, t0 + k * stride)
                 cum_list.append(live_inv @ ref_poses[tk])
                 fs_list.append(ref_fs[tk])
-            gt_cum = torch.stack(cum_list, dim=0)  # (8, 4, 4)
-            gt_delta = cumulative_to_incremental_se3(gt_cum)  # (8, 4, 4)
-            gt_fs = torch.stack(fs_list, dim=0)  # (8, 1)
+            gt_cum = torch.stack(cum_list, dim=0)  # (H, 4, 4)
+            gt_delta = cumulative_to_incremental_se3(gt_cum)  # (H, 4, 4)
+            gt_fs = torch.stack(fs_list, dim=0)  # (H, 1)
         else:
             raise ValueError("OracleReplayPolicy requiere `target_delta_se3` en sample o `reference_episode`.")
 
         # Pasar por la misma tuberia de flujo de 6 keypoints + reconstruccion SVD 4-DoF desde I_4
-        identity_seq = torch.eye(4, dtype=torch.float32).unsqueeze(0).expand(8, 4, 4).clone()
+        identity_seq = torch.eye(4, dtype=torch.float32).unsqueeze(0).expand(H, 4, 4).clone()
         flow_6d = compute_decoupled_keypoint_flow(
             T_curr=identity_seq,
             T_target=gt_delta,
