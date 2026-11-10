@@ -52,15 +52,14 @@ def _trajectory_10hz_to_px4_telemetry_50hz(
     pos_arr = np.asarray(pos_enu_10hz, dtype=np.float64).copy()
     yaw_arr = np.asarray(yaw_enu_10hz, dtype=np.float64).copy()
 
-    # Si el ultimo punto quedo cerca de la plataforma de aterrizaje, asentar suavemente sobre el pad
-    if settle_to_pad_on_land and landing_cfg and "x" in landing_cfg and "y" in landing_cfg:
-        lx = float(landing_cfg["x"])
-        ly = float(landing_cfg["y"])
+    # Si el ultimo punto quedo bajo al activar aterrizaje, asentar verticalmente en su (X, Y) real
+    if settle_to_pad_on_land and landing_cfg:
         lz = float(landing_cfg.get("z", 0.05)) + 0.03
-        d_xy = math.hypot(float(pos_arr[-1, 0]) - lx, float(pos_arr[-1, 1]) - ly)
-        if d_xy <= 1.25 and float(pos_arr[-1, 2]) <= 0.95:
+        last_x = float(pos_arr[-1, 0])
+        last_y = float(pos_arr[-1, 1])
+        if float(pos_arr[-1, 2]) <= 0.95 and float(pos_arr[-1, 2]) > lz + 1e-3:
             t_arr = np.append(t_arr, t_arr[-1] + 0.40)
-            pos_arr = np.vstack([pos_arr, np.array([[lx, ly, lz]], dtype=np.float64)])
+            pos_arr = np.vstack([pos_arr, np.array([[last_x, last_y, lz]], dtype=np.float64)])
             yaw_arr = np.append(yaw_arr, yaw_arr[-1])
 
     for i in range(1, len(t_arr)):

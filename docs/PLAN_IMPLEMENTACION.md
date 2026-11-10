@@ -120,8 +120,8 @@ Con el pipeline de datos completamente blindado, validado y optimizado en veloci
 
 ```mermaid
 flowchart LR
-    D_kin["datasets_kinematic/ (1.000+ episodios)"] --> Pretrain["Pre-entrenamiento In-Context (Graph Diffusion)"]
-    D_sitl["datasets_sitl_v2/ (50-60 episodios)"] --> CoFineTune["Co-Fine-Tuning Dinámico"]
+    D_kin["datasets/kinematic/ (1.000+ episodios)"] --> Pretrain["Pre-entrenamiento In-Context (Graph Diffusion)"]
+    D_sitl["datasets/sitl/ (50-60 episodios)"] --> CoFineTune["Co-Fine-Tuning Dinámico"]
     Pretrain --> CoFineTune
     CoFineTune --> ClosedLoop["Rollout Closed-Loop en PX4 SITL (val y held-out)"]
 ```
@@ -134,7 +134,14 @@ flowchart LR
   * Muestreo estratificado entre nodos nominales y nodos de recuperación `data['aug']`.
 
 ### Tarea 4.2: Arquitectura del Modelo de Difusión sobre Grafos Heterogéneos — [PENDIENTE]
-* **Encoder de Escena ($\phi_e$):** Red tipo PointNet++ (Set Abstraction) sobre los 2048 puntos de la escena, evaluando $M \in \{16, 32\}$ nodos centroides.
+* **Encoder de Escena ($\phi_e$) y Estrategia de Congelamiento (Lección Crítica de Instant Policy ICLR 2025):**
+  * Red tipo PointNet++ (Set Abstraction) sobre los 2048 puntos de la escena, evaluando $M \in \{16, 32\}$ nodos centroides.
+  * **Regla de entrenamiento de $\phi_e$:** Siguiendo los resultados del paper original (Apéndices F y H), PointNet++ **no debe entrenarse de punta a punta (*end-to-end*) con la pérdida de difusión**, ya que la supervisión de trayectoria es demasiado dispersa para guiar la extracción de formas 3D desde cero y provoca colapso del modelo. Se debe **pre-entrenar de forma aislada** con una tarea de representación geométrica (predicción de ocupación 3D implícita) y **mantenerse congelada (`requires_grad = False`)** durante el aprendizaje de la política.
+  * **Disponibilidad y Evaluación del Checkpoint Oficial de Vosylius & Johns (`vv19/instant_policy`):**
+    * *Disponibilidad:* Los pesos originales del paper están disponibles públicamente mediante el script `./download_weights.sh` del repositorio oficial (descarga `model.pt` desde Google Drive).
+    * *Recomendación:* Se recomienda descargarlo e inspeccionarlo como **referencia técnica y baseline comparativo** (para auditar capas exactas, normalizaciones y dimensiones de embeddings).
+    * *Limitación por Domain Shift:* No se recomienda depender exclusivamente de él para el modelo final de UAV, dado que fue entrenado sobre objetos sólidos cerrados de mesa de ShapeNet (tazas, botellas, platos en $\sim 0.8\text{ m}$), mientras que en `uav_ip` la escena abarca $10\text{ m}$ ($s=0.1$) con vigas delgadas huecas de $1\text{–}2\text{ cm}$, postes y suelo.
+    * *Alternativa canónica para UAV:* Pre-entrenar un encoder PointNet++ liviano con pérdida de ocupación 3D implícita sobre las primitivas geométricas exactas de nuestro catálogo $v2$ (cilindros, vigas de puertas y prismas de aterrizaje generados sintéticamente con `synthetic_lidar.py`) y congelarlo para la etapa de difusión.
 * **Redes de Paso de Mensajes ($\sigma \to \varphi \to \psi$):**
   * $\sigma$: Encoder de características locales entre escena y dron.
   * $\varphi$: Bloque de atención cruzada (*Cross-Attention*) que extrae la regla de la tarea comparando el contexto con la escena actual.
@@ -142,8 +149,8 @@ flowchart LR
 * **Inferencia por Descomposición SVD:** En cada paso de denoising DDIM ($K=4\text{–}8$), actualización rígida en $SE(3)$ calculada analíticamente sobre los 6 keypoints del dron mediante SVD.
 
 ### Tarea 4.3: Entrenamiento y Leyes de Escalado — [PENDIENTE]
-* **Fase 1 (Pre-entrenamiento Masivo):** Entrenar el modelo sobre `datasets_kinematic/` (cientos de tareas únicas, $1.000+$ episodios) hasta convergencia de la pérdida de flujo.
-* **Fase 2 (Co-Fine-Tuning):** Ajuste fino conjunto combinando el corpus cinemático con los episodios reales de `datasets_sitl_v2/`.
+* **Fase 1 (Pre-entrenamiento Masivo):** Entrenar el modelo sobre `datasets/kinematic/` (cientos de tareas únicas, $1.000+$ episodios) hasta convergencia de la pérdida de flujo.
+* **Fase 2 (Co-Fine-Tuning):** Ajuste fino conjunto combinando el corpus cinemático con los episodios reales de `datasets/sitl/`.
 * **Ablación de Diversidad:** Evaluar el impacto de la diversidad de tareas (entrenar con 10 vs. 50 vs. 200 tareas) y verificar la emergencia del comportamiento *in-context* frente a la memorización bayesiana.
 
 ### Tarea 4.4: Inferencia en Lazo Cerrado en PX4 SITL (`instant_policy_pilot.py`) — [PENDIENTE]
@@ -174,7 +181,7 @@ flowchart LR
   - *Normalización y escala traslación/rotación:* Revisar un esquema general sin constantes manuales `flow_scale` ni recorte duro (`ActionBounds4DoF` con `clip=True`) ajustados a este dataset, contemplando que futuras tareas puedan involucrar mayor rotación o velocidad vertical (p. ej. normalización por el *schedule* de ruido $\sigma_k$ de difusión o estadísticos dinámicos del split de entrenamiento sin *clipping* en inferencia).
   - *Invariancia espacial $SE(3)$ y señal de progreso:* No trasladar la inyección de `live_pose_se3` global ni la comparación en $X_{\text{ENU}}$ (`ctx_x - live_x`) usadas en el *overfit* de 1 episodio. Revisar cómo representar el orden relativo dentro de las demos de contexto sin usar coordenadas globales en la consulta viva $O_t$, evaluar si `data['aug']` ($\gamma = 0.70$) ya basta sin agregar perturbaciones extra al vuelo, y analizar alternativas egocéntricas solo si apareciera ambigüedad perceptual con el LiDAR 360° ($10.0\text{ m}$).
   - *Propagación de contexto ($\varphi$) y proceso de difusión ($\psi$):* No trasladar la separación manual `Key`/`Value`, el `live_modality_dropout` ni las anclas sintéticas creadas para la sonda de 3 muestras, ni tampoco el puente determinista desde $I_4$; evaluar la arquitectura estándar de grafos heterogéneos de *Instant Policy* y un *schedule* DDPM/DDIM estocástico entrenados sobre la diversidad completa del Catálogo $v2$.
-  - *Muestreo de escena ($\phi_e$):* Revisar el muestreo sin el corte fijo `z_flu > -0.11` usado en `subsample_scene_centroids_torch()`, dado que `synthetic_lidar.py` no genera piso infinito y un umbral fijo en $Z$ puede descartar puntos legítimos del `landing_pad` al volar alto (`overfly`), además de evaluar $M \in \{16, 32, 64\}$ centroides.
+  - *Muestreo y entrenamiento de escena ($\phi_e$):* Revisar el muestreo sin el corte fijo `z_flu > -0.11` usado en `subsample_scene_centroids_torch()` (que arriesga descartar el `landing_pad` al volar alto), evaluar $M \in \{16, 32, 64\}$ centroides, y descartar el entrenamiento *end-to-end* directo de PointNet++ adoptando pre-entrenamiento de ocupación 3D y congelamiento de pesos (según Tarea 4.2).
 - [ ] **1. Cantidad y Estrategia de *Keyframes* de Contexto ($L$ fijo vs. $L$ adaptativo por longitud):**
   - Evaluar valores fijos $L \in \{10, 16, 24\}$ frente a **$L$ adaptativo correlacionado con la longitud/complejidad de la demostración** (p. ej. 1 keyframe cada $1.2\text{–}1.5\text{ m}$ de longitud de arco + picos de curvatura $\kappa(t)$ y transición de aterrizaje, acotado en $[10, 28]$).
   - Analizar el compromiso entre reducir huecos entre keyframes en circuitos largos de 3–4 obstáculos o maniobras `orbit` y el costo/dispersión de atención en $\varphi$.

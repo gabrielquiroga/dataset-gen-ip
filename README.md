@@ -148,13 +148,13 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
     --episodes-per-task 5 \
     --catalog-version v2 \
     --seed 42 \
-    --output-dir datasets_sitl_v2
+    --output-dir datasets/sitl
   ```
 
 * **Qué esperar y cómo verificar:**
   * En consola observará el ciclo de arranque, vuelo y validación de cada episodio.
   * Al finalizar, el script imprime un resumen consolidado con las tasas de aceptación de intentos primarios y post-reintentos.
-  * Cada carpeta `datasets_sitl_v2/task_XXXX/episode_YY` contendrá:
+  * Cada carpeta `datasets/sitl/task_XXXX/episode_YY` contendrá:
     * `rosbag/`: Bolsa MCAP con telemetría de odometría, comandos y reloj.
     * `waypoints.yaml`: Poses geométricas de los obstáculos y plataforma.
     * `validation_report.json`: Dictamen exhaustivo del juez físico (`validation_status: "accepted"`).
@@ -178,7 +178,7 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
   * `--episodes-per-task`: Episodios por tarea (default: 5).
   * `--catalog-version {v1, v2}`: Versión del catálogo combinatorio (default: `v2`).
   * `--exclude-signatures-from` (alias: `--exclude-tasks-from`): Uno o más directorios de datasets físicos (o archivos JSON) cuyas firmas semánticas deben excluirse estrictamente.
-  * `--output-dir`: Directorio donde guardar el dataset cinemático (default: `datasets_kinematic`).
+  * `--output-dir`: Directorio donde guardar el dataset cinemático (default: `datasets/kinematic`).
   * `--workers` (`-j`): Procesos paralelos a utilizar (default: todos los núcleos CPU).
   * `--tube-decay`: Factor $\gamma$ de convergencia exponencial en Tube Augmentation (default: 0.70).
   * `--require-torch`: Exigir exportación en formato PyTorch Geometric `.pt` (requiere `venv_ip`).
@@ -189,8 +189,8 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
     --num-tasks 200 \
     --episodes-per-task 5 \
     --catalog-version v2 \
-    --exclude-signatures-from datasets_sitl_v2 \
-    --output-dir datasets_kinematic \
+    --exclude-signatures-from datasets/sitl \
+    --output-dir datasets/kinematic \
     --workers 8 \
     --require-torch
   ```
@@ -225,7 +225,7 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 * **Ejemplo de Ejecución:**
   ```bash
   ~/venv_ip/bin/python3 src/uav_ip/scripts/bag_to_heterodata.py \
-    --dataset-dir datasets_sitl_v2 \
+    --dataset-dir datasets/sitl \
     --require-torch \
     --tube-decay 0.70 \
     --workers 8 \
@@ -264,14 +264,14 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 * **Ejemplo de Ejecución:**
   ```bash
   ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
-    --dataset-dir datasets_sitl_v2 \
+    --dataset-dir datasets/sitl \
     --require-pt
   ```
 
 * **Qué esperar:**
   * Si el dataset cumple todas las restricciones, concluye con:
     `🎉 OVERALL AUDIT STATUS: PASS (0 errors)`
-  * Genera en `datasets_sitl_v2/splits/`:
+  * Genera en `datasets/sitl/splits/`:
     * `train_tasks.json`, `val_tasks.json`, `held_out_tasks.json`.
     * `dataset_summary.json`: Reporte estadístico completo auditable.
 
@@ -339,12 +339,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
   ```bash
   # Validar un episodio individual:
   python3 src/uav_ip/scripts/validate_episode.py \
-    --episode-dir datasets_sitl_v2/task_0000/episode_00 \
+    --episode-dir datasets/sitl/task_0000/episode_00 \
     --strict
 
   # Validar un dataset completo y exportar reporte JSON:
   python3 src/uav_ip/scripts/validate_episode.py \
-    --dataset-dir datasets_sitl_v2 \
+    --dataset-dir datasets/sitl \
     --json > /tmp/reporte_validacion.json
   ```
 
@@ -366,16 +366,16 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
   ```bash
   # Inspección estática 3D de un episodio:
   python3 src/uav_ip/scripts/visualize_dataset.py \
-    --bag-path datasets_sitl_v2/task_0000/episode_00
+    --bag-path datasets/sitl/task_0000/episode_00
 
   # Inspección de los vectores de recuperación de Tube Augmentation:
   python3 src/uav_ip/scripts/visualize_dataset.py \
-    --bag-path datasets_sitl_v2/task_0000/episode_00 \
+    --bag-path datasets/sitl/task_0000/episode_00 \
     --show-aug
 
   # Generar una animación GIF interactiva del vuelo:
   python3 src/uav_ip/scripts/visualize_dataset.py \
-    --bag-path datasets_sitl_v2/task_0000/episode_00 \
+    --bag-path datasets/sitl/task_0000/episode_00 \
     --animate --save-gif /tmp/vuelo_animado.gif
   ```
 
@@ -455,14 +455,14 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
      --num-tasks 200 \
      --episodes-per-task 5 \
      --catalog-version v2 \
-     --output-dir datasets_kinematic \
+     --output-dir datasets/kinematic \
      --workers 8 \
      --require-torch
    ```
 2. Auditar el dataset y generar splits oficiales:
    ```bash
    ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
-     --dataset-dir datasets_kinematic \
+     --dataset-dir datasets/kinematic \
      --require-pt
    ```
 
@@ -485,12 +485,12 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
      --episodes-per-task 5 \
      --catalog-version v2 \
      --seed 42 \
-     --output-dir datasets_sitl_v2
+     --output-dir datasets/sitl
    ```
 3. Convertir los rosbags a grafos `HeteroData` (.pt):
    ```bash
    ~/venv_ip/bin/python3 src/uav_ip/scripts/bag_to_heterodata.py \
-     --dataset-dir datasets_sitl_v2 \
+     --dataset-dir datasets/sitl \
      --require-torch \
      --tube-decay 0.70 \
      --workers 8 \
@@ -499,7 +499,7 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 4. Auditar y generar splits de evaluación formal:
    ```bash
    ~/venv_ip/bin/python3 src/uav_ip/scripts/audit_dataset.py \
-     --dataset-dir datasets_sitl_v2 \
+     --dataset-dir datasets/sitl \
      --require-pt
    ```
 

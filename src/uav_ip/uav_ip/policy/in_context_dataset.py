@@ -13,6 +13,7 @@ e inferencia parametrizables sin regenerar los archivos `.pt`:
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -721,13 +722,11 @@ class InContextNavigationDataset(Dataset):
             fname = split_map.get(split, f"{split}_tasks.txt")
             split_file = self.dataset_dir / "splits" / fname
             if split_file.is_file():
-                tasks = [
-                    line.strip()
-                    for line in split_file.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
-            else:
-                tasks = sorted(p.name for p in self.dataset_dir.glob("task_*") if p.is_dir())
+                raise FileNotFoundError(
+                    f"Archivo de split '{split}' no encontrado en: {split_file}"
+                )
+            split_data = json.loads(split_file.read_text(encoding="utf-8"))
+            tasks = [str(t).strip() for t in split_data.get("tasks", []) if str(t).strip()]
         else:
             tasks = sorted(p.name for p in self.dataset_dir.glob("task_*") if p.is_dir())
 
