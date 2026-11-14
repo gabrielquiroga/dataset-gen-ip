@@ -5,7 +5,7 @@ Ejecuta una politica (`MiniInstantPolicyNet`, `OracleReplayPolicy` o el modelo f
 en un bucle cerrado de horizonte deslizante (Receding Horizon / Action Chunking) puramente en
 Python sobre cualquier circuito `waypoints.yaml`:
   1. En cada instante de replanificacion t, sintetiza en vivo la nube LiDAR 360° de 2048 puntos
-     en marco Horizontal FLU (s=0.1) usando `SyntheticLidarGenerator`.
+     en marco Horizontal FLU (s=1.0, metros reales) usando `SyntheticLidarGenerator`.
   2. Invoca `policy.predict_actions(sample)` para obtener el horizonte futuro de T=8 pasos.
   3. Ejecuta los primeros `execution_horizon` (T_exec in {1, 2, 4, 8}) pasos a 10 Hz,
      actualizando posicion, yaw, velocidad egocentrica `vel_flu` y estado `flight_state`.
@@ -291,7 +291,7 @@ def run_kinematic_closed_loop_rollout(
     lidar_times_ms: List[float] = []
 
     while odom_tick_cursor < max_steps_10hz:
-        # 1. Sintetizar nube LiDAR 360° en la pose actual (Horizontal FLU, s=0.1)
+        # 1. Sintetizar nube LiDAR 360° en la pose actual (Horizontal FLU, default s=1.0 en metros)
         t_lid0 = time.perf_counter()
         cloud_flu_scaled = lidar_gen.generate_pointcloud(
             drone_pose={

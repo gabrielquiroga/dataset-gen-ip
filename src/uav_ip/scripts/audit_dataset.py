@@ -71,7 +71,7 @@ EXPECTED_LIDAR_POINTS: int = 2048
 SO3_ORTHOGONALITY_TOL: float = 1e-4
 TUBE_AUG_SPHERE_RADIUS_M: float = 0.60
 MAX_STEP1_CORRECTIVE_VELOCITY_MPS: float = 6.50
-DEFAULT_SCALE_FACTOR: float = 0.10
+DEFAULT_SCALE_FACTOR: float = 1.0
 
 
 def _parse_episode_slot_and_attempt(dir_name: str, meta: Optional[Dict[str, Any]] = None) -> Tuple[str, int]:
@@ -157,7 +157,7 @@ def audit_heterodata_file(
 
     tensors_np: Dict[str, np.ndarray] = {}
     dt_s_val: Optional[float] = None
-    scale_val: float = DEFAULT_SCALE_FACTOR
+    scale_val: Optional[float] = None
 
     try:
         if path.suffix == ".pt":
@@ -239,6 +239,19 @@ def audit_heterodata_file(
             "horizon_duration_s": None,
             "issues": [f"corrupt_or_unreadable_tensor_file ({type(exc).__name__}: {exc})"],
         }
+
+    if scale_val is None:
+        meta_candidate = path.parent / "episode_meta.json"
+        if meta_candidate.is_file():
+            try:
+                with open(meta_candidate, "r", encoding="utf-8") as mf:
+                    ep_meta = json.load(mf)
+                if ep_meta.get("scale_factor") is not None:
+                    scale_val = float(ep_meta["scale_factor"])
+            except Exception:
+                pass
+    if scale_val is None:
+        scale_val = DEFAULT_SCALE_FACTOR
 
     # 1. Finitud estricta (cero NaNs / Infs)
     for k_name, arr in tensors_np.items():

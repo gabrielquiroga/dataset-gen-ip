@@ -33,12 +33,12 @@ flowchart TD
 2. **Espacio de Acción ($A_t$):**
    * Secuencia temporal de $T = 8$ desplazamientos relativos futuros en el grupo de Lie $SE(3)$ respecto a la pose actual del dron:
      $$A_t = \{ T_{EA}^{(t, k)} = (T_{WE}^t)^{-1} T_{WE}^{t + k \cdot \text{stride}} \}_{k=1}^T, \quad T_{EA}^{(t, k)} \in SE(3)$$
-   * Cada acción relativa se parametriza mediante un vector de 5 dimensiones por paso: traslación escalada $(\Delta x, \Delta y, \Delta z)$ y componentes de rotación en el plano horizontal $(\cos\Delta\psi, \sin\Delta\psi)$, o su matriz homogénea $4 \times 4$ en $SE(3)$.
+   * Cada acción relativa se parametriza mediante un vector de 5 dimensiones por paso: traslación en metros reales $(\Delta x, \Delta y, \Delta z)$ y componentes de rotación en el plano horizontal $(\cos\Delta\psi, \sin\Delta\psi)$, o su matriz homogénea $4 \times 4$ en $SE(3)$.
 3. **Representación en Grafo Heterogéneo (`HeteroData`):**
    * Nodos de escena (`scene`): Puntos representativos de los obstáculos procesados por un encoder geométrico de ocupación.
    * Nodos de agente (`agent`): Poses ejecutadas por el dron, representadas por traslación, orientación y 6 *keypoints* rígidos del chasis del UAV.
    * Nodos de recuperación (`aug`): Poses perturbadas del *Tube Augmentation* ($30\%$ de los pasos) con acciones correctivas dirigidas al tubo nominal.
-   * Aristas temporales y espaciales relativas moduladas por embeddings sinusoidales de Fourier con factor de escala $s = 0.1$.
+   * Aristas temporales y espaciales relativas moduladas por embeddings sinusoidales de Fourier con preescalado interno de frecuencia ($s_{\text{emb}} = 0.1$) encapsulado exclusivamente dentro del codificador posicional.
 
 ---
 
@@ -76,15 +76,15 @@ Un error destructivo habitual es mezclar la telemetría de PX4 con las posicione
    conservando la guiñada (*yaw*, $\psi$) pero forzando $\phi = 0$ y $\theta = 0$. Cualquier punto del mundo $\mathbf{p}_w$ se proyecta vectorialmente al marco del dron como:
    $$\mathbf{p}_{\text{dron}} = (\mathbf{p}_w - \mathbf{p}_d) \cdot R_{\text{ENU}}^H$$
 
-### 2.3 Factor de Escala Métrica ($s = 0.1$) para el Encoder Sinusoidal
+### 2.3 Unidades Físicas SI ($s = 1.0$) en Datos/Geometría y Preescalado en el Encoder Sinusoidal ($s_{\text{emb}} = 0.1$)
 * **Fundamento Matemático:**
   *Instant Policy* codifica posiciones relativas mediante funciones sinusoidales periódicas de Fourier:
-  $$f_k(\Delta\mathbf{p}) = \sin(2^k \pi \cdot s \cdot \Delta\mathbf{p})$$
-  El semiperíodo fundamental para $k=0$ es $\lambda_0 = 1.0$ (en unidades de entrada).
+  $$f_k(\Delta\mathbf{p}) = \sin(2^k \pi \cdot s_{\text{emb}} \cdot \Delta\mathbf{p})$$
+  El semiperíodo fundamental para $k=0$ es $\lambda_0 = 1.0$ (en unidades de entrada al codificador).
   En manipulación robótica de mesa (*tabletop*), el espacio de trabajo mide $\sim 0.8\text{ m}$, por lo que los autores no necesitaron normalizar las coordenadas.
-* **Adaptación al Dominio UAV:**
-  En un dron navegando circuitos de hasta $10\text{ m}$ de radio sensorial, las distancias sin escalar alcanzarían múltiplos enteros del período, generando **aliasing espacial severo** (la red no puede distinguir un obstáculo a $2\text{ m}$ de uno a $4\text{ m}$ o $6\text{ m}$).
-  Al aplicar el factor fijo $s = 0.1$, el radio de $10.0\text{ m}$ se mapea exactamente al intervalo $[0.0, 1.0]$, adaptando el dominio aéreo al rango operativo del encoder sin alterar la topología de la escena.
+* **Adaptación al Dominio UAV (Sin Deformar la Geometría Física):**
+  En un dron navegando circuitos de hasta $10\text{ m}$ de radio sensorial, introducir distancias en metros directamente en $\sin(2^k \pi \Delta\mathbf{p})$ alcanzaría múltiplos enteros del período, generando **aliasing espacial severo** (la red no puede distinguir un obstáculo a $2\text{ m}$ de uno a $4\text{ m}$ o $6\text{ m}$).
+  Originalmente el proyecto aplicó $s = 0.1$ de forma global sobre nubes LiDAR y poses en `HeteroData`; sin embargo, acoplar la escala espectral a las coordenadas físicas distorsionaba umbrales métricos, radios $k$-NN y la relación entre desplazamientos de *keypoints* y ángulos. Por ello, los tensores, sensores y geometría operan en **unidades físicas reales ($s = 1.0$, metros y radianes)**, aplicando el factor $s_{\text{emb}} = 0.1$ **exclusivamente dentro de `SinusoidalPosEmb3D`** para mapear el radio de $10.0\text{ m}$ al intervalo $[0.0, 1.0]$ sin alterar la topología ni las medidas reales de la escena.
 
 ### 2.4 Control Offboard y Armado Seguro en PX4
 * **Protocolo de Failsafe:** PX4 aborta el armado o entra en failsafe si un nodo externo no publica comandos de setpoint a $\ge 2\text{ Hz}$ de forma continua durante al menos $500\text{ ms}$ previos.

@@ -26,7 +26,7 @@
 
 | Etapa | Nombre | Archivos | Criterio de Verificación | Estado |
 | :---: | :--- | :--- | :--- | :---: |
-| **1** | Geometría $SE(3)$ 4-DoF, Keypoints, Flow y SVD | `src/uav_ip/uav_ip/icil/geometry.py`, `src/uav_ip/test/icil/test_geometry.py` | Round-trips `< 1e-5`, SVD 4-DoF exacto `< 1e-5`, invarianza $SE(3)$ | ✅ Completada (pend. refactor s=0.1) |
+| **1** | Geometría $SE(3)$ 4-DoF, Keypoints, Flow y SVD | `src/uav_ip/uav_ip/icil/geometry.py`, `src/uav_ip/test/icil/test_geometry.py` | Round-trips `< 1e-5`, SVD 4-DoF exacto `< 1e-5`, invarianza $SE(3)$ | ✅ Completada |
 | **2** | Cargador de Dataset, Splits JSON y Batching | `src/uav_ip/uav_ip/icil/dataset.py`, `src/uav_ip/test/icil/test_dataset.py` | Splits disjuntos JSON cargados, formas exactas, 0 NaNs, cotas medidas | ⏳ Pendiente |
 | **3** | Encoder de Escena $\phi_e$ + Pre-entrenamiento Ocupancia 3D | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Acc. validación > 90% en primitivas 3D + `checkpoints/scene_encoder.pt` | ⏳ Pendiente |
 | **4** | Grafo Local $\sigma$ (Escena Congelada + Estado UAV) | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Forward/backward `(B, 6, d_model)` OK; $\phi_e$ congelado, $\sigma$ con gradientes | ⏳ Pendiente |
@@ -68,10 +68,10 @@ src/uav_ip/
 ## 4. Decisiones Arquitectónicas Críticas y Errores a Evitar
 
 1. **Backbone geométrico $\phi_e$ pre-entrenado y congelado (Tarea 4.2):**
-   - La nube sintética de 2048 puntos (Horizontal FLU, escala $s=0.1$) pasa por FPS + $k$-NN (PointNet++ / Set Abstraction) para producir $M$ tokens locales `(B, M, d_model)` con coordenadas centroides `(B, M, 3)`.
+   - La nube sintética de 2048 puntos (Horizontal FLU, unidades métricas físicas $s=1.0$) pasa por FPS + $k$-NN (PointNet++ / Set Abstraction) para producir $M$ tokens locales `(B, M, d_model)` con coordenadas centroides `(B, M, 3)`, aplicando el preescalado `scale=0.1` únicamente dentro de `SinusoidalPosEmb3D`.
    - Se pre-entrena con un decodificador residual $\psi_e$ mediante clasificación binaria de **ocupancia implícita 3D** sobre primitivas sintéticas del dominio UAV (`pole`, `square_gate`, `circular_gate`, `landing_pad`), y luego se congelan todos los pesos de $\phi_e$ (`requires_grad=False`, `eval()`). Evita intentar aprender geometría 3D desde cero usando solo la señal de difusión en pocas tareas.
 2. **Nube completa sin filtrado de suelo ($Z$):**
-   - **No** descartar puntos con `z_flu > -0.11`. El UAV necesita ver el suelo y el `landing_pad` en todo momento para descender y alinear aterrizaje.
+   - **No** descartar puntos con `z_flu > -1.1` m (antes `-0.11` en escala `0.1`). El UAV necesita ver el suelo y el `landing_pad` en todo momento para descender y alinear aterrizaje.
 3. **Splits estrictos desde JSON oficiales:**
    - Leer `datasets/<tipo>/splits/{train,val,held_out}_tasks.json` (mapeando `"test"` a `"held_out"`). Exigir existencia explícita (`if not split_file.is_file(): raise FileNotFoundError(...)`) para impedir fuga entre train/val/held_out.
 4. **Invarianza $SE(3)$ estricta en entradas de red:**
@@ -86,8 +86,8 @@ src/uav_ip/
    - Cuando $\hat{s}_k < 0.5$ (`flight_state`), fijar comando horizontal en la posición actual `(curr_x, curr_y)` mientras se desciende verticalmente, sin leer nunca `landing` de `waypoints.yaml` para corregir $(x, y)$.
 8. **Generalización limpia de hiperparámetros y búsqueda de grilla:**
    - Parametrizar todos los hiperparámetros de arquitectura y entrenamiento sin valores cableados, usando como configuración base por defecto: `M=32`, `L=10` (también compatible con `'adaptive'`), `T=8`, `action_stride=1`, `T_exec=4`, `N_demos=2` y `K=8` pasos DDIM, de modo que sea directo variar dimensiones o ejecutar búsqueda de grilla en Etapa 7.
-9. **Refactor pendiente del factor de escala $s=0.1$ hacia el codificador de Fourier:**
-   - Antes de iniciar la Etapa 2, el usuario moverá el factor de escala `0.1` (utilizado para evitar aliasing geométrico) desde las representaciones geométricas generales hacia el codificador posicional de Fourier (`SinusoidalPosEmb3D` en Etapa 3), manteniendo las coordenadas geométricas y keypoints en escala física consistente. Al retomar después de ese refactor, se actualizará la Etapa 1 (`geometry.py`) y las especificaciones correspondientes de las Etapas 2 a 7.
+9. **Escala física SI ($s=1.0$) en geometría/datos y factor `0.1` encapsulado en `SinusoidalPosEmb3D`:**
+   - **Completado antes de Etapa 2:** Se migró todo el pipeline de datos, `HeteroData`, sensores, evaluación y `geometry.py` a unidades físicas reales en metros (`DEFAULT_SCALE_FACTOR = 1.0`), encapsulando el factor `0.1` exclusivamente dentro de las representaciones de frecuencia de Fourier (`SinusoidalPosEmb3D(dim, scale=0.1)` en Etapa 3) para evitar aliasing periódico sin deformar coordenadas métricas, radios $k$-NN ni keypoints.
 10. **Pruebas unitarias separadas en `src/uav_ip/test/icil/`:**
     - Las verificaciones de cada etapa se escriben en módulos dedicados `src/uav_ip/test/icil/test_*.py` ejecutables con `pytest` en `~/venv_ip`, evitando dejar bloques `if __name__ == "__main__":` dentro de los módulos productivos de `uav_ip/icil/` y protegiendo la importación de `torch` con `pytest.importorskip("torch")`.
 
@@ -97,12 +97,12 @@ src/uav_ip/
 
 ### Etapa 1 — Geometría $SE(3)$ 4-DoF, Keypoints, Flow y SVD (`geometry.py`)
 
-**Objetivo:** Implementar en PyTorch puro (sin NumPy, sin `torch_geometric`, sin dependencias de dataset) toda la aritmética rígida 4-DoF (actualmente con `DEFAULT_SCALE_FACTOR = 0.1`, pendiente de refactorizar hacia el codificador de Fourier antes de Etapa 2), las transformaciones entre pose acumulada e incremental, el flujo desacoplado $[\Delta\mathbf{p}_t, \Delta\mathbf{p}_r]$ y el alineamiento cerrado SVD/Kabsch 4-DoF.
+**Objetivo:** Implementar en PyTorch puro (sin NumPy, sin `torch_geometric`, sin dependencias de dataset) toda la aritmética rígida 4-DoF en unidades físicas reales (metros y radianes, `DEFAULT_SCALE_FACTOR = 1.0`), las transformaciones entre pose acumulada e incremental, el flujo desacoplado $[\Delta\mathbf{p}_t, \Delta\mathbf{p}_r]$ y el alineamiento cerrado SVD/Kabsch 4-DoF.
 
-**Estado actual en código:** Implementado y verificado por el usuario en `src/uav_ip/uav_ip/icil/geometry.py`. Falta únicamente trasladar su verificación a `src/uav_ip/test/icil/test_geometry.py` y aplicar el refactor que mueve el factor `0.1` al codificador de Fourier.
+**Estado actual en código:** Implementado y verificado mediante tests unitarios en `src/uav_ip/uav_ip/icil/geometry.py` y `src/uav_ip/test/icil/test_geometry.py` (`DEFAULT_SCALE_FACTOR = 1.0`).
 
 **Contrato de funciones implementado (`src/uav_ip/uav_ip/icil/geometry.py`):**
-- Constantes: `DEFAULT_SCALE_FACTOR = 0.1`, `DEFAULT_ARM_LENGTH_M = 0.25`, `DEFAULT_Z_HEIGHT_M = 0.15`.
+- Constantes: `DEFAULT_SCALE_FACTOR = 1.0`, `DEFAULT_ARM_LENGTH_M = 0.25`, `DEFAULT_Z_HEIGHT_M = 0.15`.
 - `get_uav_keypoints(scale_factor, arm_length, z_height, device, dtype) -> (6, 3)`: 6 keypoints canónicos en Horizontal FLU `[Centro, +X, -X, +Y, -Y, +Z]` escalados por `scale_factor`.
 - `wrap_angle(angle) -> Tensor`: envuelve ángulos en radianes mediante `atan2(sin, cos)`.
 - `vec4_to_se3(vec4) -> (..., 4, 4)` y `se3_to_vec4(T) -> (..., 4)`: conversión exacta entre `[dx, dy, dz, yaw]` y matrices homogéneas 4-DoF $R_z(\psi)$.
@@ -166,7 +166,7 @@ def test_canonical_keypoints_shape_and_values() -> None:
 
 def test_vec4_se3_and_inverse_roundtrip() -> None:
     torch.manual_seed(42)
-    vec = torch.empty((16, 8, 4)).uniform_(-0.5, 0.5)
+    vec = torch.empty((16, 8, 4)).uniform_(-5.0, 5.0)
     vec[..., 3] = torch.empty((16, 8)).uniform_(-torch.pi, torch.pi)
     T = vec4_to_se3(vec)
     vec_rec = se3_to_vec4(T)
@@ -194,8 +194,8 @@ def test_cumulative_incremental_roundtrip() -> None:
 def test_decoupled_flow_and_svd_4dof() -> None:
     torch.manual_seed(123)
     kp = get_uav_keypoints()
-    T_curr = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([0.3, 0.3, 0.15, 2.5]))
-    T_target = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([0.3, 0.3, 0.15, 2.5]))
+    T_curr = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([3.0, 3.0, 1.5, 2.5]))
+    T_target = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([3.0, 3.0, 1.5, 2.5]))
 
     flow = compute_keypoint_flow(T_curr, T_target, kp)
     assert flow.shape == (32, 8, 6, 6)
@@ -212,8 +212,8 @@ def test_decoupled_flow_and_svd_4dof() -> None:
 def test_svd_4dof_se3_equivariance() -> None:
     torch.manual_seed(99)
     kp = get_uav_keypoints()
-    T_0 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([0.2, 0.2, 0.1, 2.0]))
-    T_1 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([0.2, 0.2, 0.1, 2.0]))
+    T_0 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([2.0, 2.0, 1.0, 2.0]))
+    T_1 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([2.0, 2.0, 1.0, 2.0]))
     p0 = transform_keypoints(T_0, kp)
     p1 = transform_keypoints(T_1, kp)
 
@@ -277,7 +277,7 @@ def test_svd_4dof_se3_equivariance() -> None:
 **Objetivo (Tarea 4.2 de `PLAN_IMPLEMENTACION.md`):** Construir la primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` junto con `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, pre-entrenar el extractor local 3D $\phi_e$ mediante predicción de ocupancia implícita sobre geometrías sintéticas del dominio UAV, y guardar un checkpoint listo para cargarse congelado.
 
 **Componentes:**
-1. `SinusoidalPosEmb3D(dim)` (codificación de Fourier 3D para desplazamientos relativos $\Delta\mathbf{x} \in \mathbb{R}^3$).
+1. `SinusoidalPosEmb3D(dim, scale=0.1)` (codificación de Fourier 3D para desplazamientos relativos $\Delta\mathbf{x} \in \mathbb{R}^3$ en metros, aplicando internamente el factor `scale=0.1` para evitar aliasing periódico sin alterar coordenadas geométricas).
 2. Utilidades FPS (*Farthest Point Sampling*) + $k$-NN local (PyTorch puro o `torch_cluster` si disponible en `~/venv_ip`, verificando disponibilidad al iniciar la etapa) sobre la **nube completa** de 2048 puntos (sin recorte en $Z$).
 3. `SceneEncoderPhi` ($\phi_e$):
    - Arquitectura tipo PointNet++ Set Abstraction (2 niveles jerárquicos de agrupación local FPS + MLP + max-pooling):
@@ -286,7 +286,7 @@ def test_svd_4dof_se3_equivariance() -> None:
 4. `OccupancyDecoderPsi` ($\psi_e$, solo para pre-entrenamiento):
    - Recibe `centroids`, `features` y puntos query 3D `q_pts` `(B, Q, 3)`.
    - Interpola / agrega features de los $k$ centroides más cercanos ponderados por `SinusoidalPosEmb3D(q_pts - c_j)` y pasa por un MLP residual para predecir probabilidad de ocupancia `logit` `(B, Q, 1)`.
-5. Generador de primitivas 3D sintéticas (`pole`, `square_gate`, `circular_gate`, `landing_pad`, suelo $z=0$ y combinaciones de 2–4 objetos con rotación/traslación aleatoria a escala $s=0.1$) + muestreo balanceado de puntos query dentro/cerca/lejos de la superficie (`BCEWithLogitsLoss`).
+5. Generador de primitivas 3D sintéticas (`pole`, `square_gate`, `circular_gate`, `landing_pad`, suelo $z=0$ y combinaciones de 2–4 objetos con rotación/traslación aleatoria en escala física $s=1.0$ en metros) + muestreo balanceado de puntos query dentro/cerca/lejos de la superficie (`BCEWithLogitsLoss`).
 
 **Verificación rápida Etapa 3:**
 - Entrenar $\phi_e + \psi_e$ en `pretrain_scene_encoder.py` hasta superar **90% de accuracy** en validación de ocupancia.
@@ -350,9 +350,9 @@ def test_svd_4dof_se3_equivariance() -> None:
 **Flujo del simulador cinemático:**
 1. Inicializar en pose inicial del episodio; pre-calcular contexto `encode_context(demos)` una única vez al comienzo del episodio.
 2. En cada ciclo de inferencia (cada `T_exec` pasos de $0.1\text{ s}$):
-   - Generar nube sintética actual con `SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)` en la pose actual.
+   - Generar nube sintética actual con `SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048)` en la pose actual.
    - Ejecutar `predict_actions(..., num_ddim_steps=K)` para obtener $T$ pasos incrementales $\delta T_1 \dots \delta T_T$ y estados $\hat{s}_1 \dots \hat{s}_T$.
-   - Avanzar ejecutando los primeros `T_exec` pasos (`T_exec <= T`), acumulando pose en mundo ENU (`scale_factor=0.1`) y estimando `vel_flu`.
+   - Avanzar ejecutando los primeros `T_exec` pasos (`T_exec <= T`), acumulando pose en mundo ENU en metros (`scale_factor=1.0`) y estimando `vel_flu`.
    - **Aterrizaje honesto:** Si $\hat{s}_k < 0.5$, mantener $(x, y)$ en la posición actual `(curr_x, curr_y)` mientras desciende hacia $z \le z_{\text{landing}}$; detener al detectar aterrizaje o alcanzar tiempo máximo.
 3. Interpolar la trayectoria cerrada resultante a $50\text{ Hz}$ mediante PCHIP y evaluar con `uav_ip.validate_episode.validate_episode_data(...)`.
 
@@ -385,8 +385,9 @@ def test_svd_4dof_se3_equivariance() -> None:
 
 *(Se irá completando al finalizar y verificar cada etapa, antes de ejecutar `/compact`.)*
 
-- **Etapa 1:** `src/uav_ip/uav_ip/icil/geometry.py` implementado y verificado por el usuario.
+- **Etapa 1:** `src/uav_ip/uav_ip/icil/geometry.py` y `src/uav_ip/test/icil/test_geometry.py` implementados y verificados (`DEFAULT_SCALE_FACTOR = 1.0`, metros reales).
   - **Decisiones confirmadas:**
     1. Tests unitarios separados por etapa en `src/uav_ip/test/icil/test_*.py` (`pytest.importorskip("torch")`).
     2. Hiperparámetros por defecto acordados y parametrizables para futura búsqueda de grilla: `M=32`, `L=10`, `T=8`, `action_stride=1`, `T_exec=4`, `N_demos=2`, `K=8`.
-  - **Pendiente antes de iniciar Etapa 2:** Refactor del usuario moviendo el factor de escala `0.1` desde las representaciones geométricas generales hacia el codificador de Fourier (`SinusoidalPosEmb3D`), tras lo cual se actualizarán `geometry.py` y las Etapas 2–7 en este documento, además de mover el bloque `__main__` de `geometry.py` a `src/uav_ip/test/icil/test_geometry.py`.
+    3. Factor de escala `0.1` encapsulado exclusivamente dentro de `SinusoidalPosEmb3D(scale=0.1)` (Etapa 3); todo el pipeline de datos (`HeteroData`), sensores, `geometry.py` y evaluación operan en unidades físicas SI (`scale_factor=1.0`, metros y radianes).
+  - **Listo para retomar desde Etapa 2:** Datasets `sitl` y `kinematic` regenerados con `scale_factor=1.0`; el siguiente paso es implementar `src/uav_ip/uav_ip/icil/dataset.py` y `src/uav_ip/test/icil/test_dataset.py`.

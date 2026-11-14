@@ -11,14 +11,15 @@ procesamiento masivo por lotes en paralelo (multiprocessing).
 
 Formato del Grafo (HeteroData):
   Nodos Nominales ('scene' y 'agent'):
-  - data['scene'].pos:             Tensor (T_steps, 2048, 3) nubes LiDAR 360° en Horizontal FLU (s=0.1)
-  - data['agent'].x / pos_enu:     Tensor (T_steps, 3) posiciones del dron en ENU escaladas (s=0.1)
+  - data['scene'].pos:             Tensor (T_steps, 2048, 3) nubes LiDAR 360° en Horizontal FLU (default: s=1.0, metros SI)
+  - data['agent'].x / pos_enu:     Tensor (T_steps, 3) posiciones del dron en ENU (default: s=1.0, metros SI)
   - data['agent'].yaw_enu:         Tensor (T_steps, 1) rumbo yaw en ENU [rad]
   - data['agent'].rot_enu:         Tensor (T_steps, 3, 3) matrices R_z(yaw_t) estabilizadas
   - data['agent'].pose_se3:        Tensor (T_steps, 4, 4) poses homogeneas T_{WE}^t en SE(3)
   - data['agent'].q_ned:           Tensor (T_steps, 4) cuaternion completo PX4 para auditoria
   - data['agent'].flight_state:    Tensor (T_steps, 1) estado binario s_t in {0, 1} (1=vuelo, 0=aterrizaje)
-  - data['agent'].keypoints_body:  Tensor (6, 3) 6 keypoints canonicos del UAV en marco local (s=0.1)
+  - data['agent'].keypoints_body:  Tensor (6, 3) 6 keypoints canonicos del UAV en marco local (default: s=1.0, metros SI)
+  - data['agent'].scale_factor:    Tensor escalar float32 con el factor s aplicado (default: 1.0)
   - data['agent'].y:               Tensor (T_steps, 8, 5) horizonte local [dx_flu, dy_flu, dz_flu, dyaw, s_{t+k}]
   - data['agent'].action_se3:      Tensor (T_steps, 8, 4, 4) transformaciones T_{EA}^{(t,k)} = (T_{WE}^t)^{-1} T_{WE}^{t+k}
   - data['agent'].keyframe_indices:Tensor (10,) indices de L=10 keyframes geometricos de contexto
@@ -29,7 +30,7 @@ Formato del Grafo (HeteroData):
   Nodos de Recuperacion ('aug' — 30% Tube Augmentation, Apendices D y E de Instant Policy):
   - data['aug'].timestep_idx:      Tensor (T_aug,) indice temporal nominal t in [0, T_steps-1]
   - data['aug'].scene_pos:         Tensor (T_aug, 2048, 3) nube LiDAR 360° evaluada en la pose perturbada \tilde{T}_{WE}^t
-  - data['aug'].pos_enu:           Tensor (T_aug, 3) posicion perturbada \tilde{p}_t en ENU escalada (s=0.1)
+  - data['aug'].pos_enu:           Tensor (T_aug, 3) posicion perturbada \tilde{p}_t en ENU (default: s=1.0, metros SI)
   - data['aug'].yaw_enu:           Tensor (T_aug, 1) yaw perturbado \tilde{\psi}_t en ENU [rad]
   - data['aug'].rot_enu:           Tensor (T_aug, 3, 3) rotacion perturbada R_z(\tilde{\psi}_t)
   - data['aug'].pose_se3:          Tensor (T_aug, 4, 4) pose homogenea perturbada \tilde{T}_{WE}^t in SE(3)
@@ -38,7 +39,7 @@ Formato del Grafo (HeteroData):
   - data['aug'].flight_state_in:   Tensor (T_aug, 1) estado binario de entrada \tilde{s}_t (con 10% flip)
   - data['aug'].y:                 Tensor (T_aug, 8, 5) accion correctiva [\Delta\tilde{x}, \Delta\tilde{y}, \Delta\tilde{z}, \Delta\tilde{\psi}, s_{t+k}]
   - data['aug'].action_se3:        Tensor (T_aug, 8, 4, 4) transformaciones correctivas \tilde{T}_{EA}^{(t,k)} = (\tilde{T}_{WE}^t)^{-1} T_{WE}^{t+k}
-  - data['aug'].target_pos_enu:    Tensor (T_aug, 8, 3) posiciones nominales futuras p_{t+1..t+8} en ENU escalado
+  - data['aug'].target_pos_enu:    Tensor (T_aug, 8, 3) posiciones nominales futuras p_{t+1..t+8} en ENU (default: s=1.0, metros SI)
 
 Uso:
   # Procesar un episodio individual:
@@ -480,13 +481,13 @@ def _wrap_angle(angle: float) -> float:
 
 
 def get_uav_keypoints_body(
-    scale_factor: float = 0.1,
+    scale_factor: float = 1.0,
     arm_length: float = 0.25,
     z_height: float = 0.15
 ) -> np.ndarray:
     """
     Retorna los 6 nodos keypoint canonicos {p_g^i}_{i=1}^6 del UAV en el marco
-    local estabilizado (Horizontal FLU) escalados por scale_factor (s = 0.1):
+    local estabilizado (Horizontal FLU) multiplicados por scale_factor (default: s = 1.0, metros reales):
       0: Centro de masa (0, 0, 0)
       1: Proa   +X (+arm_length, 0, 0)
       2: Popa   -X (-arm_length, 0, 0)
@@ -876,7 +877,7 @@ def compute_tube_augmentation(
     landing: Optional[Dict[str, Any]],
     lidar_gen: SyntheticLidarGenerator,
     ep_seed: int = 42,
-    scale_factor: float = 0.1,
+    scale_factor: float = 1.0,
     horizon: int = 8,
     action_stride: int = 1,
     tube_aug_prob: float = 0.30,
@@ -1192,6 +1193,7 @@ def extract_trajectory_keyframes(
     seg_dists = np.linalg.norm(np.diff(pos, axis=0), axis=1)
     arc_len = np.concatenate([[0.0], np.cumsum(seg_dists)])
     total_len = float(arc_len[-1]) if arc_len[-1] > 1e-8 else 1.0
+    mean_step = max(total_len / max(1, T - 1), 1e-12)
 
     curvature = np.zeros(T, dtype=np.float64)
     yaw_rate = np.zeros(T, dtype=np.float64)
@@ -1200,9 +1202,9 @@ def extract_trajectory_keyframes(
         v2 = pos[t + 1] - pos[t]
         n1 = np.linalg.norm(v1)
         n2 = np.linalg.norm(v2)
-        if n1 > 1e-6 and n2 > 1e-6:
+        if n1 > 1e-6 * mean_step and n2 > 1e-6 * mean_step:
             cos_ang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-            curvature[t] = math.acos(float(cos_ang)) / (0.5 * (n1 + n2) + 1e-6)
+            curvature[t] = math.acos(float(cos_ang)) / (0.5 * (n1 + n2) + 1e-8 * mean_step)
         yaw_rate[t] = abs(_wrap_angle(float(yaw_flat[t + 1] - yaw_flat[t - 1])))
 
     c_max = float(np.max(curvature)) if np.max(curvature) > 1e-8 else 1.0
@@ -1333,7 +1335,7 @@ def build_heterodata_from_synthetic_lidar(
     parsed_data: Dict[str, Any],
     waypoints_file: Path,
     output_path: Path,
-    scale_factor: float = 0.1,
+    scale_factor: float = 1.0,
     r_max: float = 10.0,
     fps_points: int = 2048,
     subsample_step: int = 5,
@@ -1467,7 +1469,7 @@ def build_heterodata_from_synthetic_lidar(
     )
     timestamps_s = resampled["timestamps_s"]
     pos_enu_m = resampled["pos_enu_m"]                           # (T, 3) en metros
-    agent_positions = (pos_enu_m * scale_factor).astype(np.float32)  # (T, 3) escalado s=0.1
+    agent_positions = (pos_enu_m * scale_factor).astype(np.float32)  # (T, 3) en ENU (default s=1.0, metros)
     agent_yaw = resampled["yaw_enu"]                             # (T, 1) rad en [-pi, pi)
     agent_rot = resampled["rot_enu"]                             # (T, 3, 3) R_z(yaw) in SO(3)
     agent_q_ned = resampled["q_ned"]                             # (T, 4)
@@ -1528,9 +1530,9 @@ def build_heterodata_from_synthetic_lidar(
         action_stride=action_stride,
     )
 
-    # 3. Extraccion geometrica de L=10 keyframes de contexto
+    # 3. Extraccion geometrica de L=10 keyframes de contexto (en metros para invarianza de escala)
     keyframe_indices = extract_trajectory_keyframes(
-        agent_positions,
+        pos_enu_m,
         agent_yaw,
         flight_state,
         num_keyframes=num_keyframes,
@@ -1597,6 +1599,7 @@ def build_heterodata_from_synthetic_lidar(
         data["agent"].valid_mask = torch.from_numpy(valid_mask)
         data["agent"].timestamps_s = torch.from_numpy(timestamps_s.astype(np.float32))
         data["agent"].dt_s = torch.tensor(float(dt_s), dtype=torch.float32)
+        data["agent"].scale_factor = torch.tensor(float(scale_factor), dtype=torch.float32)
         data["agent"].keyframe_indices = torch.from_numpy(keyframe_indices)
         data["agent"].aug_mask = torch.from_numpy(aug_dict["aug_mask"])
         data["agent"].setpoint_raw = torch.from_numpy(setpoint_raw)
@@ -1650,6 +1653,7 @@ def build_heterodata_from_synthetic_lidar(
             valid_mask=valid_mask,
             timestamps_s=timestamps_s.astype(np.float32),
             dt_s=np.float32(dt_s),
+            scale_factor=np.float32(scale_factor),
             keyframe_indices=keyframe_indices,
             aug_mask=aug_dict["aug_mask"],
             setpoint_raw=setpoint_raw,
@@ -1671,6 +1675,18 @@ def build_heterodata_from_synthetic_lidar(
         if verbose:
             print(f"Torch/HeteroData no disponible. Datos SE(3) guardados en formato NumPy: {saved_path}")
             print(f"  Tube Augmentation: {T_aug}/{T} muestras de recuperacion ({100.0 * T_aug / max(1, T):.1f}%)")
+
+    meta_file = waypoints_file.parent / "episode_meta.json"
+    if meta_file.is_file() and saved_path.parent.resolve() == waypoints_file.parent.resolve():
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                ep_meta = json.load(f)
+            if ep_meta.get("scale_factor") != float(scale_factor):
+                ep_meta["scale_factor"] = float(scale_factor)
+                with open(meta_file, "w", encoding="utf-8") as f:
+                    json.dump(ep_meta, f, indent=2)
+        except Exception:
+            pass
 
     return {"ok": True, "T": T, "T_aug": T_aug, "saved_path": saved_path}
 
@@ -1854,7 +1870,7 @@ def process_dataset_directory(
     dataset_dir: Path,
     output_root: Optional[Path] = None,
     workers: int = 0,
-    scale_factor: float = 0.1,
+    scale_factor: float = 1.0,
     r_max: float = 10.0,
     fps_points: int = 2048,
     subsample_step: int = 5,
@@ -2048,8 +2064,8 @@ def main():
     parser.add_argument(
         "--scale",
         type=float,
-        default=0.1,
-        help="Factor de escala metrica s (default: 0.1)"
+        default=1.0,
+        help="Factor de escala metrica s (default: 1.0, unidades fisicas SI en metros)"
     )
     parser.add_argument(
         "--fps-points",

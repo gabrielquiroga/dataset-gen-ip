@@ -97,7 +97,7 @@ def test_unidirectional_dependency_rule_core_never_imports_policy_or_torch():
 def test_se3_cumulative_incremental_and_4dof_roundtrip():
     """Verifica exactitud numerica en conversion acumulada <-> incremental y normalizacion 4-DoF."""
     rng = np.random.default_rng(123)
-    dpos = rng.uniform(-0.04, 0.04, size=(5, 8, 3)).astype(np.float32)
+    dpos = rng.uniform(-0.4, 0.4, size=(5, 8, 3)).astype(np.float32)
     dyaw = rng.uniform(-0.35, 0.35, size=(5, 8)).astype(np.float32)
 
     delta_np = build_se3_horizontal_flu_numpy(dpos, dyaw)
@@ -128,7 +128,7 @@ def test_decoupled_keypoint_flow_and_4dof_svd_roundtrip_and_gravity_alignment():
     y que ante ruido 3D arbitrario mantiene roll=0, pitch=0 exactamente.
     """
     rng = np.random.default_rng(77)
-    dpos = rng.uniform(-0.05, 0.05, size=(10, 8, 3)).astype(np.float32)
+    dpos = rng.uniform(-0.5, 0.5, size=(10, 8, 3)).astype(np.float32)
     dyaw = rng.uniform(-0.50, 0.50, size=(10, 8)).astype(np.float32)
     target_se3 = build_se3_horizontal_flu_torch(
         torch.from_numpy(dpos), torch.from_numpy(dyaw)
@@ -153,7 +153,7 @@ def test_decoupled_keypoint_flow_and_4dof_svd_roundtrip_and_gravity_alignment():
     # Perturbacion ruidosa 3D en keypoints destino -> SVD 4-DoF debe mantener R[2,2]==1 y det(R)==+1
     kp_np = get_uav_keypoints_body_numpy()
     noisy_dst = transform_keypoints(target_se3.numpy(), keypoints_body=kp_np) + rng.normal(
-        0.0, 0.005, size=(10, 8, 6, 3)
+        0.0, 0.05, size=(10, 8, 6, 3)
     ).astype(np.float32)
     T_aligned = align_keypoints_svd_horizontal_flu(kp_np, noisy_dst)
     np.testing.assert_allclose(T_aligned[..., 2, 0], 0.0, atol=1e-6)

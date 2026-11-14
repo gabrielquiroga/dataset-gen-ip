@@ -11,7 +11,7 @@ Implementa la observacion privilegiada para UAV Instant Policy:
 - Transforma puntos canonicos al marco egocentrico del dron (FLU):
     P_dron = T_{world, dron}^{-1} * T_{world, landmark} * P_can
 - Aplica filtro de alcance LiDAR 360° (R <= R_max = 10.0 m)
-- Aplica factor de escala metrica s = 0.1 para evitar aliasing en embeddings sinusoidales
+- Opcionalmente aplica un factor de escala metrica `scale_factor` (default: 1.0, unidades fisicas SI en metros reales)
 - Submuestrea con Farthest Point Sampling (FPS) a exactamente 2048 puntos
 - Retorna tensores de forma (2048, 3)
 
@@ -581,7 +581,8 @@ def generate_canonical_landing_pad(
 
 class SyntheticLidarGenerator:
     """
-    Generador de nubes LiDAR 360° omnidireccionales sinteticas (R <= 10.0 m, 2048 puntos, escala s = 0.1).
+    Generador de nubes LiDAR 360° omnidireccionales sinteticas (R <= 10.0 m, 2048 puntos,
+    default scale_factor = 1.0 en metros fisicos reales).
     Por defecto opera en el marco egocentrico estabilizado por gravedad (Horizontal FLU,
     gravity_aligned=True) para eliminar la distorsion geometrica inducida por el cabeceo (pitch)
     y alabeo (roll) de cuadricopteros subactuados.
@@ -591,7 +592,7 @@ class SyntheticLidarGenerator:
         self,
         r_max: float = 10.0,
         r_min: float = 0.1,
-        scale_factor: float = 0.1,
+        scale_factor: float = 1.0,
         target_points: int = 2048,
         cache_models: bool = True,
         gravity_aligned: bool = True
@@ -600,7 +601,8 @@ class SyntheticLidarGenerator:
         Args:
             r_max: Rango maximo del LiDAR en metros (default: 10.0 m).
             r_min: Rango minimo del LiDAR en metros (default: 0.1 m).
-            scale_factor: Factor de escala metrica s (default: 0.1 para coincidir con espacio sinusoidal).
+            scale_factor: Factor de escala metrica s (default: 1.0, unidades fisicas SI en metros;
+                el escalado para codificacion sinusoidal de Fourier se aplica internamente en la red).
             target_points: Cantidad exacta de puntos de salida (default: 2048).
             cache_models: Si True, precalcula y cachea los modelos canonicos de alta resolucion.
             gravity_aligned: Si True (default), proyecta al marco Horizontal FLU estabilizado por
@@ -678,8 +680,8 @@ class SyntheticLidarGenerator:
             gravity_aligned: Si se especifica, sobreescribe self.gravity_aligned.
 
         Returns:
-            Arreglo o tensor de dimension (2048, 3) escalado por s = 0.1 en marco egocentrico FLU
-            (o Horizontal FLU si gravity_aligned=True).
+            Arreglo o tensor de dimension (2048, 3) en marco egocentrico FLU (Horizontal FLU si
+            gravity_aligned=True), multiplicado por self.scale_factor (default: 1.0, metros reales).
         """
         use_gravity_aligned = self.gravity_aligned if gravity_aligned is None else bool(gravity_aligned)
 
@@ -779,18 +781,19 @@ class SyntheticLidarGenerator:
             mask = (distances >= self.r_min) & (distances <= self.r_max)
             pts_drone_filtered = pts_drone[mask]
 
-        # Aplicar factor de escala metrica s = 0.1
-        pts_scaled = (pts_drone_filtered * self.scale_factor).astype(np.float32)
-
-        # Submuestreo por Farthest Point Sampling a exactamente 2048 puntos.
+        # Submuestreo por Farthest Point Sampling en metros reales para garantizar equivariancia
+        # exacta respecto a `scale_factor` (sin permutaciones por redondeo float32 en FPS).
         # Si N=0 (ningun objeto dentro de r_max), coloca los puntos en la frontera exterior
-        # s * r_max (ej. 1.0), nunca en el origen (0,0,0).
-        pts_sampled = fps_numpy(
-            pts_scaled,
+        # r_max (10.0 m), escalada posteriormente por self.scale_factor, nunca en (0,0,0).
+        pts_sampled_m = fps_numpy(
+            pts_drone_filtered.astype(np.float32),
             n_samples=self.target_points,
             seed=seed,
-            empty_fallback_radius=self.r_max * self.scale_factor,
+            empty_fallback_radius=self.r_max,
         )
+
+        # Aplicar factor de escala metrica al final (default: 1.0 = metros fisicos reales)
+        pts_sampled = (pts_sampled_m * self.scale_factor).astype(np.float32)
 
         if as_tensor:
             if not HAS_TORCH:
@@ -828,11 +831,11 @@ def run_self_tests() -> bool:
     small_pts = np.random.uniform(-1, 1, size=(50, 3)).astype(np.float32)
     sampled_pad = fps_numpy(small_pts, 2048, seed=42)
     assert sampled_pad.shape == (2048, 3), f"FPS padding fallo: {sampled_pad.shape}"
-    # Verificar caso N = 0 -> anillo en frontera exterior (r = 1.0), nunca en (0,0,0)
+    # Verificar caso N = 0 -> anillo en frontera exterior (r = 10.0 m), nunca en (0,0,0)
     empty_pts = np.zeros((0, 3), dtype=np.float32)
-    sampled_empty = fps_numpy(empty_pts, 2048, seed=42, empty_fallback_radius=1.0)
+    sampled_empty = fps_numpy(empty_pts, 2048, seed=42, empty_fallback_radius=10.0)
     assert sampled_empty.shape == (2048, 3)
-    assert np.allclose(np.linalg.norm(sampled_empty, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.linalg.norm(sampled_empty, axis=1), 10.0, atol=1e-5)
     print("  [OK] Farthest Point Sampling (FPS) y casos de borde verificados.")
 
     # 3. Test de transformaciones de marco (NED/FRD -> ENU/FLU) para multiples rumbos
@@ -859,15 +862,15 @@ def run_self_tests() -> bool:
     print("  [OK] Transformaciones matematicas de marcos verificadas en multiples cuadrantes.")
 
     # 4. Test de proyeccion egocentrica rigurosa, soporte R / q_ned e invarianza a pitch/roll
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048, gravity_aligned=True)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048, gravity_aligned=True)
 
     # Dron mirando al Norte hacia un aro colocado exactamente al Norte a 5.0m
     lm_north = [{"id": "gate_n", "type": "square_gate", "x": 0.0, "y": 5.0, "z": 1.5, "yaw": math.pi / 2.0}]
     drone_north_R = {"x": 0.0, "y": 0.0, "z": 1.5, "R": R_conv_north}
     cloud_north_R = gen.generate_pointcloud(drone_north_R, lm_north, seed=42)
     mean_north_R = np.mean(cloud_north_R, axis=0)
-    assert mean_north_R[0] > 0.45, f"Aro al Norte con rumbo Norte debe tener X_flu > 0.45: {mean_north_R}"
-    assert abs(mean_north_R[1]) < 0.05, f"Aro al Norte con rumbo Norte debe tener Y_flu ~ 0: {mean_north_R}"
+    assert mean_north_R[0] > 4.5, f"Aro al Norte con rumbo Norte debe tener X_flu > 4.5 m: {mean_north_R}"
+    assert abs(mean_north_R[1]) < 0.5, f"Aro al Norte con rumbo Norte debe tener Y_flu ~ 0 m: {mean_north_R}"
 
     # Verificar que un cabeceo (pitch = 20 deg) en q_ned NO altera la nube con gravity_aligned=True
     pitch_rad = math.radians(20.0)
@@ -890,7 +893,7 @@ def run_self_tests() -> bool:
 
     assert cloud.shape == (2048, 3), f"Nube sintetica debe ser (2048, 3), obtenida {cloud.shape}"
     max_dist = np.max(np.linalg.norm(cloud, axis=1))
-    assert max_dist <= 1.0 + 1e-4, f"Puntos no deben exceder s * r_max = 1.0m. Obtenido {max_dist}"
+    assert max_dist <= 10.0 + 1e-4, f"Puntos no deben exceder s * r_max = 10.0 m. Obtenido {max_dist}"
     mean_x = np.mean(cloud[:, 0])
     assert mean_x > 0.0, f"Los landmarks al frente deben proyectarse con X_flu > 0, obtenido mean_x={mean_x}"
     print(f"  [OK] Generador completo y retrocompatibilidad con hoops validada. Radio maximo: {max_dist:.3f} m.")
@@ -899,7 +902,7 @@ def run_self_tests() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Generador de Nube de Puntos Sintetica LiDAR 360°")
-    parser.add_argument("--test", action="store_true", help="Ejecutar suite de tests unitarios")
+    parser.add_argument("--test", "--self-test", action="store_true", help="Ejecutar suite de tests unitarios")
     parser.add_argument("--waypoints", type=Path, help="Ruta al archivo waypoints.yaml")
     parser.add_argument(
         "--drone-pose",
@@ -909,7 +912,7 @@ def main():
         default=[0.0, 0.0, 1.5, 0.0],
         help="Pose del dron en Gazebo ENU [X Y Z Yaw(rad)]"
     )
-    parser.add_argument("--scale", type=float, default=0.1, help="Factor de escala metrica (default: 0.1)")
+    parser.add_argument("--scale", type=float, default=1.0, help="Factor de escala metrica s (default: 1.0, metros reales)")
     parser.add_argument("--r-max", type=float, default=10.0, help="Alcance maximo en metros (default: 10.0)")
     parser.add_argument("--points", type=int, default=2048, help="Puntos objetivo FPS (default: 2048)")
 

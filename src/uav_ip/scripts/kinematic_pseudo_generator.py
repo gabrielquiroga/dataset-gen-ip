@@ -497,6 +497,7 @@ def _generate_task_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             "duration_s": round(float(synth["duration_s"]), 3),
             "source_domain": "kinematic_spline",
             "catalog_version": str(job.get("catalog_version", "v2")),
+            "scale_factor": float(scale_factor),
             "metrics": val_report.get("metrics", {}),
         }
         with open(ep_dir / "episode_meta.json", "w", encoding="utf-8") as f:
@@ -554,7 +555,7 @@ def generate_kinematic_dataset(
     exclude_signatures_from: Optional[List[Path]] = None,
     seed: int = 1000,
     workers: int = 0,
-    scale_factor: float = 0.1,
+    scale_factor: float = 1.0,
     fps_points: int = 2048,
     r_max: float = 10.0,
     action_horizon: int = 8,
@@ -694,6 +695,191 @@ def generate_kinematic_dataset(
     }
 
 
+def _reprocess_episode_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Worker multiproceso que regenera heterodata.pt deterministamente desde waypoints.yaml."""
+    t0 = time.perf_counter()
+    ep_dir: Path = job["ep_dir"]
+    label: str = job["label"]
+    wp_file = ep_dir / "waypoints.yaml"
+    try:
+        with open(wp_file, "r", encoding="utf-8") as f:
+            wp_cfg = yaml.safe_load(f)
+        sim_bundle = synthesize_kinematic_telemetry(wp_cfg)
+        res = build_heterodata_from_synthetic_lidar(
+            parsed_data=sim_bundle["telemetry"],
+            waypoints_file=wp_file,
+            output_path=ep_dir / "heterodata",
+            scale_factor=float(job["scale_factor"]),
+            r_max=float(job["r_max"]),
+            fps_points=int(job["fps_points"]),
+            subsample_step=5,
+            trim_idle=True,
+            trim_start="takeoff_exit",
+            action_horizon=int(job["action_horizon"]),
+            action_stride=int(job["action_stride"]),
+            num_keyframes=int(job["num_keyframes"]),
+            gravity_aligned=True,
+            tube_aug_prob=float(job["tube_aug_prob"]),
+            tube_sigma_pos=float(job["tube_sigma_pos"]),
+            tube_sigma_yaw_deg=float(job["tube_sigma_yaw_deg"]),
+            tube_decay=float(job["tube_decay"]),
+            state_flip_prob=float(job["state_flip_prob"]),
+            require_torch=bool(job["require_torch"]),
+            verbose=False,
+        )
+        if not res.get("ok", False):
+            return {
+                "label": label,
+                "status": "error",
+                "T": 0,
+                "T_aug": 0,
+                "elapsed_s": time.perf_counter() - t0,
+                "error": "build_heterodata failed",
+            }
+        meta_file = ep_dir / "episode_meta.json"
+        if meta_file.is_file():
+            with open(meta_file, "r", encoding="utf-8") as f:
+                ep_meta = json.load(f)
+            ep_meta["scale_factor"] = float(job["scale_factor"])
+            with open(meta_file, "w", encoding="utf-8") as f:
+                json.dump(ep_meta, f, indent=2)
+        return {
+            "label": label,
+            "status": "ok",
+            "T": int(res["T"]),
+            "T_aug": int(res["T_aug"]),
+            "elapsed_s": time.perf_counter() - t0,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "label": label,
+            "status": "error",
+            "T": 0,
+            "T_aug": 0,
+            "elapsed_s": time.perf_counter() - t0,
+            "error": str(exc),
+        }
+
+
+def reprocess_existing_kinematic_dataset(
+    dataset_dir: Path,
+    scale_factor: float = 1.0,
+    fps_points: int = 2048,
+    r_max: float = 10.0,
+    action_horizon: int = 8,
+    action_stride: int = 1,
+    num_keyframes: int = 10,
+    tube_aug_prob: float = 0.30,
+    tube_sigma_pos: float = 0.25,
+    tube_sigma_yaw_deg: float = 5.0,
+    tube_decay: float = 0.70,
+    state_flip_prob: float = 0.10,
+    workers: int = 0,
+    require_torch: bool = False,
+) -> Dict[str, Any]:
+    """
+    Reprocesa en lote y de manera determinista todos los episodios existentes (`task_XXXX/episode_YY`)
+    de un dataset cinemático leyendo sus `waypoints.yaml` preservados, regenerando `heterodata.pt`
+    con `scale_factor` sin re-muestrear circuitos ni alterar `splits/`.
+    """
+    if require_torch and (HeteroData is None or torch is None):
+        raise RuntimeError(
+            "PyTorch y/o torch_geometric no están disponibles (--require-torch activo). "
+            "Ejecuta con ~/venv_ip/bin/python3."
+        )
+
+    dataset_dir = Path(dataset_dir).resolve()
+    jobs: List[Dict[str, Any]] = []
+    for task_dir in sorted(dataset_dir.glob("task_*")):
+        if not task_dir.is_dir():
+            continue
+        for ep_dir in sorted(task_dir.glob("episode_*")):
+            if not ep_dir.is_dir():
+                continue
+            wp_file = ep_dir / "waypoints.yaml"
+            if not wp_file.is_file():
+                continue
+            jobs.append({
+                "label": f"{task_dir.name}/{ep_dir.name}",
+                "ep_dir": ep_dir,
+                "scale_factor": float(scale_factor),
+                "fps_points": int(fps_points),
+                "r_max": float(r_max),
+                "action_horizon": int(action_horizon),
+                "action_stride": int(action_stride),
+                "num_keyframes": int(num_keyframes),
+                "tube_aug_prob": float(tube_aug_prob),
+                "tube_sigma_pos": float(tube_sigma_pos),
+                "tube_sigma_yaw_deg": float(tube_sigma_yaw_deg),
+                "tube_decay": float(tube_decay),
+                "state_flip_prob": float(state_flip_prob),
+                "require_torch": bool(require_torch),
+            })
+
+    if not jobs:
+        print(f"ERROR: No se encontraron episodios con waypoints.yaml en {dataset_dir}")
+        return {"total": 0, "ok": 0, "errors": ["no_episodes_found"], "total_T": 0, "total_T_aug": 0, "elapsed_s": 0.0}
+
+    try:
+        from uav_ip.synthetic_lidar import _get_fps_c_kernel
+        _get_fps_c_kernel()
+    except Exception:
+        pass
+
+    cpu_cores = os.cpu_count() or 4
+    num_workers = cpu_cores if workers <= 0 else min(int(workers), cpu_cores)
+    num_workers = min(num_workers, len(jobs))
+
+    print("=" * 72)
+    print(f" Reprocesamiento Determinista de Dataset Cinemático (scale={scale_factor})")
+    print(f"   Directorio dataset : {dataset_dir}")
+    print(f"   Episodios hallados : {len(jobs)}")
+    print(f"   Workers paralelos  : {num_workers}")
+    print("=" * 72)
+
+    t_start = time.perf_counter()
+    results = []
+    if num_workers == 1:
+        for idx, job in enumerate(jobs, 1):
+            res = _reprocess_episode_worker(job)
+            results.append(res)
+            if idx % 50 == 0 or idx == len(jobs) or res["status"] != "ok":
+                print(
+                    f"  [{idx:4d}/{len(jobs):4d}] {res['label']:22s} | {res['status'].upper()} | "
+                    f"T={res['T']:3d} (+{res['T_aug']:2d} aug)"
+                )
+    else:
+        with mp.Pool(processes=num_workers) as pool:
+            for idx, res in enumerate(pool.imap_unordered(_reprocess_episode_worker, jobs), 1):
+                results.append(res)
+                if idx % 50 == 0 or idx == len(jobs) or res["status"] != "ok":
+                    print(
+                        f"  [{idx:4d}/{len(jobs):4d}] {res['label']:22s} | {res['status'].upper()} | "
+                        f"T={res['T']:3d} (+{res['T_aug']:2d} aug)"
+                    )
+
+    elapsed_total = time.perf_counter() - t_start
+    n_ok = sum(1 for r in results if r["status"] == "ok")
+    err_msgs = [f"{r['label']}: {r['error']}" for r in results if r["status"] != "ok"]
+    total_T = sum(r["T"] for r in results)
+    total_aug = sum(r["T_aug"] for r in results)
+
+    print("-" * 72)
+    print(f" Reprocesamiento completado en {elapsed_total:.2f}s: {n_ok}/{len(jobs)} exitosos, {len(err_msgs)} errores.")
+    print(f" Estados regenerados: {total_T} nominales + {total_aug} tube-augmented = {total_T + total_aug}.")
+    print("=" * 72)
+
+    return {
+        "total": len(jobs),
+        "ok": n_ok,
+        "errors": err_msgs,
+        "total_T": total_T,
+        "total_T_aug": total_aug,
+        "elapsed_s": elapsed_total,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generador cinemático de pseudo-demostraciones SE(3) para Instant Policy UAV."
@@ -722,9 +908,27 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=1000, help="Semilla aleatoria base (default: 1000)")
     parser.add_argument("--workers", "-j", type=int, default=0, help="Procesos paralelos (default: 0 = todos los núcleos)")
+    parser.add_argument("--scale", type=float, default=1.0, help="Factor de escala métrica s (default: 1.0, metros SI)")
     parser.add_argument("--tube-decay", type=float, default=0.70, help="Factor gamma de Tube Augmentation (default: 0.70)")
+    parser.add_argument(
+        "--reprocess-existing",
+        action="store_true",
+        help="Regenera heterodata.pt in-place a partir de los waypoints.yaml existentes en --output-dir",
+    )
     parser.add_argument("--require-torch", action="store_true", help="Exigir exportación en formato PyTorch Geometric (.pt)")
     args = parser.parse_args()
+
+    if args.reprocess_existing:
+        reproc = reprocess_existing_kinematic_dataset(
+            dataset_dir=args.output_dir,
+            scale_factor=args.scale,
+            workers=args.workers,
+            tube_decay=args.tube_decay,
+            require_torch=args.require_torch,
+        )
+        if reproc["errors"] or reproc["total"] == 0:
+            sys.exit(1)
+        return
 
     summary = generate_kinematic_dataset(
         output_dir=args.output_dir,
@@ -735,6 +939,7 @@ def main() -> None:
         exclude_signatures_from=args.exclude_signatures_from,
         seed=args.seed,
         workers=args.workers,
+        scale_factor=args.scale,
         tube_decay=args.tube_decay,
         require_torch=args.require_torch,
     )

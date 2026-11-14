@@ -26,7 +26,7 @@ flowchart LR
         B["Juez Geométrico Independiente (validate_episode.py)\n- Envolvente x500 (0.4357 m)\n- Cota inferior h/2\n- Persistencia de aterrizaje (3.0s)"]
     end
     subgraph Postproceso ["3. Postproceso ML (HeteroData)"]
-        C1["LiDAR Sintético 360° (synthetic_lidar.py)\n[2048 pts FPS en Horizontal FLU, s=0.1]"]
+        C1["LiDAR Sintético 360° (synthetic_lidar.py)\n[2048 pts FPS en Horizontal FLU, metros (s=1.0)]"]
         C2["Conversor Batch PyG (bag_to_heterodata.py)\n[Horizonte T=8, Tube Aug gamma=0.70, vel_flu]"]
     end
     subgraph Auditoria ["4. Auditoría y Splits"]
@@ -220,7 +220,7 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
   * `--overwrite`: Sobrescribir archivos `heterodata` previamente generados.
   * `--skip-existing`: Omitir episodios que ya tengan su archivo `heterodata.pt`.
   * `--workers` (`-j`): Número de procesos paralelos para acelerar la conversión (default: todos los núcleos).
-  * `--scale`: Factor de escala métrica $s$ aplicado a posiciones y nubes (default: 0.1).
+  * `--scale`: Factor de escala métrica $s$ aplicado a posiciones y nubes (default: 1.0, metros reales).
 
 * **Ejemplo de Ejecución:**
   ```bash
@@ -235,8 +235,8 @@ A continuación se detalla el propósito, parámetros y modo de uso de cada scri
 * **Qué esperar y estructura del grafo resultante:**
   * Cada episodio aceptado tendrá su archivo `heterodata.pt`.
   * Estructura de tensores en `HeteroData`:
-    * `data['scene'].pos`: $(T, 2048, 3)$ nube de puntos egocéntrica en Horizontal FLU (escala $s=0.1$).
-    * `data['agent'].x` / `pos_enu`: $(T, 3)$ posiciones escaladas.
+    * `data['scene'].pos`: $(T, 2048, 3)$ nube de puntos egocéntrica en Horizontal FLU (metros reales, $s=1.0$).
+    * `data['agent'].x` / `pos_enu`: $(T, 3)$ posiciones en metros reales ($s=1.0$).
     * `data['agent'].pose_se3`: $(T, 4, 4)$ matriz homogénea $T_{WE}^t \in SE(3)$.
     * `data['agent'].vel_flu`: $(T, 3)$ velocidad lineal en Horizontal FLU a $10\text{ Hz}$.
     * `data['agent'].y` / `action_se3`: $(T, 8, 5)$ y $(T, 8, 4, 4)$ horizonte de $T=8$ acciones relativas futuras.

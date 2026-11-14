@@ -79,15 +79,20 @@ def test_coordinate_frame_transformations():
 
 
 def test_egocentric_projection_and_heading_invariance():
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048)
 
     # 1. Drone facing East (yaw_enu = 0), gate located East at (5.0, 0.0, 1.5)
     drone_east = {"x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
     lm_east = [{"id": "g_east", "type": "square_gate", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0}]
     cloud_east = gen.generate_pointcloud(drone_east, lm_east, seed=42)
     mean_east = np.mean(cloud_east, axis=0)
-    assert mean_east[0] > 0.45
-    assert abs(mean_east[1]) < 0.05
+    assert mean_east[0] > 4.5
+    assert abs(mean_east[1]) < 0.5
+
+    # Explicit non-unit scale_factor=0.1 remains supported via parameter
+    gen_scaled = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+    cloud_scaled = gen_scaled.generate_pointcloud(drone_east, lm_east, seed=42)
+    assert np.allclose(cloud_scaled, cloud_east * 0.1, atol=1e-5)
 
     # 2. Drone facing North (yaw_enu = pi/2, q_ned = [1,0,0,0]), gate located North at (0.0, 5.0, 1.5)
     q_ned_north = [1.0, 0.0, 0.0, 0.0]
@@ -95,8 +100,8 @@ def test_egocentric_projection_and_heading_invariance():
     lm_north = [{"id": "g_north", "type": "square_gate", "x": 0.0, "y": 5.0, "z": 1.5, "yaw": math.pi / 2.0}]
     cloud_north_qned = gen.generate_pointcloud(drone_north_qned, lm_north, seed=42)
     mean_north_qned = np.mean(cloud_north_qned, axis=0)
-    assert mean_north_qned[0] > 0.45
-    assert abs(mean_north_qned[1]) < 0.05
+    assert mean_north_qned[0] > 4.5
+    assert abs(mean_north_qned[1]) < 0.5
 
     # 3. Drone facing North passing rotation matrix R directly
     _, R_north = px4_odometry_to_gazebo_enu([0, 0, 0], q_ned_north)
@@ -107,7 +112,7 @@ def test_egocentric_projection_and_heading_invariance():
 
 def test_gravity_aligned_pitch_and_roll_invariance():
     """Verifica que inclinaciones puras de pitch/roll no distorsionen Z_FLU cuando gravity_aligned=True."""
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048, gravity_aligned=True)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048, gravity_aligned=True)
     lm_north = [{"id": "g_north", "type": "square_gate", "x": 0.0, "y": 6.0, "z": 1.5, "yaw": math.pi / 2.0}]
 
     # Level drone facing North (yaw_ned = 0)
@@ -135,11 +140,11 @@ def test_gravity_aligned_pitch_and_roll_invariance():
     cloud_tilted_raw = gen.generate_pointcloud(
         {"x": 0.0, "y": 0.0, "z": 1.5, "q_ned": q_tilted}, lm_north, seed=101, gravity_aligned=False
     )
-    assert abs(np.mean(cloud_tilted_raw[:, 2]) - np.mean(cloud_level[:, 2])) > 0.10
+    assert abs(np.mean(cloud_tilted_raw[:, 2]) - np.mean(cloud_level[:, 2])) > 1.0
 
 
 def test_generator_hoops_backwards_compatibility():
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048)
     # Legacy hoops format (e.g. task_0000)
     legacy_hoops = [
         {"name": "aro_1", "x": 5.0, "y": 0.0, "z": 1.5, "yaw": 0.0},
@@ -149,7 +154,7 @@ def test_generator_hoops_backwards_compatibility():
     drone_pose = {"x": 0.0, "y": 0.0, "z": 1.5, "yaw": 0.0}
     cloud = gen.generate_pointcloud(drone_pose, legacy_hoops, landing=landing, seed=42)
     assert cloud.shape == (2048, 3)
-    assert np.max(np.linalg.norm(cloud, axis=1)) <= 1.0 + 1e-4
+    assert np.max(np.linalg.norm(cloud, axis=1)) <= 10.0 + 1e-4
 
 
 def test_tube_augmentation_se3_convergence():
@@ -171,7 +176,7 @@ def test_tube_augmentation_se3_convergence():
     from bag_to_heterodata import compute_se3_action_horizon, compute_tube_augmentation
 
     T = 40
-    scale = 0.1
+    scale = 1.0
     # Trayectoria nominal recta por el eje del aro en Y=0, Z=1.5 m, avanzando en +X
     pos_enu_m = np.column_stack([
         np.linspace(0.0, 12.0, T),
@@ -1044,7 +1049,7 @@ def test_tube_augmentation_euclidean_sphere_and_collision_filtering():
     ]).astype(np.float64)
     yaw_enu = np.zeros((T, 1), dtype=np.float32)
     flight_state = np.ones((T, 1), dtype=np.float32)
-    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=0.1, target_points=2048)
+    gen = SyntheticLidarGenerator(r_max=10.0, scale_factor=1.0, target_points=2048)
 
     aug = compute_tube_augmentation(
         pos_enu_m=pos_enu_m,
@@ -1054,7 +1059,7 @@ def test_tube_augmentation_euclidean_sphere_and_collision_filtering():
         landing={"x": 11.0, "y": 0.0, "z": 0.05},
         lidar_gen=gen,
         ep_seed=12345,
-        scale_factor=0.1,
+        scale_factor=1.0,
         horizon=8,
         action_stride=1,
         tube_aug_prob=0.50,
@@ -1067,7 +1072,7 @@ def test_tube_augmentation_euclidean_sphere_and_collision_filtering():
     assert float(np.max(dp_norms)) <= 0.60 + 1e-5, f"Violacion de esfera euclidea: max={np.max(dp_norms)}"
 
     # Verificar que todas las poses perturbadas mantienen clearance >= UAV_COLLISION_RADIUS_XY (0.30 m)
-    pert_pos_m = (aug["pos_enu"] / 0.1).astype(np.float64)
+    pert_pos_m = (aug["pos_enu"] / 1.0).astype(np.float64)
     for idx_a in range(len(pert_pos_m)):
         t_step = int(aug["timestep_idx"][idx_a])
         t_next = min(T - 1, t_step + 1)

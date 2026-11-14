@@ -33,7 +33,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 │   synthetic_lidar.py                  bag_to_heterodata.py                   │
 │   (Observación 360° en marco          (Extrae poses SE(3), acciones T=8,     │
 │    Horizontal FLU, FPS 2048,           keyframes L=10, Tube Augmentation     │
-│    escala s=0.1, determinista)         con decaimiento gamma=0.70 y vel_flu) │
+│    metros s=1.0, determinista)         con decaimiento gamma=0.70 y vel_flu) │
 │                                                    │                         │
 │                                       audit_dataset.py                       │
 │                                       (Auditoría 3 capas: finitud, cotas     │
@@ -68,7 +68,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 | **`kinematic_pseudo_generator.py`** | `src/uav_ip/scripts/` | **Completado** | Generador ultrarrápido de pseudo-demostraciones cinemáticas a $50\text{ Hz}$ con actitud por dinámica diferencial ($\mathbf{a} - \mathbf{g}$), validado 1-a-1 por el juez geométrico y con exclusión estricta de firmas semánticas (`--exclude-signatures-from`). |
 | **`validation_geometry.py`** | `src/uav_ip/uav_ip/` | **Completado** | Fuente única de verdad geométrica con radio físico real del x500 hasta puntas de hélice ($0.3857\text{ m}$), radio de colisión ($0.4357\text{ m}$), tolerancias dinámicas y especificación compartida de obstáculos. |
 | **`validate_episode.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Validador independiente de 5 estados (configuración, MCAP/CRC32, odometría obligatoria, misión geométrica y aterrizaje continuo en ventana de $0.50\text{ s}$), soporte multi-segmento para órbitas y advertencia de clearance de pala. |
-| **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR omnidireccional 360° en marco *Horizontal FLU* ($s=0.1$, 2048 puntos FPS determinista con kernel C SIMD), paridad exacta en aros con patas y cuota acotada en plataforma. |
+| **`synthetic_lidar.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Sintetizador LiDAR omnidireccional 360° en marco *Horizontal FLU* (unidades físicas $s=1.0$, 2048 puntos FPS determinista con kernel C SIMD), paridad exacta en aros con patas y cuota acotada en plataforma. |
 | **`bag_to_heterodata.py`** | `src/uav_ip/scripts/` | **Completado** | Conversor por lotes a `HeteroData` PyTorch Geometric (.pt) con exportación de velocidades lineales `vel_flu` $(T, 3)$, *Tube Augmentation* con decaimiento exponencial $\gamma = 0.70$ y flags `--require-torch` y `--overwrite`. |
 | **`audit_dataset.py`** | `src/uav_ip/scripts/` | **Completado** | Auditoría universal en 3 capas (vuelos brutos, integridad de tensores con cota de velocidad física $\le 6.5\text{ m/s}$, y particionado formal `train`/`val`/`held_out` disjunto por firmas sin fuga de datos). |
 | **`visualize_dataset.py`** | `src/uav_ip/uav_ip/` y `scripts/` | **Completado** | Visualizador 3D estático interactivo, generador de animaciones GIF e inspector gráfico de trayectorias de recuperación por *Tube Augmentation* (`--show-aug`). |
@@ -81,7 +81,7 @@ El proyecto estructura el flujo completo desde la generación procedimental hast
 ### Hito 0: Pipeline Core E2E y Validación de Vuelo Base — [COMPLETADO]
 - [x] Modelo de simulación ligero `gz_x500` ($\text{RTF} \ge 1.0\times$).
 - [x] Protocolo de armado seguro a Offboard en `base_pilot.py` (50 setpoints previos a 50 Hz).
-- [x] Generador base de LiDAR privilegiado `synthetic_lidar.py` (2048 puntos, FPS, escala $s=0.1$).
+- [x] Generador base de LiDAR privilegiado `synthetic_lidar.py` (2048 puntos, FPS, unidades métricas $s=1.0$).
 - [x] Grabación compacta en rosbags MCAP ($< 5\text{ MB}$ por vuelo).
 - [x] Aleatorización espacial intra-tarea determinista.
 - [x] Prototipo inicial de conversión a grafos `HeteroData` con `bag_to_heterodata.py`.
@@ -140,7 +140,7 @@ flowchart LR
   * **Disponibilidad y Evaluación del Checkpoint Oficial de Vosylius & Johns (`vv19/instant_policy`):**
     * *Disponibilidad:* Los pesos originales del paper están disponibles públicamente mediante el script `./download_weights.sh` del repositorio oficial (descarga `model.pt` desde Google Drive).
     * *Recomendación:* Se recomienda descargarlo e inspeccionarlo como **referencia técnica y baseline comparativo** (para auditar capas exactas, normalizaciones y dimensiones de embeddings).
-    * *Limitación por Domain Shift:* No se recomienda depender exclusivamente de él para el modelo final de UAV, dado que fue entrenado sobre objetos sólidos cerrados de mesa de ShapeNet (tazas, botellas, platos en $\sim 0.8\text{ m}$), mientras que en `uav_ip` la escena abarca $10\text{ m}$ ($s=0.1$) con vigas delgadas huecas de $1\text{–}2\text{ cm}$, postes y suelo.
+    * *Limitación por Domain Shift:* No se recomienda depender exclusivamente de él para el modelo final de UAV, dado que fue entrenado sobre objetos sólidos cerrados de mesa de ShapeNet (tazas, botellas, platos en $\sim 0.8\text{ m}$), mientras que en `uav_ip` la escena abarca $10\text{ m}$ reales ($s=1.0$, con preescalado $0.1$ solo en `SinusoidalPosEmb3D`) con vigas delgadas huecas de $0.10\text{ m}$, postes de $\varnothing 0.20\text{ m}$ y suelo.
     * *Alternativa canónica para UAV:* Pre-entrenar un encoder PointNet++ liviano con pérdida de ocupación 3D implícita sobre las primitivas geométricas exactas de nuestro catálogo $v2$ (cilindros, vigas de puertas y prismas de aterrizaje generados sintéticamente con `synthetic_lidar.py`) y congelarlo para la etapa de difusión.
 * **Redes de Paso de Mensajes ($\sigma \to \varphi \to \psi$):**
   * $\sigma$: Encoder de características locales entre escena y dron.
@@ -181,7 +181,7 @@ flowchart LR
   - *Normalización y escala traslación/rotación:* Revisar un esquema general sin constantes manuales `flow_scale` ni recorte duro (`ActionBounds4DoF` con `clip=True`) ajustados a este dataset, contemplando que futuras tareas puedan involucrar mayor rotación o velocidad vertical (p. ej. normalización por el *schedule* de ruido $\sigma_k$ de difusión o estadísticos dinámicos del split de entrenamiento sin *clipping* en inferencia).
   - *Invariancia espacial $SE(3)$ y señal de progreso:* No trasladar la inyección de `live_pose_se3` global ni la comparación en $X_{\text{ENU}}$ (`ctx_x - live_x`) usadas en el *overfit* de 1 episodio. Revisar cómo representar el orden relativo dentro de las demos de contexto sin usar coordenadas globales en la consulta viva $O_t$, evaluar si `data['aug']` ($\gamma = 0.70$) ya basta sin agregar perturbaciones extra al vuelo, y analizar alternativas egocéntricas solo si apareciera ambigüedad perceptual con el LiDAR 360° ($10.0\text{ m}$).
   - *Propagación de contexto ($\varphi$) y proceso de difusión ($\psi$):* No trasladar la separación manual `Key`/`Value`, el `live_modality_dropout` ni las anclas sintéticas creadas para la sonda de 3 muestras, ni tampoco el puente determinista desde $I_4$; evaluar la arquitectura estándar de grafos heterogéneos de *Instant Policy* y un *schedule* DDPM/DDIM estocástico entrenados sobre la diversidad completa del Catálogo $v2$.
-  - *Muestreo y entrenamiento de escena ($\phi_e$):* Revisar el muestreo sin el corte fijo `z_flu > -0.11` usado en `subsample_scene_centroids_torch()` (que arriesga descartar el `landing_pad` al volar alto), evaluar $M \in \{16, 32, 64\}$ centroides, y descartar el entrenamiento *end-to-end* directo de PointNet++ adoptando pre-entrenamiento de ocupación 3D y congelamiento de pesos (según Tarea 4.2).
+  - *Muestreo y entrenamiento de escena ($\phi_e$):* Revisar el muestreo sin el corte fijo `z_flu > -1.1` m usado exploratoriamente en `subsample_scene_centroids_torch()` (que arriesga descartar el `landing_pad` al volar alto), evaluar $M \in \{16, 32, 64\}$ centroides, y descartar el entrenamiento *end-to-end* directo de PointNet++ adoptando pre-entrenamiento de ocupación 3D y congelamiento de pesos (según Tarea 4.2).
 - [ ] **1. Cantidad y Estrategia de *Keyframes* de Contexto ($L$ fijo vs. $L$ adaptativo por longitud):**
   - Evaluar valores fijos $L \in \{10, 16, 24\}$ frente a **$L$ adaptativo correlacionado con la longitud/complejidad de la demostración** (p. ej. 1 keyframe cada $1.2\text{–}1.5\text{ m}$ de longitud de arco + picos de curvatura $\kappa(t)$ y transición de aterrizaje, acotado en $[10, 28]$).
   - Analizar el compromiso entre reducir huecos entre keyframes en circuitos largos de 3–4 obstáculos o maniobras `orbit` y el costo/dispersión de atención en $\varphi$.

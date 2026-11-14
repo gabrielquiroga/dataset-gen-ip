@@ -45,7 +45,7 @@ def test_canonical_keypoints_shape_and_values() -> None:
 
 def test_vec4_se3_and_inverse_roundtrip() -> None:
     torch.manual_seed(42)
-    vec = torch.empty((16, 8, 4)).uniform_(-0.5, 0.5)
+    vec = torch.empty((16, 8, 4)).uniform_(-5.0, 5.0)
     vec[..., 3] = torch.empty((16, 8)).uniform_(-torch.pi, torch.pi)
     T = vec4_to_se3(vec)
     vec_rec = se3_to_vec4(T)
@@ -73,8 +73,8 @@ def test_cumulative_incremental_roundtrip() -> None:
 def test_decoupled_flow_and_svd_4dof() -> None:
     torch.manual_seed(123)
     kp = get_uav_keypoints()
-    T_curr = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([0.3, 0.3, 0.15, 2.5]))
-    T_target = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([0.3, 0.3, 0.15, 2.5]))
+    T_curr = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([3.0, 3.0, 1.5, 2.5]))
+    T_target = vec4_to_se3(torch.randn(32, 8, 4) * torch.tensor([3.0, 3.0, 1.5, 2.5]))
 
     flow = compute_keypoint_flow(T_curr, T_target, kp)
     assert flow.shape == (32, 8, 6, 6)
@@ -91,8 +91,8 @@ def test_decoupled_flow_and_svd_4dof() -> None:
 def test_svd_4dof_se3_equivariance() -> None:
     torch.manual_seed(99)
     kp = get_uav_keypoints()
-    T_0 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([0.2, 0.2, 0.1, 2.0]))
-    T_1 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([0.2, 0.2, 0.1, 2.0]))
+    T_0 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([2.0, 2.0, 1.0, 2.0]))
+    T_1 = vec4_to_se3(torch.randn(16, 4) * torch.tensor([2.0, 2.0, 1.0, 2.0]))
     p0 = transform_keypoints(T_0, kp)
     p1 = transform_keypoints(T_1, kp)
 

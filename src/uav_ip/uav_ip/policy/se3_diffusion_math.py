@@ -4,7 +4,7 @@ se3_diffusion_math.py — Transformaciones SE(3), flujo cartesiano desacoplado s
 
 Este modulo implementa el puente matematico entre:
   1. Las matrices homogeneas relativas acumuladas `action_se3` (T, 8, 4, 4) almacenadas
-     en `heterodata.pt` (en marco egocentrico Horizontal FLU con factor de escala s=0.1).
+     en `heterodata.pt` (en marco egocentrico Horizontal FLU en metros reales, s=1.0).
   2. La formulacion incremental paso a paso `delta_se3` (δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k)
      y su normalizacion al hipercubo [-1, 1] para el proceso de difusion.
   3. El flujo cartesiano desacoplado [Δp_t, Δp_r] sobre los 6 keypoints canonicos del
@@ -23,7 +23,7 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import torch
 
-DEFAULT_SCALE_FACTOR: float = 0.1
+DEFAULT_SCALE_FACTOR: float = 1.0
 DEFAULT_ARM_LENGTH_M: float = 0.25
 DEFAULT_Z_HEIGHT_M: float = 0.15
 
@@ -35,7 +35,7 @@ def get_uav_keypoints_body_numpy(
 ) -> np.ndarray:
     """
     Retorna los 6 nodos keypoint canonicos {p_g^i}_{i=1}^6 del UAV en el marco
-    local estabilizado (Horizontal FLU) escalados por `scale_factor` (s = 0.1):
+    local estabilizado (Horizontal FLU) escalados por `scale_factor` (default: s = 1.0, metros reales):
       0: Centro de masa (0, 0, 0)
       1: Proa     +X (+arm_length, 0, 0)
       2: Popa     -X (-arm_length, 0, 0)
@@ -262,20 +262,20 @@ def vector_4dof_to_se3(
 @dataclass(frozen=True)
 class ActionBounds4DoF:
     """
-    Cotas simetricas auxiliares para reescalar vectores 4-DoF [dx_s, dy_s, dz_s, dyaw_rad]
+    Cotas simetricas auxiliares para reescalar vectores 4-DoF [dx_m, dy_m, dz_m, dyaw_rad]
     al intervalo [-1, 1] durante las pruebas exploratorias Pre-Hito 4.
 
     NOTA: Los valores por defecto provienen de los percentiles observados en el corpus exploratorio
-    actual (Δt = 0.1 s, escala s = 0.1) y NO constituyen cotas universales para la red final.
+    actual (Δt = 0.1 s, unidades fisicas SI en metros, s = 1.0) y NO constituyen cotas universales para la red final.
     Usar `clip=True` con cotas fijas puede truncar maniobras futuras con mayor velocidad angular
     o vertical; para el Hito 4 conviene revisar normalizacion por el schedule de ruido de difusion,
     estadisticos dinamicos del split de entrenamiento (sin clipping duro en inferencia) o limites
     fisicos del vehiculo.
     """
 
-    max_dx_scaled: float = 0.075
-    max_dy_scaled: float = 0.075
-    max_dz_scaled: float = 0.050
+    max_dx_scaled: float = 0.75
+    max_dy_scaled: float = 0.75
+    max_dz_scaled: float = 0.50
     max_dyaw_rad: float = 0.650
 
     @classmethod
@@ -285,9 +285,9 @@ class ActionBounds4DoF:
         if s == 1:
             return cls()
         return cls(
-            max_dx_scaled=0.075 * float(s),
-            max_dy_scaled=0.075 * float(s),
-            max_dz_scaled=0.050 * float(s),
+            max_dx_scaled=0.75 * float(s),
+            max_dy_scaled=0.75 * float(s),
+            max_dz_scaled=0.50 * float(s),
             max_dyaw_rad=min(math.pi, 0.650 * float(s)),
         )
 

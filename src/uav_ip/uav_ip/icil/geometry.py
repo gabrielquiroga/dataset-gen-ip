@@ -10,7 +10,7 @@ from typing import Optional
 
 import torch
 
-DEFAULT_SCALE_FACTOR: float = 0.1
+DEFAULT_SCALE_FACTOR: float = 1.0
 DEFAULT_ARM_LENGTH_M: float = 0.25
 DEFAULT_Z_HEIGHT_M: float = 0.15
 
@@ -23,7 +23,7 @@ def get_uav_keypoints(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Retorna los 6 keypoints canonicos del UAV en marco local Horizontal FLU (escala s=0.1).
+    Retorna los 6 keypoints canonicos del UAV en marco local Horizontal FLU (escala s=1.0, metros reales).
     Forma: (6, 3) -> [Centro, Proa +X, Popa -X, Babor +Y, Estribor -Y, Cenit +Z].
     """
     kp_m = torch.tensor(

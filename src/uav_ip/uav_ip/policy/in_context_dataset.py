@@ -41,7 +41,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(N_demos, L, 2048, 3)",
         "dtype": "float32",
         "frame": "Horizontal FLU (egocentrico, roll=pitch=0)",
-        "scale": "s = 0.1 (1 unidad = 10 m)",
+        "scale": "s = 1.0 (metros reales)",
         "description": "Nubes LiDAR 360° en los L keyframes (fijo o adaptativo) de cada demostracion.",
     },
     {
@@ -50,7 +50,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(N_demos, L, 4, 4)",
         "dtype": "float32",
         "frame": "Gazebo ENU estabilizado",
-        "scale": "Traslacion s = 0.1; Rotacion R_z(yaw) in SO(2)",
+        "scale": "Traslacion s = 1.0 [m]; Rotacion R_z(yaw) in SO(2)",
         "description": "Poses T_{WE}^{t_l} de los keyframes (usadas solo para aristas relativas intra-demo).",
     },
     {
@@ -77,7 +77,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(N_demos, L, T, 4, 4)",
         "dtype": "float32",
         "frame": "Horizontal FLU relativo al keyframe l",
-        "scale": "Traslacion s = 0.1; Rotacion R_z(dyaw)",
+        "scale": "Traslacion s = 1.0 [m]; Rotacion R_z(dyaw)",
         "description": "Horizonte futuro acumulado T_{EA}^{(t_l, 1..T)} demostrado en cada keyframe.",
     },
     {
@@ -86,7 +86,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(N_demos, L, T, 4, 4)",
         "dtype": "float32",
         "frame": "Horizontal FLU paso a paso (k-1 -> k)",
-        "scale": "Traslacion s = 0.1 (Δt = 0.1 s * stride)",
+        "scale": "Traslacion s = 1.0 [m] (Δt = 0.1 s * stride)",
         "description": "Incrementos paso a paso δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k en cada keyframe.",
     },
     {
@@ -104,7 +104,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(1, 2048, 3)",
         "dtype": "float32",
         "frame": "Horizontal FLU (egocentrico, roll=pitch=0)",
-        "scale": "s = 0.1 (1 unidad = 10 m)",
+        "scale": "s = 1.0 (metros reales)",
         "description": "Nube LiDAR 360° actual observada por el dron en el instante t.",
     },
     {
@@ -113,7 +113,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(1, 4, 4)",
         "dtype": "float32",
         "frame": "Gazebo ENU estabilizado",
-        "scale": "Traslacion s = 0.1; Rotacion R_z(yaw_t)",
+        "scale": "Traslacion s = 1.0 [m]; Rotacion R_z(yaw_t)",
         "description": "Pose actual T_{WE}^t (para proyectar la salida al mundo; usada en MiniInstantPolicyNet solo como atajo exploratorio, a revisar en el Hito 4).",
     },
     {
@@ -140,7 +140,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(T, 4, 4)",
         "dtype": "float32",
         "frame": "Horizontal FLU relativo al instante t",
-        "scale": "Traslacion s = 0.1; Rotacion R_z(dyaw_k)",
+        "scale": "Traslacion s = 1.0 [m]; Rotacion R_z(dyaw_k)",
         "description": "Horizonte de T poses relativas acumuladas predichas T_hat_{EA}^{(t, 1..T)}.",
     },
     {
@@ -158,7 +158,7 @@ TENSOR_CONTRACT_SPEC: List[Dict[str, str]] = [
         "shape": "(T, 4)",
         "dtype": "float32",
         "frame": "Gazebo ENU global",
-        "scale": "Metros reales (÷ s = × 10.0) y radianes [-pi, pi)",
+        "scale": "Metros reales (s = 1.0) y radianes [-pi, pi)",
         "description": "Waypoints globales [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] para el spline.",
     },
 ]
@@ -392,6 +392,8 @@ def extract_context_from_episode(
     H = max(1, int(horizon))
     stride = max(1, int(action_stride))
     pre_kf = getattr(data["agent"], "keyframe_indices", None)
+    ep_scale_t = getattr(data["agent"], "scale_factor", None)
+    ep_scale = float(ep_scale_t.detach().cpu().item()) if ep_scale_t is not None else DEFAULT_SCALE_FACTOR
     kf_idx = select_geometric_keyframe_indices(
         pose_se3=data["agent"].pose_se3,
         flight_state=data["agent"].flight_state,
@@ -400,6 +402,7 @@ def extract_context_from_episode(
         adaptive_arc_m=adaptive_arc_m,
         min_keyframes=min_keyframes,
         max_keyframes=max_keyframes,
+        scale_factor=ep_scale,
     )
     L = int(kf_idx.numel())
 

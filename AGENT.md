@@ -5,7 +5,7 @@ Eres un Ingeniero de Software Robótico y de Machine Learning Senior. Tu experie
 
 ## 📚 Documentación Canónica del Proyecto
 Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta siempre los documentos canónicos consolidados en `docs/`:
-1. `docs/FUNDAMENTOS_Y_DISENO.md`: Teoría matemática, preservación de Markov, escala $s=0.1$, envolvente del x500, catálogo $v2$, Tube Augmentation con decaimiento $\gamma=0.70$ y memoria de decisiones de diseño (ADRs).
+1. `docs/FUNDAMENTOS_Y_DISENO.md`: Teoría matemática, preservación de Markov, unidades físicas ($s=1.0$) con preescalado sinusoidal $0.1$ en Fourier, envolvente del x500, catálogo $v2$, Tube Augmentation con decaimiento $\gamma=0.70$ y memoria de decisiones de diseño (ADRs).
 2. `docs/PLAN_IMPLEMENTACION.md`: Arquitectura activa, estado de hitos de desarrollo (Hitos 0 al 3 completados) y plan maestro para la red neuronal (Hito 4).
 3. `docs/AUDITORIA_CONSISTENCIA_Y_LITERATURA.md`: Auditoría forense del sistema, contrastación científica con Instant Policy y literatura relacionada, y bibliografía comentada.
 4. `docs/TROUBLESHOOTING.md`: Registro de soluciones a problemas de simulación, networking, virtualenvs de ML y comandos.
@@ -21,13 +21,13 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
 
 ## 🚨 Reglas Críticas del Proyecto (¡No violar!)
 1. **Embodiment y Simulación:** El vehículo en Gazebo es el modelo estándar **`gz_x500`** (sin sensor físico de profundidad). NUNCA reintroducir `gz_x500_depth` ni la captura pesada de `/depth_camera/points` (descartada por costo computacional y ceguera retrospectiva).
-2. **Observación Privilegiada y Marco Horizontal FLU:** La observación sensorial es un **LiDAR 360° sintético** generado analíticamente mediante `synthetic_lidar.py` (2048 puntos, FPS acelerado por kernel SIMD C, alcance $10.0\text{ m}$, egocéntrico *Horizontal FLU* alineado con gravedad [yaw del dron, roll=0, pitch=0], escala métrica fija $s = 0.1$).
+2. **Observación Privilegiada y Marco Horizontal FLU:** La observación sensorial es un **LiDAR 360° sintético** generado analíticamente mediante `synthetic_lidar.py` (2048 puntos, FPS acelerado por kernel SIMD C, alcance $10.0\text{ m}$, egocéntrico *Horizontal FLU* alineado con gravedad [yaw del dron, roll=0, pitch=0], en metros reales SI con escala geométrica $s = 1.0$).
 3. **Punto Único de Verdad y Thin Wrappers:** Toda la lógica de negocio reside en el módulo `src/uav_ip/uav_ip/`. Los archivos homónimos en `src/uav_ip/scripts/` son estrictamente *thin wrappers* mínimos que importan desde `uav_ip`. PROHIBIDO duplicar lógica entre `scripts/` y `uav_ip/`.
 4. **Envolvente Física del x500:** `validation_geometry.py` es la fuente única de verdad para radios y cotas. `UAV_PHYSICAL_RADIUS_XY = 0.385689 m` (disco con palas extendidas), con margen de seguridad $0.05\text{ m}$ resultando en `UAV_COLLISION_RADIUS_XY = 0.4357 m`.
 5. **Waypoints Feed-Forward Suaves y Cruce Tangencial:** En `waypoint_controller.py`, los waypoints intermedios de aproximación (`pre`) deben mantener `vel_ff=None` para evitar que el dron frene a cero. En `orbit_arc`, la condición de cruce utiliza el semiplano tangencial para evitar puntos muertos por fuerzas proporcionales opuestas al feed-forward.
 6. **Estructura del Grafo `HeteroData`:**
-   * `data['scene'].pos`: nubes de 2048 puntos en Horizontal FLU con escala $s=0.1$.
-   * `data['agent'].x`: poses $SE(3)$ ejecutadas ($x, y, z$ escalados por $s=0.1$, cuaternión $q_w, q_x, q_y, q_z$) más 6 keypoints del dron.
+   * `data['scene'].pos`: nubes de 2048 puntos en Horizontal FLU en metros reales ($s=1.0$).
+   * `data['agent'].x`: poses $SE(3)$ ejecutadas ($x, y, z$ en metros [$s=1.0$], cuaternión $q_w, q_x, q_y, q_z$) más 6 keypoints del dron.
    * `data['agent'].vel_flu`: velocidades lineales $(T, 3)$ en marco Horizontal FLU.
    * `data['agent'].y`: horizonte base de $T=8$ acciones relativas $T_{EA}^{(t,k)} \in SE(3)$ muestreadas de la trayectoria real a $10\text{ Hz}$.
    * `data['aug']`: nodos de recuperación por *Tube Augmentation* ($30\%$ de los pasos con perturbaciones $\delta p \le 0.60\text{ m}$, decaimiento exponencial $\gamma = 0.70$ con cota $\le 6.5\text{ m/s}$ y $10\%$ flip de estado de vuelo binario).

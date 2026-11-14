@@ -21,9 +21,9 @@ En el aprendizaje por imitación clásico, una red neuronal entrena durante hora
 
 ---
 
-### 0.2 Marcos de Coordenadas y por qué usamos la Escala $s = 0.1$
+### 0.2 Marcos de Coordenadas y Escala Física SI ($s = 1.0$) vs. Preescalado en Fourier ($0.1$)
 
-En todo el proyecto conviven dos sistemas de coordenadas y una escala espacial reducida:
+En todo el proyecto conviven dos sistemas de coordenadas y una separación clara entre la escala geométrica física y la escala espectral del codificador posicional:
 
 1. **Marco Global `Gazebo ENU` (Mundo Fijo):**
    - Está clavado en el suelo del escenario de simulación (`X = Este`, `Y = Norte`, `Z = Arriba`).
@@ -34,13 +34,13 @@ En todo el proyecto conviven dos sistemas de coordenadas y una escala espacial r
      - **$+Y$ (*Left*):** Hacia la izquierda (babor).
      - **$+Z$ (*Up*):** Verticalmente hacia arriba (cielo).
    - **¿Por qué se llama *Horizontal* FLU?** Un dron cuadricóptero necesita inclinarse hacia adelante (*pitch*) para acelerar o hacia los lados (*roll*) para doblar. Si usáramos el marco inclinado del chasis, cada vez que el dron frenara o acelerara, toda la nube LiDAR parecería subir y bajar violentamente. Al proyectar el marco sobre el plano horizontal (**forzando $\text{roll} = 0$ y $\text{pitch} = 0$**, conservando únicamente el giro de brújula o **rumbo $\psi$ / *yaw***), el suelo siempre está plano y un movimiento en $+X$ significa siempre *"avanzar horizontalmente hacia donde mira la nariz"*.
-3. **Factor de Escala Espacial $s = 0.1$ ($1\text{ unidad} = 10\text{ metros}$):**
+3. **Unidades Físicas SI ($s = 1.0$, metros reales) y Preescalado en Fourier ($s_{\text{emb}} = 0.1$):**
    - El paper original de *Instant Policy* fue diseñado para brazos robóticos de mesa cuyos movimientos ocurren dentro de una caja de $\sim 0.6\text{–}1.0\text{ m}$. Nuestro dron vuela en circuitos de $25\text{ m}$ con un LiDAR omnidireccional de hasta $10.0\text{ m}$ de radio.
-   - Al multiplicar todas las distancias en metros por **$s = 0.1$** (es decir, **dividir los metros por $10$**):
-     - El radio máximo de visión de $10.0\text{ m}$ del LiDAR pasa a ser $1.0\text{ unidad}$.
-     - Un avance de $0.20\text{ m}$ en un paso de $0.1\text{ s}$ pasa a ser $0.020\text{ unidades}$.
-     - Así, las coordenadas relativas que entran a los embeddings sinusoidales de Fourier quedan dentro de $[-1.0, +1.0]$, evitando aliasing periódico en la frecuencia fundamental.
-   - **Regla práctica de lectura:** Siempre que veas una posición o desplazamiento con subíndice $s$ (como $\Delta x_s = 0.030$), **multiplícalo por $10$ para obtener metros reales** ($0.030 \times 10 = 0.30\text{ m} = 30\text{ cm}$). Los ángulos ($\psi, \Delta\psi$) se miden en **radianes** y no se escalan.
+   - Si introdujéramos coordenadas en metros directamente en embeddings sinusoidales $\sin(2^k \pi \Delta\mathbf{p})$, el radio de $10.0\text{ m}$ excedería el semiperíodo fundamental generando aliasing periódico. Inicialmente el proyecto mitigó esto aplicando $s=0.1$ globalmente sobre nubes y poses; tras la migración a **escala física SI ($s = 1.0$)**, todos los datos, sensores y operaciones geométricas se expresan directamente en **metros reales**:
+     - El radio máximo de visión del LiDAR es $10.0\text{ m}$.
+     - Un avance típico de $0.20\text{ m}$ en $0.1\text{ s}$ se almacena literalmente como $0.20\text{ m}$.
+     - El factor **$s_{\text{emb}} = 0.1$** se aplica **exclusivamente dentro de `SinusoidalPosEmb3D`**, mapeando internamente el rango de $[-10.0, +10.0]\text{ m}$ a $[-1.0, +1.0]$ antes del banco de senos/cosenos sin deformar geometría ni métricas.
+   - **Regla práctica de lectura:** Todas las posiciones y desplazamientos ($\Delta x, \delta x, \dots$) se miden directamente en **metros reales** ($s = 1.0$), mientras que los ángulos ($\psi, \Delta\psi$) se miden en **radianes**.
 
 ---
 
@@ -51,13 +51,13 @@ Si queremos describir dónde estará el dron en el futuro y hacia dónde estará
 - Además, los ángulos tienen un salto brusco cuando pasan de $+180^\circ$ ($+\pi$) a $-180^\circ$ ($-\pi$).
 
 **La solución geométrica de *Instant Policy*:**
-En lugar de representar al dron como un punto con un ángulo abstracto, definimos una **estructura rígida tridimensional de 6 puntos (*keypoints*)** solidaria al chasis del dron (`keypoints_body` en escala $s=0.1$, con brazos de $0.25\text{ m}$ y altura $0.15\text{ m}$):
+En lugar de representar al dron como un punto con un ángulo abstracto, definimos una **estructura rígida tridimensional de 6 puntos (*keypoints*)** solidaria al chasis del dron (`keypoints_body` en metros reales SI, $s=1.0$, con brazos de $0.25\text{ m}$ y altura $0.15\text{ m}$):
 - $\mathbf{p}_g^0 = (0,\; 0,\; 0)$ $\rightarrow$ **Centro de masa** del dron $(0, 0, 0)$.
-- $\mathbf{p}_g^1 = (+0.025,\; 0,\; 0)$ $\rightarrow$ Punta de **proa / nariz** ($+0.25\text{ m}$ al frente).
-- $\mathbf{p}_g^2 = (-0.025,\; 0,\; 0)$ $\rightarrow$ Punta de **popa / cola** ($-0.25\text{ m}$ atrás).
-- $\mathbf{p}_g^3 = (0,\; +0.025,\; 0)$ $\rightarrow$ Punta de **babor / izquierda** ($+0.25\text{ m}$ a la izquierda).
-- $\mathbf{p}_g^4 = (0,\; -0.025,\; 0)$ $\rightarrow$ Punta de **estribor / derecha** ($-0.25\text{ m}$ a la derecha).
-- $\mathbf{p}_g^5 = (0,\; 0,\; +0.015)$ $\rightarrow$ Punta de **cenit / superior** ($+0.15\text{ m}$ arriba).
+- $\mathbf{p}_g^1 = (+0.25,\; 0,\; 0)$ $\rightarrow$ Punta de **proa / nariz** ($+0.25\text{ m}$ al frente).
+- $\mathbf{p}_g^2 = (-0.25,\; 0,\; 0)$ $\rightarrow$ Punta de **popa / cola** ($-0.25\text{ m}$ atrás).
+- $\mathbf{p}_g^3 = (0,\; +0.25,\; 0)$ $\rightarrow$ Punta de **babor / izquierda** ($+0.25\text{ m}$ a la izquierda).
+- $\mathbf{p}_g^4 = (0,\; -0.25,\; 0)$ $\rightarrow$ Punta de **estribor / derecha** ($-0.25\text{ m}$ a la derecha).
+- $\mathbf{p}_g^5 = (0,\; 0,\; +0.15)$ $\rightarrow$ Punta de **cenit / superior** ($+0.15\text{ m}$ arriba).
 
 **¿Por qué esto es tan poderoso?**
 1. Si sabes dónde están esos 6 puntos en el espacio 3D, **sabes automáticamente dónde está el dron y hacia dónde apunta su nariz (la orientación de la estructura)**.
@@ -98,9 +98,9 @@ Es fundamental no confundir los dos bucles que operan cuando el dron vuela:
 | $T_{WE}^{(t)} \in \mathbb{R}^{4 \times 4}$ | Pose del Dron en el Mundo | Matriz $4 \times 4$ que dice dónde está el dron ($E$) respecto al mundo ($W$) en el instante $t$. |
 | $T_{EA}^{(t, k)} \in \mathbb{R}^{4 \times 4}$ | Acción **Acumulada** al paso $k$ |Dónde estará el dron dentro de $k$ pasos ($k \in \{1..8\}$) medido **desde donde está parado hoy en el instante $t$**. |
 | $\delta T_k \in \mathbb{R}^{4 \times 4}$ | Acción **Incremental** paso a paso | El pequeño salto que da el dron **entre el paso $k-1$ y el paso $k$** (en $\Delta t = 0.1\text{ s}$). Matemáticamente: $\delta T_k = (T_{EA}^{(t, k-1)})^{-1} T_{EA}^{(t, k)}$. |
-| $(\Delta x_s, \Delta y_s, \Delta z_s, \Delta\psi)$ | Vector 4-DoF Acumulado | Los 4 números útiles extraídos de $T_{EA}^{(t,k)}$: avance frontal, desplazamiento lateral, cambio de altura (en escala $s=0.1$) y giro de rumbo (en radianes) desde $t$ hasta $t+k$. |
-| $(\delta x_s, \delta y_s, \delta z_s, \delta\psi)$ | Vector 4-DoF Incremental | Los mismos 4 números pero extraídos de $\delta T_k$, es decir, lo que avanza y gira el dron **en un solo paso de $0.1\text{ s}$**. |
-| $\mathbf{p}_g^1 \dots \mathbf{p}_g^6 \in \mathbb{R}^3$ | Keypoints Canónicos del Dron | Los 6 puntos de la estructura rígida del dron en reposo ($L_g = 0.025$ ($0.25\text{ m}$ en XY y $+0.15\text{ m}$ en Z)). |
+| $(\Delta x, \Delta y, \Delta z, \Delta\psi)$ | Vector 4-DoF Acumulado | Los 4 números útiles extraídos de $T_{EA}^{(t,k)}$: avance frontal, desplazamiento lateral, cambio de altura (en metros reales, $s=1.0$) y giro de rumbo (en radianes) desde $t$ hasta $t+k$. |
+| $(\delta x, \delta y, \delta z, \delta\psi)$ | Vector 4-DoF Incremental | Los mismos 4 números pero extraídos de $\delta T_k$, es decir, lo que avanza y gira el dron **en un solo paso de $0.1\text{ s}$**. |
+| $\mathbf{p}_g^1 \dots \mathbf{p}_g^6 \in \mathbb{R}^3$ | Keypoints Canónicos del Dron | Los 6 puntos de la estructura rígida del dron en reposo ($L_g = 0.25\text{ m}$ en XY y $+0.15\text{ m}$ en Z). |
 | $\Delta\mathbf{p}_t \in \mathbb{R}^3$ | Flujo de Traslación | Cuánto debe trasladarse el centro de la estructura en $(x, y, z)$ para pasar de la pose ruidosa actual a la pose correcta. Es igual para los 6 puntos. |
 | $\Delta\mathbf{p}_r^i \in \mathbb{R}^3$ | Flujo de Rotación del punto $i$ | Cuánto debe desplazarse el punto $i$ de la estructura **solo por efecto del giro de rumbo** $\Delta\psi$, dejando quieto el centro del dron. |
 | **SVD** | Descomposición en Valores Singulares | Operación algebraica que toma los 6 puntos movidos por la red neuronal y calcula la rotación rígida exacta que mejor los alinea sin deformar el dron. |
@@ -173,7 +173,7 @@ Como cada archivo `heterodata.pt` almacena la trayectoria completa `pose_se3`, l
 ## 2. Mapa Maestro de Contratos de Entrada/Salida (E/S)
 
 ### ¿Qué significa esta tabla y por qué es necesaria?
-Antes de construir una red neuronal mayor, un error frecuente en robótica es que un módulo entregue distancias en metros mientras otro espera decámetros ($s=0.1$), o que un tensor tenga las dimensiones invertidas. Esta tabla documenta el **contrato de ingeniería** entre el dataset (`heterodata.pt`), la red neuronal y el controlador del dron:
+Antes de construir una red neuronal mayor, un error frecuente en robótica es una discrepancia de unidades entre módulos o dimensiones de tensores invertidas. Esta tabla documenta el **contrato de ingeniería** en unidades físicas SI ($s=1.0$, metros reales) entre el dataset (`heterodata.pt`), la red neuronal y el controlador del dron:
 - **Cómo leer la columna `Forma Exacta`:**
   - `N_demos`: Cantidad de demostraciones de contexto (por defecto $2$, configurable con `--num-context-demos`).
   - `L`: Cantidad de *keyframes* por demostración (por defecto $10$, o variable por longitud de arco con `--num-keyframes adaptive` acompañado de `context_keyframe_mask`).
@@ -183,20 +183,20 @@ Antes de construir una red neuronal mayor, un error frecuente en robótica es qu
 
 | Etapa | Nombre del Tensor | Forma Exacta | Tipo | Marco de Coordenadas | Escala / Unidades | Descripción |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Context Input** | `context_scene_pos` | `(N_demos, L, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 0.1 (1 unidad = 10 m) | Nubes LiDAR 360° en los L keyframes (fijo o adaptativo) de cada demostracion. |
-| **Context Input** | `context_pose_se3` | `(N_demos, L, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw) in SO(2) | Poses T_{WE}^{t_l} de los keyframes (usadas solo para aristas relativas intra-demo). |
+| **Context Input** | `context_scene_pos` | `(N_demos, L, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 1.0 (metros reales) | Nubes LiDAR 360° en los L keyframes (fijo o adaptativo) de cada demostracion. |
+| **Context Input** | `context_pose_se3` | `(N_demos, L, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion en metros (s = 1.0); Rotacion R_z(yaw) in SO(2) | Poses T_{WE}^{t_l} de los keyframes (usadas solo para aristas relativas intra-demo). |
 | **Context Input** | `context_vel_flu` | `(N_demos, L, 3)` | `float32` | Horizontal FLU | m/s (fisico directo) | Velocidad lineal propioceptiva [vx_flu, vy_flu, vz_flu] en cada keyframe. |
 | **Context Input** | `context_flight_state` | `(N_demos, L, 1)` | `float32` | Escalar binario | {0.0, 1.0} | Estado de vuelo en el keyframe (1.0 = vuelo activo, 0.0 = aterrizaje). |
-| **Context Input** | `context_action_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU relativo al keyframe l | Traslacion s = 0.1; Rotacion R_z(dyaw) | Horizonte futuro acumulado T_{EA}^{(t_l, 1..T)} demostrado en cada keyframe. |
-| **Context Input** | `context_delta_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU paso a paso (k-1 -> k) | Traslacion s = 0.1 (Δt = 0.1 s * stride) | Incrementos paso a paso δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k en cada keyframe. |
+| **Context Input** | `context_action_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU relativo al keyframe l | Traslacion en metros (s = 1.0); Rotacion R_z(dyaw) | Horizonte futuro acumulado T_{EA}^{(t_l, 1..T)} demostrado en cada keyframe. |
+| **Context Input** | `context_delta_se3` | `(N_demos, L, T, 4, 4)` | `float32` | Horizontal FLU paso a paso (k-1 -> k) | Traslacion en metros (s = 1.0, Δt = 0.1 s * stride) | Incrementos paso a paso δT_k = (T_{EA}^{k-1})^{-1} T_{EA}^k en cada keyframe. |
 | **Context Input** | `context_keyframe_mask` | `(N_demos, L)` | `bool` | Mascara booleana | {True, False} | True en keyframes reales; False en slots de relleno cuando L es adaptativo. |
-| **Live Query Input** | `live_scene_pos` | `(1, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 0.1 (1 unidad = 10 m) | Nube LiDAR 360° actual observada por el dron en el instante t. |
-| **Live Query Input** | `live_pose_se3` | `(1, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion s = 0.1; Rotacion R_z(yaw_t) | Pose actual T_{WE}^t (para proyectar la salida al mundo; usada en MiniInstantPolicyNet solo como atajo exploratorio, a revisar en el Hito 4). |
+| **Live Query Input** | `live_scene_pos` | `(1, 2048, 3)` | `float32` | Horizontal FLU (egocentrico, roll=pitch=0) | s = 1.0 (metros reales) | Nube LiDAR 360° actual observada por el dron en el instante t. |
+| **Live Query Input** | `live_pose_se3` | `(1, 4, 4)` | `float32` | Gazebo ENU estabilizado | Traslacion en metros (s = 1.0); Rotacion R_z(yaw_t) | Pose actual T_{WE}^t (para proyectar la salida al mundo; usada en MiniInstantPolicyNet solo como atajo exploratorio, a revisar en el Hito 4). |
 | **Live Query Input** | `live_vel_flu` | `(1, 3)` | `float32` | Horizontal FLU | m/s (fisico directo) | Velocidad lineal actual del dron en su propio marco Horizontal FLU. |
 | **Live Query Input** | `live_flight_state` | `(1, 1)` | `float32` | Escalar binario | {0.0, 1.0} | Estado binario actual s_t antes de predecir el horizonte futuro. |
-| **Network Output** | `pred_action_se3` | `(T, 4, 4)` | `float32` | Horizontal FLU relativo al instante t | Traslacion s = 0.1; Rotacion R_z(dyaw_k) | Horizonte de T poses relativas acumuladas predichas T_hat_{EA}^{(t, 1..T)}. |
+| **Network Output** | `pred_action_se3` | `(T, 4, 4)` | `float32` | Horizontal FLU relativo al instante t | Traslacion en metros (s = 1.0); Rotacion R_z(dyaw_k) | Horizonte de T poses relativas acumuladas predichas T_hat_{EA}^{(t, 1..T)}. |
 | **Network Output** | `pred_flight_state` | `(T, 1)` | `float32` | Probabilidad escalar | [0.0, 1.0] | Prediccion del estado de vuelo futuro s_hat_{t+1..t+T} (<0.5 activa aterrizaje). |
-| **Controller Output** | `pred_world_waypoints_enu_m` | `(T, 4)` | `float32` | Gazebo ENU global | Metros reales (÷ s = × 10.0) y radianes [-pi, pi) | Waypoints globales [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] para el spline. |
+| **Controller Output** | `pred_world_waypoints_enu_m` | `(T, 4)` | `float32` | Gazebo ENU global | Metros reales (s = 1.0) y radianes [-pi, pi) | Waypoints globales [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] para el spline. |
 
 ---
 
@@ -218,33 +218,33 @@ Para comprobarlo con datos reales de tu proyecto, analizamos **200 episodios cin
 ### 3.2 Tabla Comparativa de Rangos: Acumulada $T_{EA}^{(t,k)}$ vs. Incremental $\delta T_k$
 
 **Cómo leer esta tabla:**
-- Las columnas `p50`, `p95`, `p99.5` y `Máximo Absoluto` muestran los desplazamientos en la escala interna de la red ($s = 0.1$) para las traslaciones ($\vert \Delta x_s|, |\delta x_s|, |\delta y_s|, |\delta z_s \vert $) y en **radianes** para el giro de rumbo ($\vert \delta\psi \vert $).
-- La última columna (`Equivalente Físico (p99.5)`) convierte el percentil $99.5\%$ a **metros reales** (multiplicando por $10$) o a **grados** para que puedas interpretarlo físicamente de un vistazo.
+- Las columnas `p50`, `p95`, `p99.5` y `Máximo Absoluto` expresan los desplazamientos directamente en **metros reales** ($s = 1.0$, equivalentes a $\times 10$ sobre la escala histórica $s=0.1$) para las traslaciones ($\vert \Delta x|, |\delta x|, |\delta y|, |\delta z \vert $) y en **radianes** para el giro de rumbo ($\vert \delta\psi \vert $).
+- La última columna (`Referencia / Equivalente`) aporta el contexto temporal ($\Delta t=0.1\text{ s}$) o conversión a grados. *(Nota: la figura PNG adjunta conserva la medición histórica en escala $0.1$; multiplicando su eje por $10$ se obtiene el equivalente en metros).*
 
-| Dominio / Formulación | Componente | p50 | p95 | p99.5 | Máximo Absoluto | Equivalente Físico (p99.5) |
+| Dominio / Formulación | Componente | p50 | p95 | p99.5 | Máximo Absoluto | Referencia / Equivalente |
 | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Kinematic - Acumulada $k=1$** | $\vert \Delta x_s \vert$ | 0.0133 | 0.0178 | 0.0203 | 0.0220 | 0.203 m |
-| **Kinematic - Acumulada $k=8$** | $\vert \Delta x_s \vert $ | 0.1003 | 0.1364 | 0.1492 | 0.1653 | 1.492 m |
-| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x_s \vert $ | 0.0131 | 0.0177 | 0.0196 | 0.0220 | 0.196 m ($\Delta t=0.1$ s) |
-| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y_s \vert $ | 0.0047 | 0.0138 | 0.0189 | 0.0234 | 0.189 m ($\Delta t=0.1$ s) |
-| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z_s \vert $ | 0.0000 | 0.0104 | 0.0160 | 0.0221 | 0.160 m ($\Delta t=0.1$ s) |
-| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert $ [rad] | 0.0289 | 0.1363 | 0.1942 | 0.9267 | 11.13° ($\Delta t=0.1$ s) |
-| **PX4 SITL - Acumulada $k=8$** | $\vert \Delta x_s \vert $ | 0.1053 | 0.2317 | 0.2939 | 0.3313 | 2.939 m |
-| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x_s \vert $ | 0.0127 | 0.0307 | 0.0392 | 0.0438 | 0.392 m ($\Delta t=0.1$ s) |
-| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y_s \vert $ | 0.0068 | 0.0213 | 0.0353 | 0.0493 | 0.353 m ($\Delta t=0.1$ s) |
-| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z_s \vert $ | 0.0008 | 0.0120 | 0.0200 | 0.0311 | 0.200 m ($\Delta t=0.1$ s) |
-| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert $ [rad] | 0.0176 | 0.1392 | 0.2831 | 0.2988 | 16.22° ($\Delta t=0.1$ s) |
-| **Tube Augmentation ($\gamma=0.70$)** | $\vert \delta x_s\vert, \vert\delta y_s \vert $ | 0.0122 | 0.0200 | 0.0263 | 0.0357 | Cota física $\le 0.65$ m ($6.5$ m/s) |
+| **Kinematic - Acumulada $k=1$** | $\vert \Delta x \vert$ [m] | 0.133 | 0.178 | 0.203 | 0.220 | 0.203 m (p99.5) |
+| **Kinematic - Acumulada $k=8$** | $\vert \Delta x \vert$ [m] | 1.003 | 1.364 | 1.492 | 1.653 | 1.492 m (p99.5) |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x \vert$ [m] | 0.131 | 0.177 | 0.196 | 0.220 | $\Delta t=0.1$ s |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y \vert$ [m] | 0.047 | 0.138 | 0.189 | 0.234 | $\Delta t=0.1$ s |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z \vert$ [m] | 0.000 | 0.104 | 0.160 | 0.221 | $\Delta t=0.1$ s |
+| **Kinematic - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert$ [rad] | 0.0289 | 0.1363 | 0.1942 | 0.9267 | 11.13° (p99.5, $\Delta t=0.1$ s) |
+| **PX4 SITL - Acumulada $k=8$** | $\vert \Delta x \vert$ [m] | 1.053 | 2.317 | 2.939 | 3.313 | 2.939 m (p99.5) |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta x \vert$ [m] | 0.127 | 0.307 | 0.392 | 0.438 | $\Delta t=0.1$ s |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta y \vert$ [m] | 0.068 | 0.213 | 0.353 | 0.493 | $\Delta t=0.1$ s |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta z \vert$ [m] | 0.008 | 0.120 | 0.200 | 0.311 | $\Delta t=0.1$ s |
+| **PX4 SITL - Incremental $\delta T_k$ ($\forall k$)** | $\vert \delta \psi \vert$ [rad] | 0.0176 | 0.1392 | 0.2831 | 0.2988 | 16.22° (p99.5, $\Delta t=0.1$ s) |
+| **Tube Augmentation ($\gamma=0.70$)** | $\vert \delta x\vert, \vert\delta y \vert$ [m] | 0.122 | 0.200 | 0.263 | 0.357 | Cota física $\le 0.65$ m ($6.5$ m/s) |
 
 ![Comparación Acumulada vs Incremental](assets/exploration/exp1_cumulative_vs_incremental_bounds.png)
 
 ### 3.3 Cómo interpretar la gráfica y qué se observa
 - **Gráfica Izquierda (Acción Acumulada $T_{EA}^{(t,k)}$):** Observa cómo a medida que nos alejamos en el eje horizontal desde el paso $k=1$ hasta el paso $k=8$, las curvas suben en rampa empinada: en cinemático pasan de $0.203\text{ m}$ ($k=1$) a $1.492\text{ m}$ ($k=8$), y en PX4 SITL llegan hasta **$2.939\text{ m}$** en $k=8$.
-- **Gráfica Derecha (Incremento Paso a Paso $\delta T_k$):** Al transformar las acciones a incrementos entre pasos consecutivos, **las curvas se mantienen casi planas** de $k=1$ a $k=8$ ($0.196\text{ m}$ en cinemático y $0.392\text{ m}$ en SITL). La línea punteada roja muestra una referencia exploratoria ($0.075$ en escala $s=0.1$, que equivale a $0.75\text{ m}$ por paso o $7.5\text{ m/s}$, cubriendo la cota de $6.5\text{ m/s}$ fijada en `bag_to_heterodata.py`).
+- **Gráfica Derecha (Incremento Paso a Paso $\delta T_k$):** Al transformar las acciones a incrementos entre pasos consecutivos, **las curvas se mantienen casi planas** de $k=1$ a $k=8$ ($0.196\text{ m}$ en cinemático y $0.392\text{ m}$ en SITL). La línea punteada roja muestra una referencia exploratoria ($0.75\text{ m}$ por paso o $7.5\text{ m/s}$ — $0.075$ en la gráfica histórica $s=0.1$ —, cubriendo la cota de $6.5\text{ m/s}$ fijada en `bag_to_heterodata.py`).
 
 > [!NOTE]
 > **Observación sobre `ActionBounds4DoF` (Alcance Exploratorio - A Revisar en el Hito 4):**
-> Los datos muestran que trabajar sobre incrementos $\delta T_k$ mantiene una escala uniforme entre $k=1$ y $k=8$, a diferencia de las poses acumuladas $T_{EA}^{(t,k)}$. Para poder ejecutar las pruebas rápidas de este reporte se definieron en [`ActionBounds4DoF`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py) cotas auxiliares tomadas de este corpus (`0.075` en $X/Y$, `0.050` en $Z$ y `0.65 rad` en $\psi$ por paso de $0.1\text{ s}$).
+> Los datos muestran que trabajar sobre incrementos $\delta T_k$ mantiene una escala uniforme entre $k=1$ y $k=8$, a diferencia de las poses acumuladas $T_{EA}^{(t,k)}$. Para poder ejecutar las pruebas rápidas de este reporte se definieron en [`ActionBounds4DoF`](../src/uav_ip/uav_ip/policy/se3_diffusion_math.py) cotas auxiliares tomadas de este corpus en metros y radianes (`0.75 m` en $X/Y$, `0.50 m` en $Z$ y `0.65 rad` en $\psi$ por paso de $0.1\text{ s}$).
 > **Importante:** Estos valores provienen de la distribución de este dataset concreto y **no representan un patrón fijo para la red final**. Aplicar un recorte duro (`clip=True`) con umbrales ajustados al dataset actual podría limitar maniobras futuras con mayor velocidad de giro o ascenso; en el Hito 4 conviene revisar un esquema más general (por ejemplo, normalización mediante la escala de ruido $\sigma_k$ del *schedule* de difusión, estadísticos calculados dinámicamente del split de entrenamiento sin *clipping* duro en inferencia, o límites físicos del vehículo).
 
 ---
@@ -278,7 +278,7 @@ Como vimos en la Sección 0.3, la etapa final $\psi$ de la red neuronal no escup
    - Calculamos los flujos $[\Delta\mathbf{p}_t, \Delta\mathbf{p}_r]$ de los episodios reales y reconstruimos la matriz $4 \times 4$ usando nuestro SVD 4-DoF tanto en $K=1$ paso como en un bucle iterativo DDIM de $K=4$ pasos.
    - Error máximo en $K=1$ paso desde la identidad $I_4$: **`7.451e-07 m`** / **`2.384e-07 rad`**.
    - Error máximo en bucle DDIM de $K=4$ pasos con reproyección SVD en cada iteración: **`7.451e-07 m`** / **`2.980e-07 rad`**.
-3. **Experimento de Ruido Realista en Keypoints ($\sigma = 0.002$ escalado $\equiv 2\text{ cm}$ de error en las puntas del dron): SVD 6-DoF vs. SVD 4-DoF:**
+3. **Experimento de Ruido Realista en Keypoints ($\sigma = 0.02\text{ m} \equiv 2\text{ cm}$ de error en las puntas del dron, antes $0.002$ en $s=0.1$): SVD 6-DoF vs. SVD 4-DoF:**
    - Inyectamos ruido gaussiano de $2\text{ cm}$ reales sobre las predicciones de los 6 keypoints y comparamos qué matriz construye el SVD 6-DoF clásico frente a nuestro SVD 4-DoF:
 
 | Método de Reconstrucción Rígida | Roll Espurio Máx. | Pitch Espurio Máx. | Inclinación Espuria p95 | Error Medio de Yaw |
@@ -364,7 +364,7 @@ Este experimento aborda tres preguntas prácticas de integración:
 > El propósito de `MiniInstantPolicyNet` fue comprobar rápidamente en CPU que los tensores de entrada y salida encajan entre sí sobre pruebas reducidas (1 episodio en 5.3 y 3 muestras estáticas en 5.4). Para que esa red simplificada ajustara en pocos segundos se introdujeron **varios parches heurísticos** en `simple_validation_net.py` y `exploration_suite.py`. **Estos parches NO son patrones recomendados para la red final**; se dejan registrados aquí únicamente como aspectos que conviene revisar con cuidado al diseñar el Hito 4.
 
 #### 1. Escala entre Traslación y Rotación (`flow_scale` y `ActionBounds4DoF`)
-- **Qué se hizo en la exploración:** Al escalar el espacio por $s = 0.1$, los 6 keypoints del dron ($0.5\text{ m}$ reales) quedan a un radio $L_g = 0.025$ ($0.25\text{ m}$ en XY y $+0.15\text{ m}$ en Z), por lo que un giro pequeño desplaza las puntas de la estructura numéricamente menos que una traslación típica ($\|\Delta\mathbf{p}_r\| \approx L_g |\delta\psi \vert $). En `MiniInstantPolicyNet` se aplicó un vector fijo `flow_scale = [0.04, 0.04, 0.03, 0.012, 0.012, 0.012]` y cotas `ActionBounds4DoF` con `clip=True` sacadas de los percentiles de este dataset.
+- **Qué se hizo en la exploración:** Con los 6 keypoints del dron en metros reales ($L_g = 0.25\text{ m}$ en XY y $+0.15\text{ m}$ en Z, antes escalados a $0.025$ con $s = 0.1$), un giro pequeño desplaza las puntas de la estructura numéricamente distinto a una traslación típica ($\|\Delta\mathbf{p}_r\| \approx L_g |\delta\psi \vert $). En `MiniInstantPolicyNet` se aplicó un vector fijo `flow_scale = [0.40, 0.40, 0.30, 0.12, 0.12, 0.12]` m (antes `[0.04, ..., 0.012]` en $s=0.1$) y cotas `ActionBounds4DoF` (`0.75, 0.75, 0.50` m; `0.65` rad) con `clip=True` sacadas de los percentiles de este dataset.
 - **Limitación de ese parche:** Esos coeficientes dependen de las velocidades lineales y de giro presentes en los episodios actuales. En tareas futuras que requieran giros amplios o maniobras verticales rápidas, fijar constantes a mano o aplicar `clip=True` podría sesgar el gradiente o recortar acciones válidas.
 - **Qué revisar en el Hito 4:** Evaluar una normalización general no atada manualmente a este subconjunto - por ejemplo, escalar el objetivo por el nivel de ruido $\sigma_k$ propio del *schedule* de difusión en cada paso, o calcular estadísticos dinámicos del split de entrenamiento sin imponer *clipping* duro en inferencia.
 
@@ -389,15 +389,15 @@ Este experimento aborda tres preguntas prácticas de integración:
 ### 6.1 ¿Qué se midió y qué precaución hay que tener con el prefiltrado usado?
 Cada barrido de nuestro sensor LiDAR sintético contiene **$N = 2048$ puntos 3D** pertenecientes a los obstáculos cercanos y a la plataforma `landing_pad` dentro del radio de $10.0\text{ m}$. Para estimar cuánta resolución espacial se pierde al comprimir la nube a $M$ centroides mediante *Farthest Point Sampling* (FPS) y vecindades $k$-NN ($k_{\text{nn}} = 16$), medimos la distancia desde los puntos de los obstáculos cercanos hasta su centroide más próximo con $M = 16$ y $M = 32$:
 
-| Configuración Evaluada | Centroides con `z_flu > -0.10` (Media) | Distancia Media Obstáculo $\to$ Centroide [m] | Distancia p95 Obstáculo $\to$ Centroide [m] | Tiempo FPS + k-NN por Nube [ms] |
+| Configuración Evaluada | Centroides con `z_flu > -1.0 m` (Media) | Distancia Media Obstáculo $\to$ Centroide [m] | Distancia p95 Obstáculo $\to$ Centroide [m] | Tiempo FPS + k-NN por Nube [ms] |
 | :--- | :---: | :---: | :---: | :---: |
 | **`M = 16` centroides** | 14.1 / 16 | `0.237 m` | `0.387 m` | `0.85 ms` |
 | **`M = 32` centroides** | 29.9 / 32 | `0.144 m` | `0.205 m` | `1.66 ms` |
 
 > [!NOTE]
-> **Lectura exploratoria y advertencia sobre el filtro `z_flu > -0.11`:**
+> **Lectura exploratoria y advertencia sobre el filtro `z_flu > -1.1 m`:**
 > - Pasar de $M = 16$ a $M = 32$ reduce en esta prueba la distancia p95 sin cubrir de `0.387 m` a `0.205 m` con un incremento moderado de tiempo en CPU (`1.00 ms` $\to$ `1.66 ms` por nube), lo que sugiere considerar $M \in \{16, 32, 64\}$ dentro de las opciones a evaluar en el Hito 4.
-> - **Parche exploratorio a revisar:** En [`subsample_scene_centroids_torch()`](../src/uav_ip/uav_ip/policy/simple_validation_net.py) se incluyó un corte heurístico `z_flu > -0.11` ($1.1\text{ m}$ por debajo del dron). Como [`synthetic_lidar.py`](../src/uav_ip/uav_ip/synthetic_lidar.py) **no genera piso infinito** (solo muestrea obstáculos y `landing_pad`), un corte fijo en $Z$ puede descartar puntos legítimos de la plataforma de aterrizaje cuando el dron vuela alto (p. ej. durante un `overfly` a $2.5\text{ m}$). Por ello, este corte fijo fue únicamente un supuesto exploratorio y conviene revisarlo en el Hito 4 (por ejemplo, evaluando FPS / PointNet++ sobre la nube completa sin umbral rígido en $Z$).
+> - **Parche exploratorio a revisar:** En [`subsample_scene_centroids_torch()`](../src/uav_ip/uav_ip/policy/simple_validation_net.py) se incluyó un corte heurístico `z_flu > -1.1` ($1.1\text{ m}$ por debajo del dron; antes `-0.11` en escala `0.1`). Como [`synthetic_lidar.py`](../src/uav_ip/uav_ip/synthetic_lidar.py) **no genera piso infinito** (solo muestrea obstáculos y `landing_pad`), un corte fijo en $Z$ puede descartar puntos legítimos de la plataforma de aterrizaje cuando el dron vuela alto (p. ej. durante un `overfly` a $2.5\text{ m}$). Por ello, este corte fijo fue únicamente un supuesto exploratorio y conviene revisarlo en el Hito 4 (por ejemplo, evaluando FPS / PointNet++ sobre la nube completa sin umbral rígido en $Z$).
 
 ---
 
@@ -441,7 +441,7 @@ Para separar lo que corresponde a contratos de datos verificados frente a lo que
 
 | Componente | Qué Se Comprobó en Esta Exploración |
 | :--- | :--- |
-| **1. Contratos de `heterodata.pt` y Cargador Dinámico** | `InContextNavigationDataset` carga episodios cinemáticos y SITL verificando formas, tipos y escalas (`s=0.1` en posiciones, rad en ángulos, m/s en `vel_flu`), y permite variar al vuelo $(L, T, \text{action\_stride}, N_{\text{demos}})$ - incluyendo `L='adaptive'` con `context_keyframe_mask` - sin regenerar `.pt`. |
+| **1. Contratos de `heterodata.pt` y Cargador Dinámico** | `InContextNavigationDataset` carga episodios cinemáticos y SITL verificando formas, tipos y escalas (`s=1.0` en metros reales para posiciones, rad en ángulos, m/s en `vel_flu`), y permite variar al vuelo $(L, T, \text{action\_stride}, N_{\text{demos}})$ - incluyendo `L='adaptive'` con `context_keyframe_mask` - sin regenerar `.pt`. |
 | **2. Conversión $\delta T_k \leftrightarrow T_{EA}^{(t,k)}$ y Proyección SVD 4-DoF** | La descomposición incremental mantiene escala uniforme a lo largo del horizonte con error de ida y vuelta $< 10^{-6}\text{ m}$, y `align_keypoints_svd_horizontal_flu` evita introducir *roll/pitch* espurio ante ruido en los keypoints mientras se trabaje en `Horizontal FLU`. |
 | **3. Evaluador Cinemático en Lazo Cerrado (`kinematic_rollout_eval.py`)** | Con `OracleReplayPolicy`, la composición de poses, interpolación PCHIP a $50\text{ Hz}$, generación LiDAR en vivo y auditoría con `validate_episode_data()` reproducen los vuelos de referencia (`accepted`, `ADE = 0.000 m`). |
 | **4. Soporte `--rtf` y Caché de Demostraciones en Inferencia** | `world_generator.py --rtf <float>` escala la velocidad de reloj de Gazebo manteniendo `max_step_size = 0.004s`, y precalcular la codificación de las demos al inicio del episodio reduce entre $3\times$ y $5.8\times$ el costo por ciclo de control en las pruebas medidas. |

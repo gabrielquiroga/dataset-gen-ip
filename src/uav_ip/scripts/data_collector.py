@@ -1009,7 +1009,7 @@ class DataCollector:
             "spawn_pose": spawn_pose,
             "no_takeoff_platform": self.no_takeoff_platform,
             "embodiment": "uav_lidar_360_privileged",
-            "scale_factor": 0.1,
+            "scale_factor": 1.0,
             "lidar_r_max": 10.0,
             "topics_recorded": RECORD_TOPICS,
             "episode_timeout_s": self.episode_timeout,

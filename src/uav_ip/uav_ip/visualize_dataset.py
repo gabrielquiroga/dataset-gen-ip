@@ -84,14 +84,15 @@ def _extract_local_horizon_flu(agent_y: np.ndarray, action_se3: np.ndarray = Non
 def load_dataset_file(file_path: Path, return_extra: bool = False):
     """
     Carga un archivo .pt (HeteroData) o .npz (NumPy) de forma retrocompatible y extrae:
-    - agent_x: (T, 3) posiciones del dron en ENU (escaladas s=0.1)
+    - agent_x: (T, 3) posiciones del dron en ENU (default s=1.0, metros SI)
     - agent_y: (T, 8, 5) horizonte de acciones relativas SE(3) o (T, 3) en archivos legados
-    - scene_pos: (T, 2048, 3) nubes de puntos LiDAR egocentricas (escaladas s=0.1)
-    - extra (opcional si return_extra=True): dict con 'action_horizon_flu', 'keyframe_indices',
+    - scene_pos: (T, 2048, 3) nubes de puntos LiDAR egocentricas (default s=1.0, metros SI)
+    - extra (opcional si return_extra=True): dict con 'scale_factor', 'action_horizon_flu', 'keyframe_indices',
       'flight_state', 'setpoint_raw', 'yaw_enu', 'keypoints_body' y campos 'aug_*' de Tube Augmentation.
     """
     ext = file_path.suffix.lower()
     extra = {
+        "scale_factor": None,
         "action_horizon_flu": None,
         "keyframe_indices": None,
         "flight_state": None,
@@ -119,6 +120,8 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
         scene_pos = data["scene_pos"]
         action_se3 = data["action_se3"] if "action_se3" in data else None
         extra["action_horizon_flu"] = _extract_local_horizon_flu(agent_y, action_se3)
+        if "scale_factor" in data:
+            extra["scale_factor"] = float(np.asarray(data["scale_factor"]).reshape(-1)[0])
         if "keyframe_indices" in data:
             extra["keyframe_indices"] = np.asarray(data["keyframe_indices"], dtype=np.int64)
         if "flight_state" in data:
@@ -183,6 +186,9 @@ def load_dataset_file(file_path: Path, return_extra: bool = False):
             extra["yaw_enu"] = _to_numpy(getattr(ag, "yaw_enu", None))
             extra["keypoints_body"] = _to_numpy(getattr(ag, "keypoints_body", None))
             extra["aug_mask"] = _to_numpy(getattr(ag, "aug_mask", None))
+            sc_val = _to_numpy(getattr(ag, "scale_factor", None))
+            if sc_val is not None:
+                extra["scale_factor"] = float(np.asarray(sc_val).reshape(-1)[0])
 
             has_aug = False
             if hasattr(data, "node_types"):
@@ -234,7 +240,7 @@ def plot_pointcloud_and_trajectory(
     agent_x: np.ndarray = None,
     agent_y: np.ndarray = None,
     current_step: int = 0,
-    scale: float = 0.1,
+    scale: float = 1.0,
     title: str = "Visualizacion LiDAR 360° Egocentrico (Horizontal FLU)",
     output_image: Path = None,
     interactive: bool = True,
@@ -244,6 +250,7 @@ def plot_pointcloud_and_trajectory(
     Genera un panel de 3 vistas (3D Perspectiva, Vista Superior XY, Vista Lateral XZ),
     incluyendo el horizonte de acciones relativas SE(3) (T=8) si esta disponible.
     """
+    unit_lbl = "m" if abs(scale - 1.0) < 1e-6 else "m·s"
     fig = plt.figure(figsize=(16, 6))
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
@@ -270,17 +277,17 @@ def plot_pointcloud_and_trajectory(
             "m-o", markersize=4, linewidth=2.0, label=f"Horizonte SE(3) (T={len(horizon_step)-1})"
         )
 
-    axis_len = 0.3  # en espacio escalado (equivale a 3m sin escalar)
+    axis_len = 3.0 * scale  # equivale a 3 m fisicos
     ax3d.quiver(0, 0, 0, axis_len, 0, 0, color="r", arrow_length_ratio=0.15, label="+X (Adelante)")
     ax3d.quiver(0, 0, 0, 0, axis_len, 0, color="g", arrow_length_ratio=0.15, label="+Y (Izquierda)")
     ax3d.quiver(0, 0, 0, 0, 0, axis_len, color="b", arrow_length_ratio=0.15, label="+Z (Arriba)")
 
-    ax3d.set_xlabel("X FLU (Adelante) [m·s]")
-    ax3d.set_ylabel("Y FLU (Izquierda) [m·s]")
-    ax3d.set_zlabel("Z FLU (Arriba) [m·s]")
+    ax3d.set_xlabel(f"X FLU (Adelante) [{unit_lbl}]")
+    ax3d.set_ylabel(f"Y FLU (Izquierda) [{unit_lbl}]")
+    ax3d.set_zlabel(f"Z FLU (Arriba) [{unit_lbl}]")
     ax3d.set_title("Perspectiva 3D (Marco Dron FLU)")
     ax3d.legend(loc="upper right", fontsize=8)
-    fig.colorbar(scatter, ax=ax3d, fraction=0.03, pad=0.04, label="Distancia relativa")
+    fig.colorbar(scatter, ax=ax3d, fraction=0.03, pad=0.04, label=f"Distancia relativa [{unit_lbl}]")
 
     # 2. Subplot 2D Vista Superior (Plano XY)
     ax_xy = fig.add_subplot(132)
@@ -295,8 +302,8 @@ def plot_pointcloud_and_trajectory(
     ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="Frente (+X)")
     ax_xy.quiver(0, 0, 0, axis_len, color="g", scale=1, scale_units="xy", angles="xy", label="Izq (+Y)")
-    ax_xy.set_xlabel("X FLU [m·s] (Adelante ->)")
-    ax_xy.set_ylabel("Y FLU [m·s] (<- Izq / Der ->)")
+    ax_xy.set_xlabel(f"X FLU [{unit_lbl}] (Adelante ->)")
+    ax_xy.set_ylabel(f"Y FLU [{unit_lbl}] (<- Izq / Der ->)")
     ax_xy.set_title("Vista Superior (Plano XY)")
     ax_xy.grid(True, linestyle=":", alpha=0.6)
     ax_xy.axis("equal")
@@ -315,8 +322,8 @@ def plot_pointcloud_and_trajectory(
     ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="Frente (+X)")
     ax_xz.quiver(0, 0, 0, axis_len, color="b", scale=1, scale_units="xy", angles="xy", label="Arriba (+Z)")
-    ax_xz.set_xlabel("X FLU [m·s] (Adelante ->)")
-    ax_xz.set_ylabel("Z FLU [m·s] (Arriba ->)")
+    ax_xz.set_xlabel(f"X FLU [{unit_lbl}] (Adelante ->)")
+    ax_xz.set_ylabel(f"Z FLU [{unit_lbl}] (Arriba ->)")
     ax_xz.set_title("Vista Lateral (Plano XZ)")
     ax_xz.grid(True, linestyle=":", alpha=0.6)
     ax_xz.axis("equal")
@@ -344,12 +351,15 @@ def plot_trajectory_global(
     agent_y: np.ndarray = None,
     output_image: Path = None,
     interactive: bool = True,
-    extra: dict = None
+    extra: dict = None,
+    scale: float = None,
 ):
     """
     Grafica la trayectoria global del vuelo (posicion real, keyframes L=10 y setpoints).
     Soporta tanto el nuevo formato SE(3) como archivos legados (T, 3).
     """
+    eff_scale = float(scale) if scale is not None else float((extra or {}).get("scale_factor") or 1.0)
+    unit_lbl = "m" if abs(eff_scale - 1.0) < 1e-6 else "m·s"
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
 
@@ -377,10 +387,10 @@ def plot_trajectory_global(
     ax.scatter([agent_x[0, 0]], [agent_x[0, 1]], [agent_x[0, 2]], color="green", s=100, label="Inicio")
     ax.scatter([agent_x[-1, 0]], [agent_x[-1, 1]], [agent_x[-1, 2]], color="black", s=100, marker="x", label="Fin")
 
-    ax.set_xlabel("X [m·s]")
-    ax.set_ylabel("Y [m·s]")
-    ax.set_zlabel("Z [m·s]")
-    ax.set_title("Trayectoria del Vuelo Registrada en HeteroData (s=0.1)")
+    ax.set_xlabel(f"X [{unit_lbl}]")
+    ax.set_ylabel(f"Y [{unit_lbl}]")
+    ax.set_zlabel(f"Z [{unit_lbl}]")
+    ax.set_title(f"Trayectoria del Vuelo Registrada en HeteroData (s={eff_scale:g})")
     ax.legend()
     plt.tight_layout()
 
@@ -397,7 +407,7 @@ def animate_pointcloud_and_trajectory(
     agent_x: np.ndarray,
     agent_y: np.ndarray,
     scene_pos: np.ndarray,
-    scale: float = 0.1,
+    scale: float = 1.0,
     title: str = "Vuelo Animado Instant Policy (HeteroData)",
     output_anim: Path = None,
     fps: int = 15,
@@ -408,6 +418,7 @@ def animate_pointcloud_and_trajectory(
     Genera una animacion sincronizada de la trayectoria global (con L=10 keyframes)
     y las nubes LiDAR 360° egocentricas (con el horizonte de acciones relativas T=8).
     """
+    unit_lbl = "m" if abs(scale - 1.0) < 1e-6 else "m·s"
     T = len(scene_pos)
     fig = plt.figure(figsize=(16, 6))
     fig.suptitle(title, fontsize=14, fontweight="bold")
@@ -431,14 +442,17 @@ def animate_pointcloud_and_trajectory(
     line_history, = ax3d.plot([], [], [], "b-", linewidth=2, label="Recorrido actual")
     drone_marker = ax3d.scatter([agent_x[0, 0]], [agent_x[0, 1]], [agent_x[0, 2]], color="red", s=100, marker="^", label="Dron")
 
-    ax3d.set_xlabel("X ENU [m·s]")
-    ax3d.set_ylabel("Y ENU [m·s]")
-    ax3d.set_zlabel("Z ENU [m·s]")
+    ax3d.set_xlabel(f"X ENU [{unit_lbl}]")
+    ax3d.set_ylabel(f"Y ENU [{unit_lbl}]")
+    ax3d.set_zlabel(f"Z ENU [{unit_lbl}]")
     ax3d.set_title("Trayectoria 3D Global")
 
-    x_min, x_max = float(np.min(agent_x[:, 0])) - 0.2, float(np.max(agent_x[:, 0])) + 0.2
-    y_min, y_max = float(np.min(agent_x[:, 1])) - 0.2, float(np.max(agent_x[:, 1])) + 0.2
-    z_min, z_max = min(0.0, float(np.min(agent_x[:, 2])) - 0.1), float(np.max(agent_x[:, 2])) + 0.2
+    margin_xy = 2.0 * scale
+    margin_z_lo = 1.0 * scale
+    margin_z_hi = 2.0 * scale
+    x_min, x_max = float(np.min(agent_x[:, 0])) - margin_xy, float(np.max(agent_x[:, 0])) + margin_xy
+    y_min, y_max = float(np.min(agent_x[:, 1])) - margin_xy, float(np.max(agent_x[:, 1])) + margin_xy
+    z_min, z_max = min(0.0, float(np.min(agent_x[:, 2])) - margin_z_lo), float(np.max(agent_x[:, 2])) + margin_z_hi
     ax3d.set_xlim(x_min, x_max)
     ax3d.set_ylim(y_min, y_max)
     ax3d.set_zlim(z_min, z_max)
@@ -453,13 +467,13 @@ def animate_pointcloud_and_trajectory(
     line_h_xy, = ax_xy.plot([], [], "m-o", markersize=3, linewidth=1.8, label="Horizonte T=8")
     ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
-    axis_len = 0.3
+    axis_len = 3.0 * scale
     ax_xy.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="+X Adelante")
     ax_xy.quiver(0, 0, 0, axis_len, color="g", scale=1, scale_units="xy", angles="xy", label="+Y Izquierda")
-    ax_xy.set_xlim(-1.1, 1.1)
-    ax_xy.set_ylim(-1.1, 1.1)
-    ax_xy.set_xlabel("X FLU [m·s] (Adelante ->)")
-    ax_xy.set_ylabel("Y FLU [m·s] (<- Izq / Der ->)")
+    ax_xy.set_xlim(-11.0 * scale, 11.0 * scale)
+    ax_xy.set_ylim(-11.0 * scale, 11.0 * scale)
+    ax_xy.set_xlabel(f"X FLU [{unit_lbl}] (Adelante ->)")
+    ax_xy.set_ylabel(f"Y FLU [{unit_lbl}] (<- Izq / Der ->)")
     ax_xy.set_title("LiDAR 360° Egocéntrico (Plano XY)")
     ax_xy.grid(True, linestyle=":", alpha=0.6)
     ax_xy.axis("equal")
@@ -474,10 +488,10 @@ def animate_pointcloud_and_trajectory(
     ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.quiver(0, 0, axis_len, 0, color="r", scale=1, scale_units="xy", angles="xy", label="+X Adelante")
     ax_xz.quiver(0, 0, 0, axis_len, color="b", scale=1, scale_units="xy", angles="xy", label="+Z Arriba")
-    ax_xz.set_xlim(-1.1, 1.1)
-    ax_xz.set_ylim(-0.8, 0.8)
-    ax_xz.set_xlabel("X FLU [m·s] (Adelante ->)")
-    ax_xz.set_ylabel("Z FLU [m·s] (Arriba ->)")
+    ax_xz.set_xlim(-11.0 * scale, 11.0 * scale)
+    ax_xz.set_ylim(-8.0 * scale, 8.0 * scale)
+    ax_xz.set_xlabel(f"X FLU [{unit_lbl}] (Adelante ->)")
+    ax_xz.set_ylabel(f"Z FLU [{unit_lbl}] (Arriba ->)")
     ax_xz.set_title("LiDAR 360° Egocéntrico (Plano XZ)")
     ax_xz.grid(True, linestyle=":", alpha=0.6)
     ax_xz.axis("equal")
@@ -539,7 +553,7 @@ def plot_tube_augmentation_recovery(
     agent_x: np.ndarray,
     extra: dict,
     aug_idx: int = 0,
-    scale: float = 0.1,
+    scale: float = 1.0,
     title: str = "Verificacion de Tube Augmentation (30% Recuperacion SE(3))",
     output_image: Path = None,
     interactive: bool = True,
@@ -571,6 +585,7 @@ def plot_tube_augmentation_recovery(
     cloud = aug_cloud_all[k_sel]
     h_flu = np.vstack([np.zeros((1, 3), dtype=np.float32), aug_h_flu[k_sel]])
 
+    unit_lbl = "m" if abs(scale - 1.0) < 1e-6 else "m·s"
     dp_m = aug_dp_m[k_sel] if aug_dp_m is not None else np.zeros(3)
     dyaw_deg = math.degrees(float(aug_dyaw[k_sel].reshape(-1)[0])) if aug_dyaw is not None else 0.0
 
@@ -607,9 +622,9 @@ def plot_tube_augmentation_recovery(
         color="crimson", edgecolors="black", s=120, marker="^", zorder=10,
         label=f"Pose activa aug #{k_sel} (t={t_nom})"
     )
-    ax3d.set_xlabel("X ENU [m·s]")
-    ax3d.set_ylabel("Y ENU [m·s]")
-    ax3d.set_zlabel("Z ENU [m·s]")
+    ax3d.set_xlabel(f"X ENU [{unit_lbl}]")
+    ax3d.set_ylabel(f"Y ENU [{unit_lbl}]")
+    ax3d.set_zlabel(f"Z ENU [{unit_lbl}]")
     ax3d.set_title("Convergencia 3D del Tubo hacia Ruta Nominal")
     ax3d.legend(loc="upper left", fontsize=8)
 
@@ -624,8 +639,8 @@ def plot_tube_augmentation_recovery(
     )
     ax_xy.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xy.axvline(0, color="gray", linestyle="--", alpha=0.5)
-    ax_xy.set_xlabel("X FLU Perturbado [m·s] (Adelante ->)")
-    ax_xy.set_ylabel("Y FLU Perturbado [m·s] (<- Izq / Der ->)")
+    ax_xy.set_xlabel(f"X FLU Perturbado [{unit_lbl}] (Adelante ->)")
+    ax_xy.set_ylabel(f"Y FLU Perturbado [{unit_lbl}] (<- Izq / Der ->)")
     ax_xy.set_title("Recuperacion Lateral (Plano XY Egocentrico)")
     ax_xy.grid(True, linestyle=":", alpha=0.6)
     ax_xy.axis("equal")
@@ -641,8 +656,8 @@ def plot_tube_augmentation_recovery(
     )
     ax_xz.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax_xz.axvline(0, color="gray", linestyle="--", alpha=0.5)
-    ax_xz.set_xlabel("X FLU Perturbado [m·s] (Adelante ->)")
-    ax_xz.set_ylabel("Z FLU Perturbado [m·s] (Arriba ->)")
+    ax_xz.set_xlabel(f"X FLU Perturbado [{unit_lbl}] (Adelante ->)")
+    ax_xz.set_ylabel(f"Z FLU Perturbado [{unit_lbl}] (Arriba ->)")
     ax_xz.set_title("Recuperacion Vertical (Plano XZ Egocentrico)")
     ax_xz.grid(True, linestyle=":", alpha=0.6)
     ax_xz.axis("equal")
@@ -725,8 +740,8 @@ def main():
     parser.add_argument(
         "--scale", "-s",
         type=float,
-        default=0.1,
-        help="Factor de escala metrica s (default: 0.1)"
+        default=None,
+        help="Factor de escala metrica s (default: autodetectado del archivo o 1.0)"
     )
     parser.add_argument(
         "--output", "-o",
@@ -750,6 +765,16 @@ def main():
 
         print(f"Cargando dataset desde: {args.file}...")
         agent_x, agent_y, scene_pos, extra = load_dataset_file(args.file, return_extra=True)
+        detected_scale = extra.get("scale_factor")
+        if detected_scale is None:
+            meta_p = args.file.parent / "episode_meta.json"
+            if meta_p.is_file():
+                try:
+                    import json as _json
+                    detected_scale = _json.loads(meta_p.read_text(encoding="utf-8")).get("scale_factor")
+                except Exception:
+                    detected_scale = None
+        eff_scale = float(args.scale) if args.scale is not None else float(detected_scale if detected_scale is not None else 1.0)
 
         T = len(scene_pos)
         step = max(0, min(args.step, T - 1))
@@ -770,7 +795,7 @@ def main():
             n_aug = len(extra["aug_pos_enu"])
             print(f"Muestras Tube Augmentation:     {n_aug}/{T} ({100.0 * n_aug / max(1, T):.1f}%)")
         print(f"Rango de nube t={step}:         Min={np.min(cloud, axis=0)}, Max={np.max(cloud, axis=0)}")
-        print(f"Distancia maxima del LiDAR:     {np.max(np.linalg.norm(cloud, axis=1)):.3f} (en espacio s={args.scale})")
+        print(f"Distancia maxima del LiDAR:     {np.max(np.linalg.norm(cloud, axis=1)):.3f} (en espacio s={eff_scale:g})")
         print("------------------------------------------")
 
         if args.show_aug:
@@ -778,7 +803,7 @@ def main():
                 agent_x=agent_x,
                 extra=extra,
                 aug_idx=args.aug_index,
-                scale=args.scale,
+                scale=eff_scale,
                 title=f"Tube Augmentation Recovery: {args.file.name}",
                 output_image=args.output,
                 interactive=not args.no_gui,
@@ -793,7 +818,7 @@ def main():
                 agent_x=agent_x,
                 agent_y=agent_y,
                 scene_pos=scene_pos,
-                scale=args.scale,
+                scale=eff_scale,
                 title=title,
                 output_anim=args.output,
                 fps=args.fps,
@@ -807,7 +832,7 @@ def main():
                 agent_x=agent_x,
                 agent_y=agent_y,
                 current_step=step,
-                scale=args.scale,
+                scale=eff_scale,
                 title=title,
                 output_image=args.output,
                 interactive=not args.no_gui,
@@ -839,9 +864,10 @@ def main():
             landmarks.append(lm_c)
         landing = cfg.get("landing", None)
 
+        eff_scale = float(args.scale) if args.scale is not None else 1.0
         gen = SyntheticLidarGenerator(
             r_max=args.r_max,
-            scale_factor=args.scale,
+            scale_factor=eff_scale,
             target_points=2048
         )
 
@@ -868,7 +894,7 @@ def main():
         title = f"LiDAR Sintetico 360° desde {args.waypoints.name} (Dron en {args.drone_pose[:3]})"
         plot_pointcloud_and_trajectory(
             cloud=cloud,
-            scale=args.scale,
+            scale=eff_scale,
             title=title,
             output_image=args.output,
             interactive=not args.no_gui

@@ -12,8 +12,8 @@ Ambas politicas implementan exactamente el mismo contrato `.predict_actions(...)
                 `live_scene_pos` (1, 2048, 3), `live_pose_se3` (1, 4, 4),
                 `live_vel_flu` (1, 3), `live_flight_state` (1, 1)
   Salida (`PolicyPrediction`):
-    - `pred_action_se3`:            (T, 4, 4) poses relativas acumuladas en Horizontal FLU (s=0.1)
-    - `pred_delta_se3`:             (T, 4, 4) incrementos paso a paso δT_k en Horizontal FLU (s=0.1)
+    - `pred_action_se3`:            (T, 4, 4) poses relativas acumuladas en Horizontal FLU (s=1.0, metros reales)
+    - `pred_delta_se3`:             (T, 4, 4) incrementos paso a paso δT_k en Horizontal FLU (s=1.0, metros reales)
     - `pred_flight_state`:          (T, 1)    probabilidad de vuelo activo en [0, 1]
     - `pred_world_waypoints_enu_m`: (T, 4)    [X_enu_m, Y_enu_m, Z_enu_m, yaw_enu_rad] en metros reales
     - `pred_keypoint_flow`:         (T, 6, 6) flujo cartesiano desacoplado [Δp_t, Δp_r] en los 6 keypoints
@@ -49,8 +49,8 @@ from .se3_diffusion_math import (
 class PolicyPrediction:
     """Estructura tipada de salida de cualquier politica de navegacion UAV Instant Policy."""
 
-    pred_action_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=0.1)
-    pred_delta_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=0.1)
+    pred_action_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=1.0, metros)
+    pred_delta_se3: torch.Tensor  # (T, 4, 4) float32 en Horizontal FLU (s=1.0, metros)
     pred_flight_state: torch.Tensor  # (T, 1) float32 en [0, 1]
     pred_world_waypoints_enu_m: np.ndarray  # (T, 4) float32 [X_m, Y_m, Z_m, yaw_rad]
     pred_keypoint_flow: torch.Tensor  # (T, 6, 6) float32 [dp_t, dp_r]
@@ -60,7 +60,7 @@ def subsample_scene_centroids_torch(
     points: torch.Tensor,
     num_centroids: int = 16,
     num_neighbors: int = 16,
-    ground_z_cutoff_scaled: float = -0.11,
+    ground_z_cutoff_scaled: float = -1.1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Submuestrea `M = num_centroids` centroides representativos de una nube LiDAR (B, N, 3)
@@ -119,13 +119,15 @@ def subsample_scene_centroids_torch(
 class SinusoidalPosEmb3D(nn.Module):
     """
     Codificacion posicional sinusoidal de Fourier para coordenadas/desplazamientos 3D
-    (Vosylius & Johns, ICLR 2025, Sec. 3.3).
+    (Vosylius & Johns, ICLR 2025, Sec. 3.3). Aplica el factor interno `scale` (default: 0.1)
+    sobre coordenadas en unidades fisicas SI (metros) para prevenir aliasing de altas frecuencias.
     """
 
-    def __init__(self, num_freqs: int = 6, include_input: bool = True) -> None:
+    def __init__(self, num_freqs: int = 6, include_input: bool = True, scale: float = 0.1) -> None:
         super().__init__()
         self.num_freqs = int(num_freqs)
         self.include_input = bool(include_input)
+        self.scale = float(scale)
         freqs = (2.0 ** torch.arange(self.num_freqs, dtype=torch.float32)) * math.pi
         self.register_buffer("freqs", freqs, persistent=False)
 
@@ -135,13 +137,14 @@ class SinusoidalPosEmb3D(nn.Module):
         return base + 3 * 2 * self.num_freqs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., 3)
-        scaled = x.unsqueeze(-1) * self.freqs  # (..., 3, F)
+        # x: (..., 3) en metros fisicos -> x_s: coordenadas pre-escaladas para Fourier
+        x_s = x * self.scale
+        scaled = x_s.unsqueeze(-1) * self.freqs  # (..., 3, F)
         sin_feat = torch.sin(scaled)
         cos_feat = torch.cos(scaled)
         fourier = torch.cat([sin_feat, cos_feat], dim=-1).flatten(start_dim=-2)  # (..., 6*F)
         if self.include_input:
-            return torch.cat([x, fourier], dim=-1)
+            return torch.cat([x_s, fourier], dim=-1)
         return fourier
 
 
@@ -169,7 +172,7 @@ class MiniScenePatchEncoder(nn.Module):
         self.num_neighbors = int(num_neighbors)
         self.use_patch_cache = bool(use_patch_cache)
         self._patch_cache: Dict[Tuple[Any, ...], Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.pos_emb = SinusoidalPosEmb3D(num_freqs=4, include_input=True)
+        self.pos_emb = SinusoidalPosEmb3D(num_freqs=4, include_input=True, scale=0.1)
         in_dim = self.pos_emb.out_dim * 2  # centroide + diferencia local
 
         self.patch_mlp = nn.Sequential(
@@ -248,7 +251,7 @@ class MiniScenePatchEncoder(nn.Module):
     def forward(self, scene_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Entrada:
-          - `scene_pos`: (B, N_pts, 3) en Horizontal FLU (s=0.1)
+          - `scene_pos`: (B, N_pts, 3) en Horizontal FLU (s=1.0, metros reales)
         Salida:
           - `centroids`: (B, M, 3)
           - `scene_feat`: (B, M, d_model)
@@ -303,12 +306,12 @@ class MiniInstantPolicyNet(nn.Module):
         self.bounds = ActionBounds4DoF.for_stride(self.action_stride)
         s_mult = float(self.action_stride)
         flow_scale = torch.tensor(
-            [0.04 * s_mult, 0.04 * s_mult, 0.03 * s_mult, 0.012, 0.012, 0.012],
+            [0.40 * s_mult, 0.40 * s_mult, 0.30 * s_mult, 0.12, 0.12, 0.12],
             dtype=torch.float32,
         )
         self.register_buffer("flow_scale", flow_scale, persistent=False)
 
-        self.pos_emb_3d = SinusoidalPosEmb3D(num_freqs=4, include_input=True)
+        self.pos_emb_3d = SinusoidalPosEmb3D(num_freqs=4, include_input=True, scale=0.1)
         self.scene_encoder = MiniScenePatchEncoder(
             d_model=d_model,
             num_centroids=num_centroids,
@@ -415,8 +418,8 @@ class MiniInstantPolicyNet(nn.Module):
         device = scene_pos.device
         centroids, scene_feat = self.scene_encoder(scene_pos)  # (B_obs, M, 3), (B_obs, M, d)
 
-        kp = keypoints_body.unsqueeze(0).expand(B_obs, 6, 3)  # (B_obs, 6, 3)
-        kp_emb = self.pos_emb_3d(kp * 10.0)  # Escalar brazo de palanca 0.05 -> 0.5 para Fourier
+        kp = keypoints_body.unsqueeze(0).expand(B_obs, 6, 3)  # (B_obs, 6, 3) en metros
+        kp_emb = self.pos_emb_3d(kp * 10.0)  # Compensar scale=0.1 para mantener rango ~0.25 en Fourier
 
         if pose_se3 is not None:
             p_xyz = pose_se3[:, :3, 3] * torch.tensor([0.35, 1.0, 1.0], device=device, dtype=scene_pos.dtype)
@@ -557,11 +560,11 @@ class MiniInstantPolicyNet(nn.Module):
         u_values = (act_emb + 0.25 * sigma_ctx).reshape(U, N_demos * L * 6, self.d_model)
         u_token_mask = u_mask.unsqueeze(-1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6)
 
-        # Codificar coordenadas longitudinales x_s de los keyframes si context_pose_se3 existe
+        # Codificar coordenadas longitudinales x [m] de los keyframes si context_pose_se3 existe
         if u_pose is not None:
             u_x_kf = u_pose[:, 0, 3].reshape(U, N_demos * L, 1).expand(U, N_demos * L, 6).reshape(U, N_demos * L * 6, 1)
         else:
-            u_x_kf = torch.linspace(0.0, 2.5, steps=max(2, L), device=device)[:L].view(1, 1, L, 1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6, 1)
+            u_x_kf = torch.linspace(0.0, 25.0, steps=max(2, L), device=device)[:L].view(1, 1, L, 1).expand(U, N_demos, L, 6).reshape(U, N_demos * L * 6, 1)
 
         if B > 1 and U < B:
             inv_tensor = torch.tensor(inv_map, dtype=torch.long, device=device)
@@ -646,9 +649,9 @@ class MiniInstantPolicyNet(nn.Module):
             if ctx_x.shape[0] == 1 and B > 1:
                 ctx_x = ctx_x.expand(B, -1)
             live_x = live_pose_se3[:, 0, 3:4]  # (B, 1)
-            # Ventana gaussiana longitudinal nitida (sigma_x = 0.07 en s=0.1, equivalente a 0.70 m)
+            # Ventana gaussiana longitudinal nitida (sigma_x = 0.70 m en unidades fisicas SI)
             dist_sq = (ctx_x - live_x) ** 2
-            logits = -dist_sq / (2.0 * (0.07 ** 2))
+            logits = -dist_sq / (2.0 * (0.70 ** 2))
             if kf_valid_mask is not None:
                 logits = logits.masked_fill(~kf_valid_mask, -1e9)
             phase_weights = torch.softmax(logits, dim=-1)  # (B, K_kf)
@@ -699,13 +702,13 @@ class MiniInstantPolicyNet(nn.Module):
         # Posiciones relativas de los 6 keypoints respecto al cuerpo (escaladas a O(1) para Fourier)
         curr_cum_se3 = incremental_to_cumulative_se3(curr_delta_se3)  # (B, T, 4, 4)
         kp_body_exp = keypoints_body.view(1, 1, 6, 3)
-        delta_scale = 0.04 * float(self.action_stride)
-        cum_scale = 0.02 * float(self.horizon * self.action_stride)
+        delta_scale = 0.40 * float(self.action_stride)
+        cum_scale = 0.20 * float(self.horizon * self.action_stride)
         kp_delta_rel = (transform_keypoints(curr_delta_se3, keypoints_body=keypoints_body) - kp_body_exp) / delta_scale
         kp_cum_rel = (transform_keypoints(curr_cum_se3, keypoints_body=keypoints_body) - kp_body_exp) / cum_scale
 
-        emb_delta = self.pos_emb_3d(kp_delta_rel)  # (B, T, 6, pos_dim)
-        emb_cum = self.pos_emb_3d(kp_cum_rel)  # (B, T, 6, pos_dim)
+        emb_delta = self.pos_emb_3d(kp_delta_rel / self.pos_emb_3d.scale)  # (B, T, 6, pos_dim)
+        emb_cum = self.pos_emb_3d(kp_cum_rel / self.pos_emb_3d.scale)  # (B, T, 6, pos_dim)
 
         h_ids = self.horizon_step_emb(torch.arange(self.horizon, device=device))[None, :, None, :]  # (1, T, 1, d)
         kp_ids = self.keypoint_id_emb(torch.arange(6, device=device))[None, None, :, :]  # (1, 1, 6, d)
@@ -733,7 +736,7 @@ class MiniInstantPolicyNet(nn.Module):
     def compute_loss(
         self,
         batch: Dict[str, Any],
-        noise_std_pos: float = 0.020,
+        noise_std_pos: float = 0.20,
         noise_std_yaw: float = 0.15,
     ) -> Dict[str, torch.Tensor]:
         """
