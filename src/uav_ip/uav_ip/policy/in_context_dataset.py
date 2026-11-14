@@ -714,14 +714,14 @@ class InContextNavigationDataset(Dataset):
             tasks = list(task_ids)
         elif split is not None:
             split_map = {
-                "train": "train_tasks.txt",
-                "val": "val_tasks.txt",
-                "test": "test_tasks.txt",
-                "held_out": "test_tasks.txt",
+                "train": "train_tasks.json",
+                "val": "val_tasks.json",
+                "test": "test_tasks.json",
+                "held_out": "test_tasks.json",
             }
-            fname = split_map.get(split, f"{split}_tasks.txt")
+            fname = split_map.get(split, f"{split}_tasks.json")
             split_file = self.dataset_dir / "splits" / fname
-            if split_file.is_file():
+            if not split_file.is_file():
                 raise FileNotFoundError(
                     f"Archivo de split '{split}' no encontrado en: {split_file}"
                 )
