@@ -11,6 +11,7 @@ Antes de proponer cambios arquitectónicos o rediseñar componentes, consulta si
 4. `docs/TROUBLESHOOTING.md`: Registro de soluciones a problemas de simulación, networking, virtualenvs de ML y comandos.
 5. `README.md`: Portal principal y manual de usuario detallado de cada script del repositorio.
 6. `docs/EXPLORACION_RED_NEURONAL.md`: Contratos de tensores E/S, verificación matemática $SE(3)$/SVD 4-DoF, resultados exploratorios en lazo cerrado cinemático y aspectos abiertos a revisar en el Hito 4.
+7. `docs/PLAN_ETAPAS_HITO4.md`: Plan maestro paso a paso y fuente principal de verdad para la implementación incremental de `uav_ip/icil/` (Etapas 1 a 7, contratos, progreso y protocolo entre `/compact`).
 
 ## 🛠️ Tecnologías y Estilos
 - **Lenguaje Principal:** Python 3 (estrictamente tipado siempre que sea posible, usando docstrings y tipos de `typing`).
