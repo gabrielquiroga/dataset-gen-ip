@@ -27,7 +27,7 @@
 | Etapa | Nombre | Archivos | Criterio de Verificación | Estado |
 | :---: | :--- | :--- | :--- | :---: |
 | **1** | Geometría $SE(3)$ 4-DoF, Keypoints, Flow y SVD | `src/uav_ip/uav_ip/icil/geometry.py`, `src/uav_ip/test/icil/test_geometry.py` | Round-trips `< 1e-5`, SVD 4-DoF exacto `< 1e-5`, invarianza $SE(3)$ | ✅ Completada |
-| **2** | Cargador de Dataset, Splits JSON y Batching | `src/uav_ip/uav_ip/icil/dataset.py`, `src/uav_ip/test/icil/test_dataset.py` | Splits disjuntos JSON cargados, formas exactas, 0 NaNs, cotas medidas | ⏳ Pendiente |
+| **2** | Cargador de Dataset, Splits JSON y Batching | `src/uav_ip/uav_ip/icil/dataset.py`, `src/uav_ip/test/icil/test_dataset.py` | Splits disjuntos JSON cargados, formas exactas, 0 NaNs, cotas medidas | ✅ Completada |
 | **3** | Encoder de Escena $\phi_e$ + Pre-entrenamiento Ocupancia 3D | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Acc. validación > 90% en primitivas 3D + `checkpoints/scene_encoder.pt` | ⏳ Pendiente |
 | **4** | Grafo Local $\sigma$ (Escena Congelada + Estado UAV) | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Forward/backward `(B, 6, d_model)` OK; $\phi_e$ congelado, $\sigma$ con gradientes | ⏳ Pendiente |
 | **5** | Red de Política ($\varphi \to \psi$), Difusión DDPM/DDIM y Test Dorado | `src/uav_ip/uav_ip/icil/policy_net.py`, `src/uav_ip/test/icil/test_policy_net.py` | Overfit en 1 episodio + Test Context-Swap lateral invertido exitoso | ⏳ Pendiente |
@@ -236,6 +236,8 @@ def test_svd_4dof_se3_equivariance() -> None:
 
 **Objetivo:** Cargar episodios `heterodata.pt` de `datasets/kinematic/` y `datasets/sitl/` respetando estrictamente los splits JSON, seleccionar `L` keyframes (fijo o `'adaptive'`), recomputar horizontes con `(T, action_stride)` en formato incremental $\delta T_k$, y producir batches listos para el entrenamiento e inferencia.
 
+**Estado actual en código:** Implementado y verificado por el usuario en `~/venv_ip` en `src/uav_ip/uav_ip/icil/dataset.py` y `src/uav_ip/test/icil/test_dataset.py`.
+
 **Esquema de splits verificado:**
 - Ubicación: `datasets/<kinematic|sitl>/splits/{train,val,held_out}_tasks.json` (mapear `"test"` $\to$ `"held_out"`).
 - Estructura JSON observada: `{"tasks": [...], "signatures": [...]}`.
@@ -269,6 +271,15 @@ def test_svd_4dof_se3_equivariance() -> None:
 - Verificar 0 intersección entre `train`, `val` y `held_out` task IDs.
 - Medir y registrar en este documento los percentiles (99%, max) de $\|\Delta\mathbf{p}\|_t$ y $|\Delta\psi|$ de $\delta T_k$ en `kinematic` y `sitl` para calibrar las escalas de ruido DDPM en Etapa 5.
 - Confirmar 0 `NaN`/`Inf` y formas exactas tras `DataLoader(..., collate_fn=collate_icil_batch)`.
+
+**Estadísticas físicas medidas de $\delta T_k$ (`split='train'`, `stride=1`, `T=8`, `include_aug=True`, unidades SI $s=1.0$):**
+
+| Dominio | Pasos válidos | $\|\Delta\mathbf{p}_t\|_2$ p99 / max | $|\Delta x|$ p99 / max | $|\Delta y|$ p99 / max | $|\Delta z|$ p99 / max | $|\Delta\psi|$ p99 / max |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`sitl`** | 78,723 | 0.4481 m / 0.5939 m | 0.3796 m / 0.5925 m | 0.3301 m / 0.5267 m | 0.1826 m / 0.3688 m | 0.2718 rad / 0.3435 rad |
+| **`kinematic`** | 1,926,108 | 0.2374 m / 0.3969 m | 0.2068 m / 0.3653 m | 0.1832 m / 0.3659 m | 0.1440 m / 0.3588 m | 0.1902 rad / 0.9855 rad |
+
+- **Calibración derivada para Etapa 5 (DDPM):** A partir de estos rangos reales ($\Delta t = 0.1\text{ s}$ con Tube Augmentation incluido), las acciones incrementales $[\Delta x, \Delta y, \Delta z, \Delta\psi]$ quedan acotadas de forma natural dentro de $\approx [-0.60, 0.60]\text{ m}$ en XY, $\approx [-0.40, 0.40]\text{ m}$ en Z y $\approx [-0.50, 0.50]\text{ rad}$ en el percentil 99–100%, permitiendo definir una escala de normalización parametrizable por eje (p. ej. `[0.60, 0.60, 0.40, 0.50]`) antes de inyectar ruido gaussiano $\mathcal{N}(0, I)$.
 
 ---
 
@@ -333,7 +344,7 @@ def test_svd_4dof_se3_equivariance() -> None:
      - Flujo rotacional $\Delta\hat{\mathbf{p}}_r$ `(B, T, 6, 3)`
      - Logit de estado de vuelo $\hat{s}$ `(B, T, 1)` (promedio sobre los 6 nodos de cada paso $k$).
 3. **Difusión DDPM (entrenamiento) y DDIM (inferencia):**
-   - Perturbación controlada de acciones incrementales $\delta T_k$ en espacio 4-DoF normalizado (usando cotas medidas en Etapa 2) $\to$ cálculo del flujo objetivo exacto mediante `geometry.compute_keypoint_flow`.
+   - Perturbación controlada de acciones incrementales $\delta T_k$ en espacio 4-DoF normalizado usando las cotas empíricas medidas en Etapa 2 (escala parametrizable por eje, base `[0.60, 0.60, 0.40, 0.50]` acorde a `sitl`/`kinematic` p99–max) $\to$ cálculo del flujo objetivo exacto mediante `geometry.compute_keypoint_flow`.
    - Pérdida L1/MSE en flujo $[\Delta\mathbf{p}_t, \Delta\mathbf{p}_r]$ + BCE en `flight_state` respetando `action_valid_mask`.
    - Muestreo DDIM en $K \in \{4, 8, 10\}$ pasos aplicando `geometry.apply_flow_and_svd` al final de cada paso sin clipping artificial.
 
@@ -390,4 +401,8 @@ def test_svd_4dof_se3_equivariance() -> None:
     1. Tests unitarios separados por etapa en `src/uav_ip/test/icil/test_*.py` (`pytest.importorskip("torch")`).
     2. Hiperparámetros por defecto acordados y parametrizables para futura búsqueda de grilla: `M=32`, `L=10`, `T=8`, `action_stride=1`, `T_exec=4`, `N_demos=2`, `K=8`.
     3. Factor de escala `0.1` encapsulado exclusivamente dentro de `SinusoidalPosEmb3D(scale=0.1)` (Etapa 3); todo el pipeline de datos (`HeteroData`), sensores, `geometry.py` y evaluación operan en unidades físicas SI (`scale_factor=1.0`, metros y radianes).
-  - **Listo para retomar desde Etapa 2:** Datasets `sitl` y `kinematic` regenerados con `scale_factor=1.0`; el siguiente paso es implementar `src/uav_ip/uav_ip/icil/dataset.py` y `src/uav_ip/test/icil/test_dataset.py`.
+- **Etapa 2:** `src/uav_ip/uav_ip/icil/dataset.py` y `src/uav_ip/test/icil/test_dataset.py` implementados y verificados en `~/venv_ip` (con estadísticas de `sitl` y `kinematic` reportadas abajo).
+  - Cotas físicas medidas de $\delta T_k$ (`train`, `stride=1`, `T=8`, `include_aug=True`, unidades SI $s=1.0$):
+    - `sitl` (`78,723` pasos): `trans_norm` p99=`0.4481 m` / max=`0.5939 m` (`dx_max=0.5925 m`, `dy_max=0.5267 m`, `dz_max=0.3688 m`); `|dyaw|` p99=`0.2718 rad` ($\approx 15.57^\circ$) / max=`0.3435 rad` ($\approx 19.68^\circ$).
+    - `kinematic` (`1,926,108` pasos): `trans_norm` p99=`0.2374 m` / max=`0.3969 m` (`dx_max=0.3653 m`, `dy_max=0.3659 m`, `dz_max=0.3588 m`); `|dyaw|` p99=`0.1902 rad` ($\approx 10.90^\circ$) / max=`0.9855 rad` ($\approx 56.47^\circ$).
+- **Listo para retomar desde Etapa 3:** Implementar la primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` (`SinusoidalPosEmb3D(scale=0.1)`, FPS/$k$-NN, `SceneEncoderPhi`, `OccupancyDecoderPsi`) junto a `src/uav_ip/scripts/icil/pretrain_scene_encoder.py` y su test `src/uav_ip/test/icil/test_scene_encoder.py`.
