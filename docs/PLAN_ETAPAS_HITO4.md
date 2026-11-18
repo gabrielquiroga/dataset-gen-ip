@@ -28,7 +28,7 @@
 | :---: | :--- | :--- | :--- | :---: |
 | **1** | Geometría $SE(3)$ 4-DoF, Keypoints, Flow y SVD | `src/uav_ip/uav_ip/icil/geometry.py`, `src/uav_ip/test/icil/test_geometry.py` | Round-trips `< 1e-5`, SVD 4-DoF exacto `< 1e-5`, invarianza $SE(3)$ | ✅ Completada |
 | **2** | Cargador de Dataset, Splits JSON y Batching | `src/uav_ip/uav_ip/icil/dataset.py`, `src/uav_ip/test/icil/test_dataset.py` | Splits disjuntos JSON cargados, formas exactas, 0 NaNs, cotas medidas | ✅ Completada |
-| **3** | Encoder de Escena $\phi_e$ + Pre-entrenamiento Ocupancia 3D | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Acc. validación > 90% en primitivas 3D + `checkpoints/scene_encoder.pt` | ⏳ Pendiente |
+| **3** | Encoder de Escena $\phi_e$ + Pre-entrenamiento Ocupancia 3D | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Acc. validación > 90% en primitivas 3D + `checkpoints/scene_encoder.pt` | ✅ Completada (`92.79% val_acc`) |
 | **4** | Grafo Local $\sigma$ (Escena Congelada + Estado UAV) | `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/test/icil/test_scene_encoder.py` | Forward/backward `(B, 6, d_model)` OK; $\phi_e$ congelado, $\sigma$ con gradientes | ⏳ Pendiente |
 | **5** | Red de Política ($\varphi \to \psi$), Difusión DDPM/DDIM y Test Dorado | `src/uav_ip/uav_ip/icil/policy_net.py`, `src/uav_ip/test/icil/test_policy_net.py` | Overfit en 1 episodio + Test Context-Swap lateral invertido exitoso | ⏳ Pendiente |
 | **6** | Evaluador en Lazo Cerrado Cinemático + PCHIP 50 Hz | `src/uav_ip/uav_ip/icil/rollout_eval.py`, `src/uav_ip/test/icil/test_rollout_eval.py` | Oráculo `accepted` (`ADE=0.0`) + rollout del modelo overfiteado exitoso | ⏳ Pendiente |
@@ -287,6 +287,8 @@ def test_svd_4dof_se3_equivariance() -> None:
 
 **Objetivo (Tarea 4.2 de `PLAN_IMPLEMENTACION.md`):** Construir la primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` junto con `src/uav_ip/scripts/icil/pretrain_scene_encoder.py`, pre-entrenar el extractor local 3D $\phi_e$ mediante predicción de ocupancia implícita sobre geometrías sintéticas del dominio UAV, y guardar un checkpoint listo para cargarse congelado.
 
+**Estado actual en código:** Implementado y verificado por el usuario en `~/venv_ip` en `src/uav_ip/uav_ip/icil/scene_encoder.py`, `src/uav_ip/scripts/icil/pretrain_scene_encoder.py` y `src/uav_ip/test/icil/test_scene_encoder.py`.
+
 **Componentes:**
 1. `SinusoidalPosEmb3D(dim, scale=0.1)` (codificación de Fourier 3D para desplazamientos relativos $\Delta\mathbf{x} \in \mathbb{R}^3$ en metros, aplicando internamente el factor `scale=0.1` para evitar aliasing periódico sin alterar coordenadas geométricas).
 2. Utilidades FPS (*Farthest Point Sampling*) + $k$-NN local (PyTorch puro o `torch_cluster` si disponible en `~/venv_ip`, verificando disponibilidad al iniciar la etapa) sobre la **nube completa** de 2048 puntos (sin recorte en $Z$).
@@ -302,6 +304,10 @@ def test_svd_4dof_se3_equivariance() -> None:
 **Verificación rápida Etapa 3:**
 - Entrenar $\phi_e + \psi_e$ en `pretrain_scene_encoder.py` hasta superar **90% de accuracy** en validación de ocupancia.
 - Guardar `checkpoints/scene_encoder.pt` incluyendo hiperparámetros (`M`, `d_model`).
+- **Métricas empíricas medidas (`epochs=25`, `steps_per_epoch=40`, `CPU`, `M=32`, `d_model=128`, `pos_scale=0.1`):**
+  - `best_val_acc = 92.79%` (alcanzado en época 24; supera el umbral objetivo de `90%`).
+  - `best_val_loss = 0.1791` (con `train_acc = 92.49%` vs `val_acc = 92.75%` en época 25, sin sobreajuste).
+  - Tests unitarios: `7 passed` en `~/venv_ip` (`test_scene_encoder.py`).
 
 ---
 
@@ -405,4 +411,6 @@ def test_svd_4dof_se3_equivariance() -> None:
   - Cotas físicas medidas de $\delta T_k$ (`train`, `stride=1`, `T=8`, `include_aug=True`, unidades SI $s=1.0$):
     - `sitl` (`78,723` pasos): `trans_norm` p99=`0.4481 m` / max=`0.5939 m` (`dx_max=0.5925 m`, `dy_max=0.5267 m`, `dz_max=0.3688 m`); `|dyaw|` p99=`0.2718 rad` ($\approx 15.57^\circ$) / max=`0.3435 rad` ($\approx 19.68^\circ$).
     - `kinematic` (`1,926,108` pasos): `trans_norm` p99=`0.2374 m` / max=`0.3969 m` (`dx_max=0.3653 m`, `dy_max=0.3659 m`, `dz_max=0.3588 m`); `|dyaw|` p99=`0.1902 rad` ($\approx 10.90^\circ$) / max=`0.9855 rad` ($\approx 56.47^\circ$).
-- **Listo para retomar desde Etapa 3:** Implementar la primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` (`SinusoidalPosEmb3D(scale=0.1)`, FPS/$k$-NN, `SceneEncoderPhi`, `OccupancyDecoderPsi`) junto a `src/uav_ip/scripts/icil/pretrain_scene_encoder.py` y su test `src/uav_ip/test/icil/test_scene_encoder.py`.
+- **Etapa 3:** Primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` (`SinusoidalPosEmb3D(scale=0.1)`, FPS/$k$-NN, `SceneEncoderPhi`, `OccupancyDecoderPsi`, `load_pretrained_scene_encoder`), `src/uav_ip/scripts/icil/pretrain_scene_encoder.py` y `src/uav_ip/test/icil/test_scene_encoder.py` implementados y verificados en `~/venv_ip` (`7 passed`).
+  - Checkpoint `checkpoints/scene_encoder.pt` pre-entrenado con `M=32`, `d_model=128`, `pos_scale=0.1` en 25 épocas (CPU): `best_val_acc = 92.79%`, `best_val_loss = 0.1791`.
+- **Listo para retomar desde Etapa 4:** Completar la segunda mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` con `LocalStateEncoderSigma` ($\sigma$, grafo bipartito $M \to 6$ con `torch_geometric.nn.TransformerConv`) y añadir sus tests de congelamiento de $\phi_e$ y flujo de gradientes en `src/uav_ip/test/icil/test_scene_encoder.py`.
