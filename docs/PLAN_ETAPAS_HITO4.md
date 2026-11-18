@@ -414,3 +414,12 @@ def test_svd_4dof_se3_equivariance() -> None:
 - **Etapa 3:** Primera mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` (`SinusoidalPosEmb3D(scale=0.1)`, FPS/$k$-NN, `SceneEncoderPhi`, `OccupancyDecoderPsi`, `load_pretrained_scene_encoder`), `src/uav_ip/scripts/icil/pretrain_scene_encoder.py` y `src/uav_ip/test/icil/test_scene_encoder.py` implementados y verificados en `~/venv_ip` (`7 passed`).
   - Checkpoint `checkpoints/scene_encoder.pt` pre-entrenado con `M=32`, `d_model=128`, `pos_scale=0.1` en 25 épocas (CPU): `best_val_acc = 92.79%`, `best_val_loss = 0.1791`.
 - **Listo para retomar desde Etapa 4:** Completar la segunda mitad de `src/uav_ip/uav_ip/icil/scene_encoder.py` con `LocalStateEncoderSigma` ($\sigma$, grafo bipartito $M \to 6$ con `torch_geometric.nn.TransformerConv`) y añadir sus tests de congelamiento de $\phi_e$ y flujo de gradientes en `src/uav_ip/test/icil/test_scene_encoder.py`.
+
+---
+
+## 7. Ideas y Aportes para la Memoria Técnica
+
+*(Registro de ideas, figuras y análisis conceptuales que surgen a medida que avanza el desarrollo. No aportan directamente al rendimiento del modelo, pero servirán como material de respaldo al elaborar la memoria técnica del trabajo.)*
+
+1. **Visualización de escena y salida del *Scene Encoder* (Etapa 3):** Mostrar una escena 3D sintética generada junto con los puntos del LiDAR sintético y lo que devuelve el decoder de ocupancia, para ilustrar conceptualmente la capacidad del encoder de preservar la geometría de la escena.
+2. **Evolución de métricas del pre-entrenamiento del *Scene Encoder* (Etapa 3):** Mostrar la evolución a lo largo de las épocas de las métricas de entrenamiento y validación (pérdida, exactitud, mejor exactitud alcanzada y tiempos por época), a partir del historial guardado en `checkpoints/scene_encoder_history.csv`.
